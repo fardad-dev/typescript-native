@@ -3,43 +3,25 @@
 //   tsnc <file.ts> [-o out] [--emit-llvm]
 
 import * as path from "path";
-import { compile, Options } from "./driver";
+import { Command } from "commander";
+import { compile } from "./driver";
 
-function parseArgs(argv: string[]): Options {
-  let input: string | undefined;
-  let output: string | undefined;
-  let emitLlvm = false;
+const program = new Command();
 
-  for (let i = 0; i < argv.length; i++) {
-    const a = argv[i];
-    if (a === "-o") {
-      output = argv[++i];
-    } else if (a === "--emit-llvm") {
-      emitLlvm = true;
-    } else if (!a.startsWith("-")) {
-      input = a;
-    } else {
-      throw new Error(`Unknown flag: ${a}`);
+program
+  .name("tsnc")
+  .description("tsn native compiler: a TypeScript subset -> native executable")
+  .argument("<file>", "TypeScript source file to compile")
+  .option("-o, --output <path>", "output executable path (defaults to the source basename)")
+  .option("--emit-llvm", "also write the generated LLVM IR alongside the binary", false)
+  .action((file: string, opts: { output?: string; emitLlvm: boolean }) => {
+    const output = opts.output ?? path.basename(file, path.extname(file));
+    try {
+      compile({ input: file, output, emitLlvm: opts.emitLlvm });
+    } catch (err) {
+      console.error(`tsnc: ${(err as Error).message}`);
+      process.exit(1);
     }
-  }
+  });
 
-  if (!input) {
-    console.error("usage: tsnc <file.ts> [-o out] [--emit-llvm]");
-    process.exit(1);
-  }
-  if (!output) {
-    output = path.basename(input, path.extname(input));
-  }
-  return { input, output, emitLlvm };
-}
-
-function main(): void {
-  try {
-    compile(parseArgs(process.argv.slice(2)));
-  } catch (err) {
-    console.error(`tsnc: ${(err as Error).message}`);
-    process.exit(1);
-  }
-}
-
-main();
+program.parse();

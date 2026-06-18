@@ -7,12 +7,16 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "tsnc": "node dist/index.js"
+    "tsnc": "node dist/index.js",
+    "test": "vitest run",
+    "test:watch": "vitest"
   },
   "dependencies": {
+    "commander": "^15.0.0",
     "typescript": "^5.4.0"
   },
   "devDependencies": {
-    "@types/node": "^25.9.3"
+    "@types/node": "^25.9.3",
+    "vitest": "^4.1.9"
   }
 }
