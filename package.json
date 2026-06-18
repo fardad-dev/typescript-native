@@ -1,0 +1,18 @@
+{
+  "name": "typescript-native",
+  "version": "0.1.0",
+  "description": "AOT compiler: a TypeScript subset -> LLVM IR -> native executable",
+  "bin": {
+    "tsnc": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "tsnc": "node dist/index.js"
+  },
+  "dependencies": {
+    "typescript": "^5.4.0"
+  },
+  "devDependencies": {
+    "@types/node": "^25.9.3"
+  }
+}
