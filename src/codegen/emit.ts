@@ -6,12 +6,19 @@
 // real lowering to machine code, and enforces that non-void functions return
 // (we pass -Werror=return-type in the backend).
 //
-// Type mapping (chosen to preserve the previous backend's observable behavior):
-//   number  -> long long      (64-bit integer; integer division, as before)
+// Type mapping:
+//   number  -> double OR long long   (see repr.ts: integer-valued numbers use a
+//                                      64-bit integer rep, "i64"; the rest f64)
 //   boolean -> bool           (std::cout prints 1/0)
-//   string  -> std::string    (literals are const char*, convert implicitly)
+//   string  -> tsn_str        (ref-counted immutable string; see prelude)
 //   T[]     -> std::vector<T>  (heap-backed; .length -> .size())
 //   { ... } -> a generated `struct` (one per distinct field shape)
+//
+// A `number` value carries a representation ("i64" / "f64") alongside its type;
+// repr.ts infers, per variable/parameter/return, which one is sound to use. The
+// emitter consults that table for slot declarations and combines reps locally
+// for expressions (see emitBinary). Object fields and array elements always use
+// the f64 rep, so aggregates are unaffected.
 
 import {
   Module,
@@ -23,6 +30,7 @@ import {
   Func,
   RetType,
 } from "../ir/nodes";
+import { analyze, RepTable, Rep, litRep, combineRep, MAIN_KEY } from "./repr";
 
 // C++ operator text for each IR binary op (=== / !== map to == / !=).
 const CPP_OP: Record<BinaryOp, string> = {
@@ -82,9 +90,12 @@ function sameType(a: Type, b: Type): boolean {
 }
 
 // An emitted value: its C++ expression text and the tsn type it represents.
+// For `number` values, `rep` records the C++ representation ("i64" / "f64") of
+// the expression, so callers can pick integer vs floating operations.
 interface Value {
   code: string;
   type: Type;
+  rep?: Rep;
 }
 
 interface Sig {
@@ -102,13 +113,19 @@ class Emitter {
   private structDefs: string[] = []; // generated `struct ... { ... };` lines
   private structNames = new Map<string, string>(); // field-shape key -> struct name
 
+  // Representation table (number i64/f64), inferred up front by repr.ts.
+  private reps!: RepTable;
+
   // Per-function scratch, reset by resetForFunction().
   private body: string[] = [];
   private vars = new Map<string, Type>();
   private curReturn: RetType = "void";
+  private funcKey: string = MAIN_KEY; // scope key for repr lookups
   private indent = "  ";
 
   emitModule(mod: Module): string {
+    this.reps = analyze(mod); // decide each number slot's representation
+
     // First pass: collect signatures so calls can reference any function.
     for (const fn of mod.functions) {
       if (this.sigs.has(fn.name))
@@ -131,11 +148,62 @@ class Emitter {
       `#include <cmath>`,
       `#include <iostream>`,
       `#include <string>`,
+      `#include <utility>`,
       `#include <vector>`,
       ``,
+      // `string` is a ref-counted, immutable string. TypeScript strings are
+      // immutable, so a value can be freely shared: copying one bumps a counter
+      // and aliases the same heap buffer instead of duplicating the characters.
+      // That makes the costly operation in element-shuffling code (e.g. a sort's
+      // `a[j+1] = a[j]`) a pointer copy + counter bump rather than a char copy —
+      // the same trick V8 uses. The refcount is a plain (non-atomic) long: the
+      // generated programs are single-threaded, so no atomics are needed.
+      `struct tsn_str {`,
+      `  struct Rep { std::string s; long rc; };`,
+      `  Rep* p;`,
+      `  tsn_str() noexcept : p(nullptr) {}`,
+      `  tsn_str(const char* c) : p(new Rep{std::string(c), 1}) {}`,
+      `  tsn_str(std::string s) : p(new Rep{std::move(s), 1}) {}`,
+      `  tsn_str(const tsn_str& o) noexcept : p(o.p) { if (p) ++p->rc; }`,
+      `  tsn_str(tsn_str&& o) noexcept : p(o.p) { o.p = nullptr; }`,
+      `  tsn_str& operator=(const tsn_str& o) noexcept {`,
+      `    if (o.p) ++o.p->rc;`,
+      `    release();`,
+      `    p = o.p;`,
+      `    return *this;`,
+      `  }`,
+      `  tsn_str& operator=(tsn_str&& o) noexcept {`,
+      `    if (this != &o) { release(); p = o.p; o.p = nullptr; }`,
+      `    return *this;`,
+      `  }`,
+      `  ~tsn_str() { release(); }`,
+      `  void release() noexcept { if (p && --p->rc == 0) delete p; }`,
+      // p is null only for a moved-from value (left behind by vector growth or a
+      // by-value return) — never read in generated code, but treat it as the
+      // empty string so an accessor can never dereference null. The `p ?` branch
+      // is perfectly predicted (always true in practice), so it costs nothing.
+      `  const std::string& str() const noexcept {`,
+      `    static const std::string empty;`,
+      `    return p ? p->s : empty;`,
+      `  }`,
+      `  std::size_t size() const noexcept { return p ? p->s.size() : 0; }`,
+      `  operator const std::string&() const noexcept { return str(); }`,
+      `};`,
+      `inline bool operator<(const tsn_str& a, const tsn_str& b) { return a.str() < b.str(); }`,
+      `inline bool operator<=(const tsn_str& a, const tsn_str& b) { return a.str() <= b.str(); }`,
+      `inline bool operator>(const tsn_str& a, const tsn_str& b) { return a.str() > b.str(); }`,
+      `inline bool operator>=(const tsn_str& a, const tsn_str& b) { return a.str() >= b.str(); }`,
+      `inline bool operator==(const tsn_str& a, const tsn_str& b) { return a.str() == b.str(); }`,
+      `inline bool operator!=(const tsn_str& a, const tsn_str& b) { return a.str() != b.str(); }`,
+      `inline tsn_str operator+(const tsn_str& a, const tsn_str& b) { return tsn_str(a.str() + b.str()); }`,
+      `inline std::ostream& operator<<(std::ostream& os, const tsn_str& s) { return os << s.str(); }`,
+      ``,
       // `number` is a double; print it JS-style (shortest round-trip, integers
-      // without a trailing ".0") via std::to_chars.
+      // without a trailing ".0") via std::to_chars. NaN/Infinity get their JS
+      // spellings — std::to_chars would emit "nan"/"inf".
       `static std::string tsn_num_to_string(double v) {`,
+      `  if (std::isnan(v)) return "NaN";`,
+      `  if (std::isinf(v)) return v < 0 ? "-Infinity" : "Infinity";`,
       `  std::array<char, 32> buf;`,
       `  auto res = std::to_chars(buf.data(), buf.data() + buf.size(), v);`,
       `  return std::string(buf.data(), res.ptr);`,
@@ -156,12 +224,20 @@ class Emitter {
       `  return std::fmod(a, b);`,
       `}`,
       ``,
+      // JS `%` on operands already known to be integers (the i64 rep). Skips the
+      // integral-ness guards tsn_mod needs and uses one hardware remainder; the
+      // `b ?` guard keeps `x % 0` defined as NaN (JS semantics) instead of UB.
+      // The result is a double, so a NaN from `% 0` stays representable.
+      `static inline double tsn_imod(long long a, long long b) {`,
+      `  return b ? (double)(a % b) : NAN;`,
+      `}`,
+      ``,
       // String methods, matching JS String.prototype semantics. Indices are JS
       // numbers (doubles): NaN (the sentinel an omitted optional arg lowers to)
       // means "default"; otherwise truncate toward zero, then clamp. substring
       // clamps negatives to 0 and swaps a start > end; slice counts negatives
       // from the end. indexOf returns a 0-based position or -1.
-      `static std::string tsn_substring(const std::string& s, double startD, double endD) {`,
+      `static tsn_str tsn_substring(const std::string& s, double startD, double endD) {`,
       `  long long len = (long long)s.size();`,
       `  long long start = std::isnan(startD) ? 0 : (long long)startD;`,
       `  long long end = std::isnan(endD) ? len : (long long)endD;`,
@@ -173,7 +249,7 @@ class Emitter {
       `  return s.substr((std::size_t)start, (std::size_t)(end - start));`,
       `}`,
       ``,
-      `static std::string tsn_slice(const std::string& s, double startD, double endD) {`,
+      `static tsn_str tsn_slice(const std::string& s, double startD, double endD) {`,
       `  long long len = (long long)s.size();`,
       `  long long start = std::isnan(startD) ? 0 : (long long)startD;`,
       `  long long end = std::isnan(endD) ? len : (long long)endD;`,
@@ -195,7 +271,7 @@ class Emitter {
       `  return pos == std::string::npos ? -1.0 : (double)pos;`,
       `}`,
       ``,
-      `static std::string tsn_char_at(const std::string& s, double idxD) {`,
+      `static tsn_str tsn_char_at(const std::string& s, double idxD) {`,
       `  long long i = std::isnan(idxD) ? 0 : (long long)idxD;`,
       `  if (i < 0 || i >= (long long)s.size()) return std::string();`,
       `  return std::string(1, s[(std::size_t)i]);`,
@@ -207,12 +283,12 @@ class Emitter {
       `  return (double)(unsigned char)s[(std::size_t)i];`,
       `}`,
       ``,
-      `static std::string tsn_to_upper(std::string s) {`,
+      `static tsn_str tsn_to_upper(std::string s) {`,
       `  for (char& c : s) c = (char)std::toupper((unsigned char)c);`,
       `  return s;`,
       `}`,
       ``,
-      `static std::string tsn_to_lower(std::string s) {`,
+      `static tsn_str tsn_to_lower(std::string s) {`,
       `  for (char& c : s) c = (char)std::tolower((unsigned char)c);`,
       `  return s;`,
       `}`,
@@ -231,13 +307,26 @@ class Emitter {
   private cppType(t: Type): string {
     if (isArray(t)) return `std::vector<${this.cppType(t.element)}>`;
     if (isObject(t)) return this.structName(t);
-    if (t === "number") return "double";
+    if (t === "number") return "double"; // f64 rep — the default for nested aggregates
     if (t === "boolean") return "bool";
-    return "std::string"; // string
+    return "tsn_str"; // string — a ref-counted immutable string (see prelude)
   }
 
-  private retType(t: RetType): string {
-    return t === "void" ? "void" : this.cppType(t);
+  // C++ type for a number with a known representation.
+  private cppNumType(rep: Rep): string {
+    return rep === "i64" ? "long long" : "double";
+  }
+
+  // C++ type for a variable/parameter slot, honoring its number representation.
+  private slotType(t: Type, rep: Rep): string {
+    return t === "number" ? this.cppNumType(rep) : this.cppType(t);
+  }
+
+  // Return type of a function, honoring its number return representation.
+  private retSlotType(fnName: string, t: RetType): string {
+    if (t === "void") return "void";
+    if (t === "number") return this.cppNumType(this.reps.retRep(fnName));
+    return this.cppType(t);
   }
 
   // Generate (or reuse) a named struct for an object type. Keyed by field shape.
@@ -258,35 +347,42 @@ class Emitter {
 
   // --- functions ----------------------------------------------------------
 
-  private prototype(fn: Func): string {
-    const params = fn.params.map((p) => this.cppType(p.type)).join(", ");
-    return `${this.retType(fn.returnType)} ${fn.name}(${params});`;
+  // C++ type of a function parameter, honoring its inferred number representation.
+  private paramType(fnName: string, p: { name: string; type: Type }): string {
+    return this.slotType(p.type, this.reps.varRep(fnName, p.name));
   }
 
-  private resetForFunction(ret: RetType): void {
+  private prototype(fn: Func): string {
+    const params = fn.params.map((p) => this.paramType(fn.name, p)).join(", ");
+    return `${this.retSlotType(fn.name, fn.returnType)} ${fn.name}(${params});`;
+  }
+
+  private resetForFunction(ret: RetType, funcKey: string): void {
     this.body = [];
     this.vars = new Map();
     this.curReturn = ret;
+    this.funcKey = funcKey;
     this.indent = "  ";
   }
 
   private emitFunction(fn: Func): string {
-    this.resetForFunction(fn.returnType);
+    this.resetForFunction(fn.returnType, fn.name);
     for (const p of fn.params) this.vars.set(p.name, p.type);
     for (const s of fn.body) this.emitStmt(s);
 
     const params = fn.params
-      .map((p) => `${this.cppType(p.type)} ${p.name}`)
+      .map((p) => `${this.paramType(fn.name, p)} ${p.name}`)
       .join(", ");
     return [
-      `${this.retType(fn.returnType)} ${fn.name}(${params}) {`,
+      `${this.retSlotType(fn.name, fn.returnType)} ${fn.name}(${params}) {`,
       ...this.body,
       `}`,
     ].join("\n");
   }
 
   private emitMain(stmts: Stmt[]): string {
-    this.resetForFunction("void"); // top-level `return` is rejected during lowering
+    // top-level `return` is rejected during lowering
+    this.resetForFunction("void", MAIN_KEY);
     for (const s of stmts) this.emitStmt(s);
     return [`int main() {`, ...this.body, `  return 0;`, `}`].join("\n");
   }
@@ -331,16 +427,6 @@ class Emitter {
         this.vars.set(stmt.name, stmt.type);
         return `${this.cppType(stmt.type)} ${stmt.name} = {}`;
       }
-      // Unannotated integer literal -> infer C++ `int` from the actual value,
-      // e.g. `const a = 12` -> `int a = 12`. (Annotated `: number` stays double.)
-      if (
-        stmt.type === undefined &&
-        stmt.init.kind === "num" &&
-        Number.isInteger(stmt.init.value)
-      ) {
-        this.vars.set(stmt.name, "number");
-        return `int ${stmt.name} = ${stmt.init.value}`;
-      }
       const init = this.emitExpr(stmt.init);
       // With an annotation, check assignability; without one, infer from the init.
       if (stmt.type !== undefined && !sameType(stmt.type, init.type)) {
@@ -350,7 +436,11 @@ class Emitter {
       }
       // Bind the initializer's type (for aggregates, its field/element shape).
       this.vars.set(stmt.name, init.type);
-      return `${this.cppType(init.type)} ${stmt.name} = ${init.code}`;
+      // The variable's C++ type follows its inferred number representation (a
+      // safe-integer initializer that's never assigned a fraction stays i64); an
+      // i64 init code widens harmlessly into a demoted (double) slot.
+      const cpp = this.slotType(init.type, this.reps.varRep(this.funcKey, stmt.name));
+      return `${cpp} ${stmt.name} = ${init.code}`;
     }
     if (stmt.kind === "assign") {
       const target = this.emitLValue(stmt.target);
@@ -431,9 +521,13 @@ class Emitter {
             "console.log of an object is not supported yet (log fields individually)",
           );
         }
-        // Numbers (doubles) print JS-style; strings/booleans stream directly.
+        // f64 numbers print JS-style via to_chars; an i64 number is already an
+        // integer that streams correctly (no trailing ".0"). Strings/booleans
+        // stream directly.
         const out =
-          val.type === "number" ? `tsn_num_to_string(${val.code})` : val.code;
+          val.type === "number" && val.rep !== "i64"
+            ? `tsn_num_to_string(${val.code})`
+            : val.code;
         this.push(`std::cout << ${out} << "\\n";`);
         return;
       }
@@ -506,18 +600,28 @@ class Emitter {
   private emitExpr(e: Expr): Value {
     switch (e.kind) {
       case "num": {
-        // Emit a C++ double literal: "2" -> "2.0", but keep "2.5" / "1e21" as-is.
         const s = String(e.value);
-        return { code: /[.eE]/.test(s) ? s : `${s}.0`, type: "number" };
+        // A safe-integer literal is an i64 (`2` -> `2LL`); anything fractional or
+        // beyond 2^53 is a C++ double literal ("2.5" / "1e21" as-is, "2" -> "2.0").
+        if (litRep(e.value) === "i64") {
+          return { code: `${s}LL`, type: "number", rep: "i64" };
+        }
+        return {
+          code: /[.eE]/.test(s) ? s : `${s}.0`,
+          type: "number",
+          rep: "f64",
+        };
       }
       case "bool":
         return { code: e.value ? "true" : "false", type: "boolean" };
       case "str":
-        return { code: cppStringLiteral(e.value), type: "string" };
+        return { code: `tsn_str(${cppStringLiteral(e.value)})`, type: "string" };
       case "var": {
         const type = this.vars.get(e.name);
         if (!type) throw new Error(`Unknown variable: ${e.name}`);
-        return { code: e.name, type };
+        const rep =
+          type === "number" ? this.reps.varRep(this.funcKey, e.name) : undefined;
+        return { code: e.name, type, rep };
       }
       case "binary":
         return this.emitBinary(e);
@@ -528,10 +632,10 @@ class Emitter {
             throw new Error("Operator '!' expects a boolean");
           return { code: `(!${v.code})`, type: "boolean" };
         }
-        // unary `-` / `+` — numeric negation / identity.
+        // unary `-` / `+` — numeric negation / identity; rep is preserved.
         if (v.type !== "number")
           throw new Error(`Operator '${e.op}' expects a number`);
-        return { code: `(${e.op}${v.code})`, type: "number" };
+        return { code: `(${e.op}${v.code})`, type: "number", rep: v.rep };
       }
       case "array": {
         if (e.elements.length === 0) {
@@ -585,36 +689,36 @@ class Emitter {
           throw new Error("Array index must be a number");
         }
         // `number` is a double; operator[] needs an integer index.
-        const at = `${arr.code}[static_cast<std::size_t>(${idx.code})]`;
+        const i = `static_cast<std::size_t>(${idx.code})`;
         // `s[i]` on a string yields a one-char string (JS has no char type).
         if (arr.type === "string") {
-          return { code: `std::string(1, ${at})`, type: "string" };
+          return {
+            code: `tsn_str(std::string(1, (${arr.code}).str()[${i}]))`,
+            type: "string",
+          };
         }
-        return { code: at, type: arr.type.element };
+        // Array elements use the f64 rep (vector<double> for number[]).
+        return {
+          code: `${arr.code}[${i}]`,
+          type: arr.type.element,
+          rep: arr.type.element === "number" ? "f64" : undefined,
+        };
       }
       case "member": {
         const obj = this.emitExpr(e.obj);
-        // `arr.length` — std::vector::size() as a number (double).
-        if (isArray(obj.type)) {
+        // `arr.length` / `str.length` — size() is a non-negative integer (i64).
+        if (isArray(obj.type) || obj.type === "string") {
           if (e.name === "length") {
             return {
-              code: `static_cast<double>((${obj.code}).size())`,
+              code: `static_cast<long long>((${obj.code}).size())`,
               type: "number",
+              rep: "i64",
             };
           }
-          throw new Error(`Arrays have no property '${e.name}'`);
+          const kind = isArray(obj.type) ? "Arrays" : "Strings";
+          throw new Error(`${kind} have no property '${e.name}'`);
         }
-        // `str.length` — std::string::size() as a number (double). A bare string
-        // literal is a `const char*`, which has no `.size()`; wrap it so the call
-        // resolves. (Any other string-typed expression is already a std::string.)
-        if (obj.type === "string") {
-          if (e.name === "length") {
-            const s = e.obj.kind === "str" ? `std::string(${obj.code})` : `(${obj.code})`;
-            return { code: `static_cast<double>(${s}.size())`, type: "number" };
-          }
-          throw new Error(`Strings have no property '${e.name}'`);
-        }
-        // `obj.field`
+        // `obj.field` — object fields use the f64 rep.
         if (isObject(obj.type)) {
           const field = obj.type.fields.find((f) => f.name === e.name);
           if (!field) {
@@ -622,7 +726,11 @@ class Emitter {
               `Property '${e.name}' does not exist on type '${displayType(obj.type)}'`,
             );
           }
-          return { code: `(${obj.code}).${e.name}`, type: field.type };
+          return {
+            code: `(${obj.code}).${e.name}`,
+            type: field.type,
+            rep: field.type === "number" ? "f64" : undefined,
+          };
         }
         throw new Error(
           `Type '${displayType(obj.type)}' has no property '${e.name}'`,
@@ -630,11 +738,15 @@ class Emitter {
       }
       case "call": {
         const val = this.emitCall(e, /*asStatement*/ false);
-        return { code: val.code, type: val.type as Type };
+        const rep =
+          val.type === "number" ? this.reps.retRep(e.callee) : undefined;
+        return { code: val.code, type: val.type as Type, rep };
       }
       case "methodCall": {
         const val = this.emitMethodCall(e, /*asStatement*/ false);
-        return { code: val.code, type: val.type as Type };
+        // charCodeAt / indexOf return numbers in the f64 rep (can be NaN / -1).
+        const rep = val.type === "number" ? "f64" : undefined;
+        return { code: val.code, type: val.type as Type, rep };
       }
     }
   }
@@ -644,19 +756,10 @@ class Emitter {
     const r = this.emitExpr(e.right);
     const code = `(${l.code} ${CPP_OP[e.op]} ${r.code})`;
 
-    // String comparison (relational + equality). A bare string literal is a
-    // `const char*`, so two literals would compare pointers; wrapping the left
-    // literal forces std::string's lexicographic operators (a mixed
-    // `const char* OP std::string` already resolves the right way).
-    const stringCmp = () => {
-      const left = e.left.kind === "str" ? `std::string(${l.code})` : l.code;
-      return `(${left} ${CPP_OP[e.op]} ${r.code})`;
-    };
-
     if (ARITH.has(e.op)) {
-      // `+` with a string operand is concatenation (numbers coerce via the same
-      // JS-style formatter; std::string(...) on the left makes operator+ resolve
-      // even when both operands are bare `const char*` literals).
+      // `+` with a string operand is concatenation. Each operand becomes a
+      // tsn_str (a number coerces to its JS string form), then tsn_str's
+      // operator+ produces the concatenated tsn_str.
       if (e.op === "+" && (l.type === "string" || r.type === "string")) {
         const okConcat = (t: Type) => t === "string" || t === "number";
         if (!okConcat(l.type) || !okConcat(r.type)) {
@@ -664,27 +767,46 @@ class Emitter {
             `Cannot concatenate '${displayType(l.type)}' and '${displayType(r.type)}'`,
           );
         }
+        // An i64 number prints exactly via std::to_string; an f64 uses the
+        // shortest-round-trip formatter.
         const strForm = (v: Value) =>
-          v.type === "number" ? `tsn_num_to_string(${v.code})` : v.code;
-        return {
-          code: `(std::string(${strForm(l)}) + ${strForm(r)})`,
-          type: "string",
-        };
+          v.type !== "number"
+            ? v.code
+            : v.rep === "i64"
+              ? `tsn_str(std::to_string(${v.code}))`
+              : `tsn_str(tsn_num_to_string(${v.code}))`;
+        return { code: `(${strForm(l)} + ${strForm(r)})`, type: "string" };
       }
       if (l.type !== "number" || r.type !== "number") {
         throw new Error(`Operator '${e.op}' expects numbers`);
       }
-      // `number` is a double, so `%` can't use C++ integer `%`. tsn_mod takes a
-      // fast hardware-remainder path for integer-valued operands and falls back
-      // to std::fmod otherwise — both match JS `%`. (Plain std::fmod here was the
-      // hot spot in modulo-heavy loops: a libm call per iteration.)
-      const arithCode = e.op === "%" ? `tsn_mod(${l.code}, ${r.code})` : code;
-      return { code: arithCode, type: "number" };
+      const lr = l.rep ?? "f64";
+      const rr = r.rep ?? "f64";
+      // Cast an i64 operand to double where float arithmetic is required.
+      const asF64 = (v: Value) =>
+        v.rep === "i64" ? `static_cast<double>(${v.code})` : v.code;
+      if (e.op === "/") {
+        // JS `/` is always float division — this is also what stops two integer
+        // operands from doing C++ truncating integer division.
+        return { code: `(${asF64(l)} / ${asF64(r)})`, type: "number", rep: "f64" };
+      }
+      if (e.op === "%") {
+        // Integer operands take the fast guarded integer remainder; otherwise
+        // tsn_mod's fmod path. Either way the result is f64, so `x % 0 === NaN`.
+        const modCode =
+          lr === "i64" && rr === "i64"
+            ? `tsn_imod(${l.code}, ${r.code})`
+            : `tsn_mod(${asF64(l)}, ${asF64(r)})`;
+        return { code: modCode, type: "number", rep: "f64" };
+      }
+      // `+` `-` `*` — integer only when both operands are; a mixed pair is
+      // promoted to double by C++. (`code` is `(l <op> r)`.)
+      return { code, type: "number", rep: combineRep(lr, rr) };
     }
     if (RELATIONAL.has(e.op)) {
-      // Lexicographic ordering on strings (std::string compares this way).
+      // Lexicographic ordering on strings (tsn_str compares this way).
       if (l.type === "string" && r.type === "string") {
-        return { code: stringCmp(), type: "boolean" };
+        return { code, type: "boolean" };
       }
       if (l.type !== "number" || r.type !== "number") {
         throw new Error(`Operator '${e.op}' expects numbers or strings`);
@@ -701,10 +823,7 @@ class Emitter {
           `Cannot compare '${displayType(l.type)}' and '${displayType(r.type)}' with '${e.op}'`,
         );
       }
-      // Value comparison for strings (not the `const char*` pointer compare).
-      if (l.type === "string") {
-        return { code: stringCmp(), type: "boolean" };
-      }
+      // Value comparison for strings (tsn_str's operator==/!=).
       return { code, type: "boolean" };
     }
     // logical && ||

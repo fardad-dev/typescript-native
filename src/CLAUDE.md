@@ -21,6 +21,8 @@ backend/clang.ts    (4) clang++ .cpp -> native executable
 - [frontend/lower.ts](frontend/lower.ts) — TypeScript AST → our IR. See [frontend/CLAUDE.md](frontend/CLAUDE.md).
 - [ir/nodes.ts](ir/nodes.ts) — IR node definitions. See [ir/CLAUDE.md](ir/CLAUDE.md).
 - [codegen/emit.ts](codegen/emit.ts) — IR → C++ source. See [codegen/CLAUDE.md](codegen/CLAUDE.md).
+- [codegen/repr.ts](codegen/repr.ts) — number-representation pass (`i64`/`f64`) the emitter runs
+  first, so integer-valued numbers compile to `long long`. See [codegen/CLAUDE.md](codegen/CLAUDE.md).
 - [backend/clang.ts](backend/clang.ts) — compile + link via clang++. See [backend/CLAUDE.md](backend/CLAUDE.md).
 
 ## Adding a language feature (the repeated 3-touch pattern)

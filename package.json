@@ -32,6 +32,9 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "tsnc": "node dist/index.js",
+    "bench": "node benchmark/run.mjs",
+    "bench:words": "node benchmark/sort-words.mjs",
+    "bench:leaderboard": "node benchmark/leaderboard.mjs",
     "test": "vitest run",
     "test:watch": "vitest",
     "prepare": "npm run build",

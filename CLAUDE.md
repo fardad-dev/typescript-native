@@ -81,7 +81,7 @@ npm test            # run the e2e suite once (vitest run)
 npm run test:watch  # re-run on change — the TDD red->green loop
 ```
 
-The suite (currently **33 cases**, all green) auto-discovers every `tests/cases/*.ts`,
+The suite (currently **34 cases**, all green) auto-discovers every `tests/cases/*.ts`,
 compiles it to a real native binary, runs it, and diffs stdout against the matching
 `.expected` file. **Every feature gets a `tests/cases/*.ts` + `.expected` pair**, ideally
 written first (red), then implemented to green. See [tests/CLAUDE.md](tests/CLAUDE.md).
@@ -114,23 +114,58 @@ tsn types map onto C++ types (see [src/codegen/CLAUDE.md](src/codegen/CLAUDE.md)
 
 | tsn type | C++ type           | notes                                                       |
 | -------- | ------------------ | ----------------------------------------------------------- |
-| number   | `double`           | IEEE f64 — `5 / 2 === 2.5`; printed JS-style via `to_chars` |
+| number   | `double` or `long long` | IEEE f64 by default; **integer-valued numbers use a 64-bit int rep** (see below). Printed JS-style |
 | boolean  | `bool`             | `std::cout` prints `1` / `0`                                |
-| string   | `std::string`      | literals are `const char*`, convert implicitly; methods → `tsn_*` helpers |
+| string   | `tsn_str`          | ref-counted immutable string; copy = pointer + refcount bump (no char copy); methods → `tsn_*` helpers |
 | `T[]`    | `std::vector<T>`   | heap-backed; `.length` → `.size()`; `.push()` → `push_back` |
 | `{ ... }`| generated `struct` | one struct per distinct field shape                         |
 
-- **`number` is `double`.** `%` compiles to the `tsn_mod` helper (`std::fmod`, with a hardware
-  integer-remainder fast path when both operands are integer-valued); array indices cast to integer.
+- **`number` is f64, but integer-valued numbers use a 64-bit integer representation.** A
+  pre-pass ([src/codegen/repr.ts](src/codegen/repr.ts)) infers, per variable / parameter / return,
+  whether every value reaching it is provably integer-valued; if so it's emitted as `long long`
+  (`i64`) instead of `double` (`f64`). This gives integer arithmetic, `%`, and comparisons the
+  CPU's integer units — **~1.8× on integer-heavy loops** (a prime sieve; and tsnc now *beats* V8
+  by ~2× in its own JIT-warm regime, where it used to reach parity). Soundness: a slot is `i64`
+  only when no fractional value can flow in; `/` is **always** float division (`5 / 2 === 2.5`,
+  and two integer vars no longer do C++ integer division), and `%` returns f64 so `x % 0 === NaN`
+  stays representable (fast `tsn_imod` for integer operands, `tsn_mod`/`fmod` otherwise). Object
+  fields and array elements always use the f64 rep. The one accepted imprecision — shared with all
+  native-int compilation — is wraparound past 2^63.
 - **Inference picks the concrete C++ type.** An unannotated declaration takes its type from the
-  initializer; an integer literal becomes `int` (`const a = 12` → `int a = 12`), a decimal becomes
-  `double`, etc. An annotated `: number` is always `double`. `var` is rejected during lowering.
+  initializer (`const s = "hi"` → string, `const a = 12` → `number`); whether a `number` lands on
+  `long long` or `double` is the rep decision above (`const a = 12` → `long long a = 12LL`). `var`
+  is rejected during lowering.
+- **`string` is ref-counted (`tsn_str`), not `std::string`.** TypeScript strings are immutable,
+  so a value is shared, not duplicated: copying one bumps a counter and aliases the same heap
+  buffer. This makes the hot operation in element-shuffling code (e.g. a sort's `a[j+1]=a[j]`) a
+  pointer copy + counter bump instead of a character copy — matching V8's pointer moves. The
+  tradeoff: every string is a heap allocation (no `std::string` small-string optimization), so
+  string-creation-heavy code pays an alloc per value. The refcount is a plain (non-atomic) `long`
+  — generated programs are single-threaded.
 - **Scalar-only boundaries (v1):** object fields and function params/returns must be
   `number`/`boolean`/`string`. (C++ value semantics would now make aggregate params/returns
   safe — this restriction is enforced in the front-end and can be lifted next.)
 
 The compiler **errors cleanly** (a `tsnc:` message) on unsupported constructs rather than
 miscompiling — e.g. `console.log` of an aggregate, void-as-value, type mismatches.
+
+### Unsupported types (rejected at lowering)
+
+Every type annotation must lower to one of the supported types above; anything else throws
+`tsnc: Unsupported type annotation: <SyntaxKind>` from `lowerType` ([src/frontend/lower.ts](src/frontend/lower.ts)).
+Not yet supported:
+
+| Type                    | Example                       | Notes                                                       |
+| ----------------------- | ----------------------------- | ----------------------------------------------------------- |
+| Union                   | `number \| string`            | No tagged-union representation yet.                         |
+| `any`                   | `let x: any`                  | Would erase the static type codegen relies on.              |
+| `unknown` / `never`     | `let x: unknown`              | Same reason as `any`.                                       |
+| Tuple                   | `[number, string]`            | Only homogeneous `T[]` arrays are supported.                |
+| Literal / enum          | `"a" \| "b"`, `enum E {}`     | No literal types or enums.                                  |
+| Intersection            | `A & B`                       | No type composition.                                        |
+| Function type           | `(x: number) => number`       | No first-class function values / closures.                  |
+| Generic / type param    | `Map<K, V>`, `<T>(x: T) => T` | Only the built-in `Array<T>` is special-cased.              |
+| `null` / `undefined`    | `string \| null`             | No nullable types; no optional (`x?:`) fields/params.       |
 
 ## Conventions
 
@@ -181,8 +216,19 @@ pair** (red → green).
       `indexOf` / `charAt` / `charCodeAt` / `toUpperCase` / `toLowerCase` (JS semantics, via
       `tsn_*` runtime helpers).
 - [x] **Native-speed backend** — `clang++ -O3`; ~10–17× faster than `node app.ts` for normal
-      program sizes (Node's startup/JIT-warmup tax dominates), ~parity on sustained hot loops
-      (where V8's JIT has fully warmed).
+      program sizes (Node's startup/JIT-warmup tax dominates). On sustained hot loops it now
+      *beats* a JIT-warm V8 on integer work (~2× on the prime sieve; see the integer fast path
+      below) and stays ~parity on string-comparison-bound work.
+- [x] **Ref-counted immutable strings (`tsn_str`)** — strings are shared, not copied, so
+      element-shuffling code (sorts) moves a pointer + bumps a counter instead of copying chars
+      (matching V8). On the `benchmark/sort-words.mjs` word-sort this cut tsnc's sustained-compute
+      gap to V8 from ~15% behind to ~parity (a same-source A/B shows ~12% over by-value strings).
+- [x] **Integer fast path for `number`** — a representation pass ([src/codegen/repr.ts](src/codegen/repr.ts))
+      emits `long long` for provably integer-valued numbers (variables, parameters, returns) and
+      `double` for the rest, via a sound monotone fixpoint. **~1.8× on integer-heavy loops**; in
+      V8's own JIT-warm regime the prime sieve goes from ~parity to ~2× ahead. As a bonus it fixed
+      a latent `int/int` truncation bug (`/` is now always float division) and made `NaN`/`Infinity`
+      print JS-style.
 
 ### Will support — strings (next; needed by the word-sort benchmark)
 
@@ -201,9 +247,6 @@ pair** (red → green).
 
 - [ ] **Full `ts.Program` + TypeChecker** — real semantic diagnostics; abort before codegen on
       type errors instead of reading AST annotations.
-- [ ] **Integer fast path for `number`** — emit `long long` for provably integer-valued numbers
-      (keep `double` for fractional), for ~2× on integer-heavy loops (matches Rust/Go/C++; see
-      `benchmark/`). This is the one remaining compute-speed lever over Node.
 
 ### Later
 

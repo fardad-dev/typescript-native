@@ -5,18 +5,38 @@ text**. `emit(mod): string` returns the full `.cpp`. C++ is a high-level target,
 **expression-based**: `emitExpr` returns a C++ expression string and we let `clang++` do the
 real lowering — no SSA temporaries or pointer bookkeeping here.
 
-## Type mapping (`cppType`)
+## Type mapping (`cppType` / `slotType`)
 
 | tsn type            | C++ type             | notes                                                  |
 | ------------------- | -------------------- | ------------------------------------------------------ |
-| `number`            | `double`             | IEEE f64; `%` → `std::fmod`; printed via `tsn_num_to_string` |
+| `number`            | `double` or `long long` | f64 by default; integer-valued slots use the `i64` rep (`long long`) — see below. `cppType` returns `double` (the rep used for nested aggregates); `slotType` honors the slot's rep |
 | `boolean`           | `bool`               | `std::cout` prints `1`/`0`                             |
-| `string`            | `std::string`        | literals are `const char*`, convert implicitly; `<`/`==` force std::string ops (not pointer compare); `s.length`→`.size()`; `s[i]`→one-char string; methods → `tsn_*` helpers |
-| `T[]`               | `std::vector<T>`     | `.length` → `static_cast<double>(v.size())`; `.push()` → `push_back`; index cast to `std::size_t` |
-| `{ ... }`           | generated `struct`   | `structName()` dedupes by field shape                  |
+| `string`            | `tsn_str`            | ref-counted immutable string (prelude struct); copy = pointer + refcount bump, so array shuffles don't copy chars. Every string expr is a `tsn_str` (literals too: `tsn_str("…")`); operators (`<` `==` `+` `<<`) and `.str()`/`.size()` are defined on it; methods → `tsn_*` helpers (take `const std::string&` via its conversion, return `tsn_str`) |
+| `T[]`               | `std::vector<T>`     | `.length` → `static_cast<long long>(v.size())` (i64); `.push()` → `push_back`; index cast to `std::size_t` |
+| `{ ... }`           | generated `struct`   | `structName()` dedupes by field shape; number fields use the f64 rep |
 
-A `Value` is `{ code, type }` — the C++ expression text and its tsn `Type`. No length
-tracking is needed anymore (arrays are real `std::vector`s).
+A `Value` is `{ code, type, rep? }` — the C++ expression text, its tsn `Type`, and (for
+`number`) its representation `"i64"`/`"f64"`. No length tracking is needed (arrays are real
+`std::vector`s).
+
+## Number representation (`repr.ts`, run before emission)
+
+JS `number` is f64, but most program numbers are integer-valued. [repr.ts](repr.ts) runs a
+**monotone fixpoint** over the whole module and decides, per variable / parameter / return
+("slot"), whether it can be a `long long` (`i64`) — i.e. only integer values can flow in — or
+must stay `double` (`f64`). The emitter then:
+
+- declares slots with `slotType` / `paramType` / `retSlotType` (consulting the table);
+- tags each expression `Value` with a rep, combining locally (`litRep`, `combineRep`): `+ - *`
+  are `i64` only when both operands are; `/` is **always** `f64` (so two integer vars don't do
+  C++ integer division); `%` yields `f64` (`tsn_imod` for `i64` operands — guarded so `x % 0`
+  is `NaN`, not UB — else `tsn_mod`); `.length` is `i64`; fields/elements/`charCodeAt` are `f64`.
+
+Soundness rests on the rep table never declaring an `i64` slot that can receive a fraction
+(the fixpoint demotes `i64`→`f64` on the first floating source, and re-walks until stable).
+`repr.ts`'s expr typing mirrors the emitter's just well enough to find slots; the emitter stays
+the authority on types, so a divergence can only make a rep more conservative, never unsound.
+Accepted imprecision: integer wraparound past 2^63.
 
 ## The `Emitter` class
 
@@ -32,9 +52,11 @@ tracking is needed anymore (arrays are real `std::vector`s).
 
 - **Expression-based:** build C++ expressions; fully parenthesize binary ops
   (`(${l} ${op} ${r})`) to preserve precedence.
-- Integer literals get an `LL` suffix (`2LL`) to stay 64-bit.
-- `let` declares with the **initializer's** type (`cppType(init.type)`), so aggregates get
-  their literal's exact `vector`/`struct` shape.
+- A safe-integer literal emits as `i64` (`2` → `2LL`); a fractional/large one as a `double`
+  literal (`2.5`, `1e21`, `2` → `2.0`).
+- `let` declares with the **initializer's** type, but a `number` slot's C++ type comes from its
+  rep (`slotType`), not `cppType` — so a demoted slot is `double` even with an `i64` initializer
+  (the `i64` literal widens in). Aggregates still get their literal's exact `vector`/`struct` shape.
 - `console.log` → `std::cout << <expr> << "\n"`.
 - Object literals become `structName{...}`; arrays become `std::vector<T>{...}`.
 - `cppStringLiteral` encodes JS strings as C++ literals (escape `"`/`\`/controls; other bytes
