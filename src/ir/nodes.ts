@@ -1,7 +1,13 @@
 // Internal IR: a small, typed representation lowered from the TypeScript AST.
 // Codegen consumes this — never the raw TS AST.
 
-export type Type = "number" | "boolean" | "string";
+// Arrays carry their element type but not a length — length is a value-level
+// property (our arrays are stack-allocated with a compile-time-known size).
+export type Type =
+  | "number"
+  | "boolean"
+  | "string"
+  | { kind: "array"; element: Type };
 
 export type BinaryOp = "+" | "-" | "*" | "/" | "%";
 
@@ -10,7 +16,10 @@ export type Expr =
   | { kind: "bool"; value: boolean }
   | { kind: "str"; value: string }
   | { kind: "var"; name: string }
-  | { kind: "binary"; op: BinaryOp; left: Expr; right: Expr };
+  | { kind: "binary"; op: BinaryOp; left: Expr; right: Expr }
+  | { kind: "array"; elements: Expr[] }
+  | { kind: "index"; arr: Expr; index: Expr }
+  | { kind: "length"; arg: Expr };
 
 export type Stmt =
   | { kind: "let"; name: string; type: Type; init: Expr }

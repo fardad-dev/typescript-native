@@ -3,10 +3,11 @@
 // v1 representation:
 //   number, boolean -> i64 (booleans are 0/1)
 //   string          -> ptr to a private global byte array (a NUL-terminated C string)
+//   T[]             -> ptr to a stack buffer (`alloca [N x repr(T)]`), compile-time-sized
 //
-// Every emitted value carries its IR type so we know its LLVM representation
-// (i64 vs ptr), which store/load width to use, and which printf format to pick.
-// Mutable `let` bindings live in stack slots (alloca + load/store).
+// Every emitted value carries its IR type (and, for arrays, a compile-time
+// length) so we know its LLVM representation, which store/load width to use,
+// which printf format to pick, and how to index it.
 
 import { Module, Expr, Stmt, BinaryOp, Type } from "../ir/nodes";
 
@@ -20,15 +21,33 @@ const OPCODE: Record<BinaryOp, string> = {
   "%": "srem",
 };
 
-// The LLVM type used to represent a tsn value.
-function reprOf(t: Type): "i64" | "ptr" {
-  return t === "string" ? "ptr" : "i64";
+type ArrayType = { kind: "array"; element: Type };
+
+function isArray(t: Type): t is ArrayType {
+  return typeof t === "object" && t.kind === "array";
 }
 
-// An emitted value: its LLVM operand text and the tsn type it represents.
+// The LLVM type used to represent a tsn value. Arrays and strings are pointers.
+function reprOf(t: Type): "i64" | "ptr" {
+  return typeof t === "object" || t === "string" ? "ptr" : "i64";
+}
+
+function displayType(t: Type): string {
+  return isArray(t) ? `${displayType(t.element)}[]` : t;
+}
+
+function sameType(a: Type, b: Type): boolean {
+  if (isArray(a) && isArray(b)) return sameType(a.element, b.element);
+  if (isArray(a) || isArray(b)) return false;
+  return a === b;
+}
+
+// An emitted value: its LLVM operand text, the tsn type it represents, and —
+// for arrays — its compile-time element count.
 interface Value {
   v: string;
   type: Type;
+  length?: number;
 }
 
 export function emit(mod: Module): string {
@@ -40,7 +59,7 @@ class Emitter {
   private globals: string[] = []; // string-literal constants
   private temp = 0;
   private strCount = 0;
-  private vars = new Map<string, { ptr: string; type: Type }>();
+  private vars = new Map<string, { ptr: string; type: Type; length?: number }>();
 
   emitModule(mod: Module): string {
     for (const stmt of mod.stmts) this.emitStmt(stmt);
@@ -81,10 +100,16 @@ class Emitter {
     switch (stmt.kind) {
       case "let": {
         const init = this.emitExpr(stmt.init);
-        if (reprOf(stmt.type) !== reprOf(init.type)) {
+        if (!sameType(stmt.type, init.type)) {
           throw new Error(
-            `Type '${init.type}' is not assignable to '${stmt.type}'`
+            `Type '${displayType(init.type)}' is not assignable to '${displayType(stmt.type)}'`
           );
+        }
+        // An array binding reuses the buffer the literal already allocated —
+        // no separate pointer slot, and references need no load.
+        if (isArray(stmt.type)) {
+          this.vars.set(stmt.name, { ptr: init.v, type: stmt.type, length: init.length });
+          return;
         }
         const r = reprOf(stmt.type);
         const ptr = `%${stmt.name}.addr`;
@@ -95,6 +120,11 @@ class Emitter {
       }
       case "log": {
         const val = this.emitExpr(stmt.arg);
+        if (isArray(val.type)) {
+          throw new Error(
+            "console.log of an array is not supported yet (log elements individually)"
+          );
+        }
         const t = this.fresh();
         if (reprOf(val.type) === "ptr") {
           this.body.push(
@@ -122,6 +152,10 @@ class Emitter {
       case "var": {
         const slot = this.vars.get(e.name);
         if (!slot) throw new Error(`Unknown variable: ${e.name}`);
+        // Arrays are passed around as the buffer pointer itself — no load.
+        if (isArray(slot.type)) {
+          return { v: slot.ptr, type: slot.type, length: slot.length };
+        }
         const r = reprOf(slot.type);
         const t = this.fresh();
         this.body.push(`  ${t} = load ${r}, ptr ${slot.ptr}`);
@@ -135,9 +169,59 @@ class Emitter {
             "String concatenation is not supported yet (needs a heap/runtime)"
           );
         }
+        if (isArray(l.type) || isArray(r.type)) {
+          throw new Error("Arithmetic on arrays is not supported");
+        }
         const t = this.fresh();
         this.body.push(`  ${t} = ${OPCODE[e.op]} i64 ${l.v}, ${r.v}`);
         return { v: t, type: "number" };
+      }
+      case "array": {
+        if (e.elements.length === 0) {
+          throw new Error(
+            "Empty array literals are not supported (element type cannot be inferred)"
+          );
+        }
+        const vals = e.elements.map((el) => this.emitExpr(el));
+        const element = vals[0].type;
+        for (const val of vals) {
+          if (!sameType(val.type, element)) {
+            throw new Error("All array elements must have the same type");
+          }
+        }
+        const er = reprOf(element);
+        const n = vals.length;
+        const arr = this.fresh();
+        this.body.push(`  ${arr} = alloca [${n} x ${er}]`);
+        vals.forEach((val, i) => {
+          const p = this.fresh();
+          this.body.push(`  ${p} = getelementptr ${er}, ptr ${arr}, i64 ${i}`);
+          this.body.push(`  store ${er} ${val.v}, ptr ${p}`);
+        });
+        return { v: arr, type: { kind: "array", element }, length: n };
+      }
+      case "index": {
+        const arr = this.emitExpr(e.arr);
+        if (!isArray(arr.type)) {
+          throw new Error(`Cannot index a value of type '${displayType(arr.type)}'`);
+        }
+        const idx = this.emitExpr(e.index);
+        if (idx.type !== "number") {
+          throw new Error("Array index must be a number");
+        }
+        const er = reprOf(arr.type.element);
+        const p = this.fresh();
+        this.body.push(`  ${p} = getelementptr ${er}, ptr ${arr.v}, i64 ${idx.v}`);
+        const t = this.fresh();
+        this.body.push(`  ${t} = load ${er}, ptr ${p}`);
+        return { v: t, type: arr.type.element };
+      }
+      case "length": {
+        const arr = this.emitExpr(e.arg);
+        if (!isArray(arr.type) || arr.length === undefined) {
+          throw new Error("'.length' is only supported on arrays");
+        }
+        return { v: String(arr.length), type: "number" };
       }
     }
   }

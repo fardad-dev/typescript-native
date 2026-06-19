@@ -54,13 +54,21 @@ function lowerType(node: ts.TypeNode): Type {
   if (node.kind === ts.SyntaxKind.NumberKeyword) return "number";
   if (node.kind === ts.SyntaxKind.BooleanKeyword) return "boolean";
   if (node.kind === ts.SyntaxKind.StringKeyword) return "string";
-  // In our `tsn` dialect, the boxed wrappers `Number`/`Boolean`/`String` are
-  // treated as their primitives — we only have one of each.
+  // `T[]`
+  if (ts.isArrayTypeNode(node)) {
+    return { kind: "array", element: lowerType(node.elementType) };
+  }
   if (ts.isTypeReferenceNode(node) && ts.isIdentifier(node.typeName)) {
     const n = node.typeName.text;
+    // In our `tsn` dialect, the boxed wrappers `Number`/`Boolean`/`String` are
+    // treated as their primitives — we only have one of each.
     if (n === "Number" || n === "number") return "number";
     if (n === "Boolean" || n === "boolean") return "boolean";
     if (n === "String" || n === "string") return "string";
+    // `Array<T>`
+    if (n === "Array" && node.typeArguments?.length === 1) {
+      return { kind: "array", element: lowerType(node.typeArguments[0]) };
+    }
   }
   throw new Error(`Unsupported type annotation: ${ts.SyntaxKind[node.kind]}`);
 }
@@ -77,6 +85,30 @@ function lowerExpr(node: ts.Expression): Expr {
   if (node.kind === ts.SyntaxKind.FalseKeyword) return { kind: "bool", value: false };
   if (ts.isIdentifier(node)) return { kind: "var", name: node.text };
   if (ts.isParenthesizedExpression(node)) return lowerExpr(node.expression);
+  if (ts.isArrayLiteralExpression(node)) {
+    return {
+      kind: "array",
+      elements: node.elements.map((el) => {
+        if (ts.isSpreadElement(el)) {
+          throw new Error("Spread elements in arrays are not supported (v1)");
+        }
+        return lowerExpr(el);
+      }),
+    };
+  }
+  if (ts.isElementAccessExpression(node)) {
+    return {
+      kind: "index",
+      arr: lowerExpr(node.expression),
+      index: lowerExpr(node.argumentExpression),
+    };
+  }
+  if (ts.isPropertyAccessExpression(node)) {
+    if (node.name.text === "length") {
+      return { kind: "length", arg: lowerExpr(node.expression) };
+    }
+    throw new Error(`Unsupported property access: .${node.name.text}`);
+  }
   if (ts.isBinaryExpression(node)) {
     return {
       kind: "binary",
