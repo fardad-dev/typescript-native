@@ -11,8 +11,8 @@ real lowering — no SSA temporaries or pointer bookkeeping here.
 | ------------------- | -------------------- | ------------------------------------------------------ |
 | `number`            | `double` or `long long` | f64 by default; integer-valued slots use the `i64` rep (`long long`) — see below. `cppType` returns `double` (the rep used for nested aggregates); `slotType` honors the slot's rep |
 | `boolean`           | `bool`               | `std::cout` prints `1`/`0`                             |
-| `string`            | `tsn_str`            | ref-counted immutable string (prelude struct); copy = pointer + refcount bump, so array shuffles don't copy chars. Every string expr is a `tsn_str` (literals too: `tsn_str("…")`); operators (`<` `==` `+` `<<`) and `.str()`/`.size()` are defined on it; methods → `tsn_*` helpers (take `const std::string&` via its conversion, return `tsn_str`) |
-| `T[]`               | `std::vector<T>`     | `.length` → `static_cast<long long>(v.size())` (i64); `.push()` → `push_back`; index cast to `std::size_t` |
+| `string`            | `tsn_str`            | ref-counted immutable string (prelude struct); copy = pointer + refcount bump, so array shuffles don't copy chars. Every string expr is a `tsn_str` (literals too: `tsn_str("…")`); operators (`<` `==` `+` `<<`) and `.str()`/`.size()` are defined on it; methods → `tsn_*` helpers (take `const std::string&` via its conversion; mostly return `tsn_str`, but `split` returns `std::vector<tsn_str>`) |
+| `T[]`               | `std::vector<T>`     | `.length` → `static_cast<long long>(v.size())` (i64); `.push()` → `push_back`; `.join(sep?)` → `tsn_join` (`string[]`/`number[]` → `tsn_str`); index cast to `std::size_t` |
 | `{ ... }`           | generated `struct`   | `structName()` dedupes by field shape; number fields use the f64 rep |
 
 A `Value` is `{ code, type, rep? }` — the C++ expression text, its tsn `Type`, and (for

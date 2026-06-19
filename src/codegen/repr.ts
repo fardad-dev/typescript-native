@@ -286,7 +286,10 @@ class RepAnalyzer {
           case "charAt":
           case "substring":
           case "slice":
+          case "join":
             return { type: "string", rep: "f64" };
+          case "split":
+            return { type: { kind: "array", element: "string" }, rep: "f64" };
           default:
             // charCodeAt / indexOf -> number (can be NaN/-1, kept f64); push -> void.
             return { type: "number", rep: "f64" };

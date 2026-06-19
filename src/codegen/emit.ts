@@ -293,6 +293,46 @@ class Emitter {
       `  return s;`,
       `}`,
       ``,
+      // JS String.prototype.split with a STRING separator (regex is outside the
+      // subset). Mirrors JS edge cases: an empty separator splits into single
+      // characters; a separator that never matches yields a one-element array of
+      // the whole string; consecutive separators produce empty pieces. `limit`
+      // (NaN = absent) caps the number of pieces; <= 0 yields an empty array.
+      `static std::vector<tsn_str> tsn_split(const std::string& s, const std::string& sep, double limitD) {`,
+      `  std::vector<tsn_str> out;`,
+      `  std::size_t cap = std::isnan(limitD) ? (std::size_t)-1`,
+      `                  : (limitD <= 0.0 ? 0 : (std::size_t)limitD);`,
+      `  if (cap == 0) return out;`,
+      `  if (sep.empty()) {`,
+      `    for (std::size_t i = 0; i < s.size() && out.size() < cap; ++i)`,
+      `      out.push_back(tsn_str(std::string(1, s[i])));`,
+      `    return out;`,
+      `  }`,
+      `  std::size_t start = 0;`,
+      `  while (out.size() < cap) {`,
+      `    std::size_t pos = s.find(sep, start);`,
+      `    if (pos == std::string::npos) { out.push_back(tsn_str(s.substr(start))); break; }`,
+      `    out.push_back(tsn_str(s.substr(start, pos - start)));`,
+      `    start = pos + sep.size();`,
+      `  }`,
+      `  return out;`,
+      `}`,
+      ``,
+      // JS Array.prototype.join: stringify each element JS-style and concatenate
+      // with the separator. Overloaded by element type — strings stream verbatim,
+      // numbers go through the shortest-round-trip formatter — matching how `+`
+      // coerces operands during concatenation.
+      `static tsn_str tsn_join(const std::vector<tsn_str>& v, const std::string& sep) {`,
+      `  std::string out;`,
+      `  for (std::size_t i = 0; i < v.size(); ++i) { if (i) out += sep; out += v[i].str(); }`,
+      `  return tsn_str(out);`,
+      `}`,
+      `static tsn_str tsn_join(const std::vector<double>& v, const std::string& sep) {`,
+      `  std::string out;`,
+      `  for (std::size_t i = 0; i < v.size(); ++i) { if (i) out += sep; out += tsn_num_to_string(v[i]); }`,
+      `  return tsn_str(out);`,
+      `}`,
+      ``,
       ...(this.structDefs.length ? [...this.structDefs, ``] : []),
       ...(protos.length ? [...protos, ``] : []),
       defs.join("\n\n"),
@@ -891,6 +931,27 @@ class Emitter {
         }
         return { code: `${recv.code}.push_back(${arg.code})`, type: "void" };
       }
+      if (e.method === "join") {
+        if (e.args.length > 1) {
+          throw new Error(`'join' expects 0-1 argument(s), got ${e.args.length}`);
+        }
+        const elem = recv.type.element;
+        if (elem !== "string" && elem !== "number") {
+          throw new Error(
+            `'join' is only supported on string[] or number[], not '${displayType(recv.type)}'`,
+          );
+        }
+        // Separator defaults to "," (JS); a provided one must be a string.
+        let sep = `","`;
+        if (e.args.length === 1) {
+          const arg = this.emitExpr(e.args[0]);
+          if (arg.type !== "string") {
+            throw new Error("'join' separator must be a string");
+          }
+          sep = arg.code;
+        }
+        return { code: `tsn_join(${recv.code}, ${sep})`, type: "string" };
+      }
       throw new Error(`Unsupported array method '${e.method}'`);
     }
     throw new Error(
@@ -948,6 +1009,24 @@ class Emitter {
       case "slice": {
         const [start, end] = numArgs(1, 2);
         return { code: `tsn_slice(${s}, ${start}, ${end})`, type: "string" };
+      }
+      case "split": {
+        // `split(sep: string, limit?: number)` -> string[]. Regex separators are
+        // outside the subset (a regex literal already fails at lowering).
+        if (argv.length < 1 || argv.length > 2) {
+          throw new Error(`'split' expects 1-2 argument(s), got ${argv.length}`);
+        }
+        if (argv[0].type !== "string") {
+          throw new Error("'split' separator must be a string");
+        }
+        if (argv.length === 2 && argv[1].type !== "number") {
+          throw new Error("'split' limit must be a number");
+        }
+        const limit = argv.length === 2 ? argv[1].code : "NAN";
+        return {
+          code: `tsn_split(${s}, ${argv[0].code}, ${limit})`,
+          type: { kind: "array", element: "string" },
+        };
       }
       case "indexOf": {
         if (argv.length < 1 || argv.length > 2) {

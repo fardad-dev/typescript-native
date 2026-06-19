@@ -99,12 +99,14 @@ Implemented and tested end-to-end:
   access `obj.field`, array `.length`.
 - **Strings:** literals, concatenation, lexicographic comparison, `s.length`, character access
   `s[i]` (→ a one-char string), and methods `substring` / `slice` / `indexOf` / `charAt` /
-  `charCodeAt` / `toUpperCase` / `toLowerCase` (JS `String.prototype` semantics, ASCII).
+  `charCodeAt` / `toUpperCase` / `toLowerCase` / `split` (`s.split(sep[, limit])` → `string[]`;
+  string separators only — regex is out of subset) (JS `String.prototype` semantics, ASCII).
 - **`console.log(x)`** for numbers/booleans and strings.
 - **Variables:** `let` / `const` (initializer required); a type annotation is optional — without
   one the type is **inferred from the initializer**. `var` is **not supported** (errors). Assignment
   `x = e`, `a[i] = e`, `obj.f = e`, compound `+= -= *= /= %=`, and `i++` / `i--`.
-- **Arrays:** literals (incl. empty `[]` with an annotation) and `xs.push(v)`.
+- **Arrays:** literals (incl. empty `[]` with an annotation), `xs.push(v)`, and `xs.join(sep?)`
+  → `string` (separator defaults to `","`; `string[]` and `number[]`).
 - **Control flow:** `if` / `else`, `while`, `for (init; cond; update)`.
 - **Functions:** top-level, typed params + return type, `return`, calls, `void`; recursion works.
 
@@ -229,12 +231,12 @@ pair** (red → green).
       V8's own JIT-warm regime the prime sieve goes from ~parity to ~2× ahead. As a bonus it fixed
       a latent `int/int` truncation bug (`/` is now always float division) and made `NaN`/`Infinity`
       print JS-style.
-
-### Will support — strings (next; needed by the word-sort benchmark)
-
-- [ ] **`split` / `join`** — `paragraph.split(" ")` → `string[]`, `words.join(" ")` → `string`,
-      so a real paragraph can be tokenized and reassembled in-language. (Blocked on returning a
-      `string[]` from a method — ties into lifting the scalar-only boundary below.)
+- [x] **`split` / `join`** — `paragraph.split(" ")` → `string[]` (string separators + optional
+      `limit`, full JS edge-case semantics), `words.join(sep?)` → `string` (`string[]` / `number[]`,
+      separator defaults to `","`), so a paragraph can be tokenized and reassembled in-language.
+      Turned out *not* to need the scalar-only boundary lifted: a `methodCall` result already flows
+      through `RetType`, and arrays are first-class in `let` / indexing / `.length`, so a method
+      returning `string[]` just works. Runtime helpers `tsn_split` / `tsn_join`.
 
 ### Will support — core completeness
 
