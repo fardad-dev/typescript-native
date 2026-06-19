@@ -7,5 +7,9 @@ import { defineConfig } from "vitest/config";
 export default defineConfig({
   test: {
     maxConcurrency: 12,
+    // Each case compiles a real binary with `clang++ -O3` (see src/backend/clang.ts).
+    // -O3 trades compile time for fast output; under concurrency a few cases can
+    // exceed vitest's 5s default, so give the compile+run step generous headroom.
+    testTimeout: 30000,
   },
 });

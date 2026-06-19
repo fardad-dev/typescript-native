@@ -13,14 +13,32 @@
 //   T[]     -> std::vector<T>  (heap-backed; .length -> .size())
 //   { ... } -> a generated `struct` (one per distinct field shape)
 
-import { Module, Expr, Stmt, BinaryOp, Type, Field, Func, RetType } from "../ir/nodes";
+import {
+  Module,
+  Expr,
+  Stmt,
+  BinaryOp,
+  Type,
+  Field,
+  Func,
+  RetType,
+} from "../ir/nodes";
 
 // C++ operator text for each IR binary op (=== / !== map to == / !=).
 const CPP_OP: Record<BinaryOp, string> = {
-  "+": "+", "-": "-", "*": "*", "/": "/", "%": "%",
-  "<": "<", "<=": "<=", ">": ">", ">=": ">=",
-  "===": "==", "!==": "!=",
-  "&&": "&&", "||": "||",
+  "+": "+",
+  "-": "-",
+  "*": "*",
+  "/": "/",
+  "%": "%",
+  "<": "<",
+  "<=": "<=",
+  ">": ">",
+  ">=": ">=",
+  "===": "==",
+  "!==": "!=",
+  "&&": "&&",
+  "||": "||",
 };
 
 const ARITH = new Set<BinaryOp>(["+", "-", "*", "/", "%"]);
@@ -93,8 +111,12 @@ class Emitter {
   emitModule(mod: Module): string {
     // First pass: collect signatures so calls can reference any function.
     for (const fn of mod.functions) {
-      if (this.sigs.has(fn.name)) throw new Error(`Duplicate function '${fn.name}'`);
-      this.sigs.set(fn.name, { params: fn.params.map((p) => p.type), ret: fn.returnType });
+      if (this.sigs.has(fn.name))
+        throw new Error(`Duplicate function '${fn.name}'`);
+      this.sigs.set(fn.name, {
+        params: fn.params.map((p) => p.type),
+        ret: fn.returnType,
+      });
     }
 
     // Emit bodies first — this populates structDefs as object types are seen.
@@ -116,6 +138,21 @@ class Emitter {
       `  std::array<char, 32> buf;`,
       `  auto res = std::to_chars(buf.data(), buf.data() + buf.size(), v);`,
       `  return std::string(buf.data(), res.ptr);`,
+      `}`,
+      ``,
+      // JS `%` on an f64. Fast path: when both operands are integer-valued and in
+      // the exactly-representable range, use the CPU's integer remainder (one
+      // instruction) instead of std::fmod (a libm call that dominated hot loops).
+      // The range guard makes the long long casts well-defined; the `== a` checks
+      // confirm both operands were integral. Otherwise fall back to true fmod.
+      // All three (int %, fmod, JS %) truncate toward zero, so results agree.
+      `static inline double tsn_mod(double a, double b) {`,
+      `  if (b != 0.0 && std::fabs(a) < 9007199254740992.0 &&`,
+      `      std::fabs(b) < 9007199254740992.0) {`,
+      `    long long ia = (long long)a, ib = (long long)b;`,
+      `    if ((double)ia == a && (double)ib == b) return (double)(ia % ib);`,
+      `  }`,
+      `  return std::fmod(a, b);`,
       `}`,
       ``,
       ...(this.structDefs.length ? [...this.structDefs, ``] : []),
@@ -143,12 +180,16 @@ class Emitter {
 
   // Generate (or reuse) a named struct for an object type. Keyed by field shape.
   private structName(o: ObjectType): string {
-    const key = o.fields.map((f) => `${f.name}:${displayType(f.type)}`).join(";");
+    const key = o.fields
+      .map((f) => `${f.name}:${displayType(f.type)}`)
+      .join(";");
     const existing = this.structNames.get(key);
     if (existing) return existing;
     const name = `tsn_Obj${this.structNames.size}`;
     this.structNames.set(key, name);
-    const members = o.fields.map((f) => `${this.cppType(f.type)} ${f.name};`).join(" ");
+    const members = o.fields
+      .map((f) => `${this.cppType(f.type)} ${f.name};`)
+      .join(" ");
     this.structDefs.push(`struct ${name} { ${members} };`);
     return name;
   }
@@ -172,7 +213,9 @@ class Emitter {
     for (const p of fn.params) this.vars.set(p.name, p.type);
     for (const s of fn.body) this.emitStmt(s);
 
-    const params = fn.params.map((p) => `${this.cppType(p.type)} ${p.name}`).join(", ");
+    const params = fn.params
+      .map((p) => `${this.cppType(p.type)} ${p.name}`)
+      .join(", ");
     return [
       `${this.retType(fn.returnType)} ${fn.name}(${params}) {`,
       ...this.body,
@@ -204,7 +247,9 @@ class Emitter {
   private condition(e: Expr): string {
     const v = this.emitExpr(e);
     if (v.type !== "number" && v.type !== "boolean") {
-      throw new Error(`Condition must be a number or boolean, got '${displayType(v.type)}'`);
+      throw new Error(
+        `Condition must be a number or boolean, got '${displayType(v.type)}'`,
+      );
     }
     return v.code;
   }
@@ -227,7 +272,7 @@ class Emitter {
       const init = this.emitExpr(stmt.init);
       if (!sameType(stmt.type, init.type)) {
         throw new Error(
-          `Type '${displayType(init.type)}' is not assignable to '${displayType(stmt.type)}'`
+          `Type '${displayType(init.type)}' is not assignable to '${displayType(stmt.type)}'`,
         );
       }
       // Bind the initializer's type (for aggregates, its field/element shape).
@@ -239,7 +284,7 @@ class Emitter {
       const val = this.emitExpr(stmt.value);
       if (!sameType(target.type, val.type)) {
         throw new Error(
-          `Type '${displayType(val.type)}' is not assignable to '${displayType(target.type)}'`
+          `Type '${displayType(val.type)}' is not assignable to '${displayType(target.type)}'`,
         );
       }
       return `${target.code} = ${val.code}`;
@@ -253,16 +298,22 @@ class Emitter {
     switch (target.kind) {
       case "var": {
         const type = this.vars.get(target.name);
-        if (!type) throw new Error(`Cannot assign to undeclared variable '${target.name}'`);
+        if (!type)
+          throw new Error(
+            `Cannot assign to undeclared variable '${target.name}'`,
+          );
         return { code: target.name, type };
       }
       case "index": {
         const arr = this.emitExpr(target.arr);
         if (!isArray(arr.type)) {
-          throw new Error(`Cannot index a value of type '${displayType(arr.type)}'`);
+          throw new Error(
+            `Cannot index a value of type '${displayType(arr.type)}'`,
+          );
         }
         const idx = this.emitExpr(target.index);
-        if (idx.type !== "number") throw new Error("Array index must be a number");
+        if (idx.type !== "number")
+          throw new Error("Array index must be a number");
         return {
           code: `${arr.code}[static_cast<std::size_t>(${idx.code})]`,
           type: arr.type.element,
@@ -271,12 +322,14 @@ class Emitter {
       case "member": {
         const obj = this.emitExpr(target.obj);
         if (!isObject(obj.type)) {
-          throw new Error(`Cannot assign to property '${target.name}' of '${displayType(obj.type)}'`);
+          throw new Error(
+            `Cannot assign to property '${target.name}' of '${displayType(obj.type)}'`,
+          );
         }
         const field = obj.type.fields.find((f) => f.name === target.name);
         if (!field) {
           throw new Error(
-            `Property '${target.name}' does not exist on type '${displayType(obj.type)}'`
+            `Property '${target.name}' does not exist on type '${displayType(obj.type)}'`,
           );
         }
         return { code: `(${obj.code}).${target.name}`, type: field.type };
@@ -297,29 +350,31 @@ class Emitter {
         const val = this.emitExpr(stmt.arg);
         if (isArray(val.type)) {
           throw new Error(
-            "console.log of an array is not supported yet (log elements individually)"
+            "console.log of an array is not supported yet (log elements individually)",
           );
         }
         if (isObject(val.type)) {
           throw new Error(
-            "console.log of an object is not supported yet (log fields individually)"
+            "console.log of an object is not supported yet (log fields individually)",
           );
         }
         // Numbers (doubles) print JS-style; strings/booleans stream directly.
-        const out = val.type === "number" ? `tsn_num_to_string(${val.code})` : val.code;
+        const out =
+          val.type === "number" ? `tsn_num_to_string(${val.code})` : val.code;
         this.push(`std::cout << ${out} << "\\n";`);
         return;
       }
       case "return": {
         if (this.curReturn === "void") {
-          if (stmt.value) throw new Error("Cannot return a value from a void function");
+          if (stmt.value)
+            throw new Error("Cannot return a value from a void function");
           this.push(`return;`);
         } else {
           if (!stmt.value) throw new Error("Missing return value");
           const val = this.emitExpr(stmt.value);
           if (!sameType(val.type, this.curReturn)) {
             throw new Error(
-              `Type '${displayType(val.type)}' is not assignable to return type '${displayType(this.curReturn)}'`
+              `Type '${displayType(val.type)}' is not assignable to return type '${displayType(this.curReturn)}'`,
             );
           }
           this.push(`return ${val.code};`);
@@ -365,7 +420,8 @@ class Emitter {
         this.emitBlock(stmt.body);
         this.push(`}`);
         // A `let`-introduced loop variable is scoped to the loop in C++; drop it.
-        if (stmt.init && stmt.init.kind === "let") this.vars.delete(stmt.init.name);
+        if (stmt.init && stmt.init.kind === "let")
+          this.vars.delete(stmt.init.name);
         return;
       }
     }
@@ -394,13 +450,14 @@ class Emitter {
         return this.emitBinary(e);
       case "unary": {
         const v = this.emitExpr(e.operand);
-        if (v.type !== "boolean") throw new Error("Operator '!' expects a boolean");
+        if (v.type !== "boolean")
+          throw new Error("Operator '!' expects a boolean");
         return { code: `(!${v.code})`, type: "boolean" };
       }
       case "array": {
         if (e.elements.length === 0) {
           throw new Error(
-            "Empty array literals are not supported (element type cannot be inferred)"
+            "Empty array literals are not supported (element type cannot be inferred)",
           );
         }
         const vals = e.elements.map((el) => this.emitExpr(el));
@@ -415,13 +472,19 @@ class Emitter {
         return { code: `${this.cppType(arrType)}{${items}}`, type: arrType };
       }
       case "object": {
-        const props = e.properties.map((p) => ({ name: p.name, value: this.emitExpr(p.value) }));
+        const props = e.properties.map((p) => ({
+          name: p.name,
+          value: this.emitExpr(p.value),
+        }));
         const seen = new Set<string>();
         for (const p of props) {
-          if (seen.has(p.name)) throw new Error(`Duplicate property '${p.name}'`);
+          if (seen.has(p.name))
+            throw new Error(`Duplicate property '${p.name}'`);
           seen.add(p.name);
           if (typeof p.value.type !== "string") {
-            throw new Error("Object fields must be number, boolean, or string (v1)");
+            throw new Error(
+              "Object fields must be number, boolean, or string (v1)",
+            );
           }
         }
         const objType: ObjectType = {
@@ -434,7 +497,9 @@ class Emitter {
       case "index": {
         const arr = this.emitExpr(e.arr);
         if (!isArray(arr.type)) {
-          throw new Error(`Cannot index a value of type '${displayType(arr.type)}'`);
+          throw new Error(
+            `Cannot index a value of type '${displayType(arr.type)}'`,
+          );
         }
         const idx = this.emitExpr(e.index);
         if (idx.type !== "number") {
@@ -451,7 +516,10 @@ class Emitter {
         // `arr.length` — std::vector::size() as a number (double).
         if (isArray(obj.type)) {
           if (e.name === "length") {
-            return { code: `static_cast<double>((${obj.code}).size())`, type: "number" };
+            return {
+              code: `static_cast<double>((${obj.code}).size())`,
+              type: "number",
+            };
           }
           throw new Error(`Arrays have no property '${e.name}'`);
         }
@@ -460,12 +528,14 @@ class Emitter {
           const field = obj.type.fields.find((f) => f.name === e.name);
           if (!field) {
             throw new Error(
-              `Property '${e.name}' does not exist on type '${displayType(obj.type)}'`
+              `Property '${e.name}' does not exist on type '${displayType(obj.type)}'`,
             );
           }
           return { code: `(${obj.code}).${e.name}`, type: field.type };
         }
-        throw new Error(`Type '${displayType(obj.type)}' has no property '${e.name}'`);
+        throw new Error(
+          `Type '${displayType(obj.type)}' has no property '${e.name}'`,
+        );
       }
       case "call": {
         const val = this.emitCall(e, /*asStatement*/ false);
@@ -491,18 +561,24 @@ class Emitter {
         const okConcat = (t: Type) => t === "string" || t === "number";
         if (!okConcat(l.type) || !okConcat(r.type)) {
           throw new Error(
-            `Cannot concatenate '${displayType(l.type)}' and '${displayType(r.type)}'`
+            `Cannot concatenate '${displayType(l.type)}' and '${displayType(r.type)}'`,
           );
         }
         const strForm = (v: Value) =>
           v.type === "number" ? `tsn_num_to_string(${v.code})` : v.code;
-        return { code: `(std::string(${strForm(l)}) + ${strForm(r)})`, type: "string" };
+        return {
+          code: `(std::string(${strForm(l)}) + ${strForm(r)})`,
+          type: "string",
+        };
       }
       if (l.type !== "number" || r.type !== "number") {
         throw new Error(`Operator '${e.op}' expects numbers`);
       }
-      // `number` is a double, so `%` uses std::fmod (C++ `%` is integer-only).
-      const arithCode = e.op === "%" ? `std::fmod(${l.code}, ${r.code})` : code;
+      // `number` is a double, so `%` can't use C++ integer `%`. tsn_mod takes a
+      // fast hardware-remainder path for integer-valued operands and falls back
+      // to std::fmod otherwise — both match JS `%`. (Plain std::fmod here was the
+      // hot spot in modulo-heavy loops: a libm call per iteration.)
+      const arithCode = e.op === "%" ? `tsn_mod(${l.code}, ${r.code})` : code;
       return { code: arithCode, type: "number" };
     }
     if (RELATIONAL.has(e.op)) {
@@ -512,9 +588,13 @@ class Emitter {
       return { code, type: "boolean" };
     }
     if (EQUALITY.has(e.op)) {
-      if (isAggregate(l.type) || isAggregate(r.type) || !sameType(l.type, r.type)) {
+      if (
+        isAggregate(l.type) ||
+        isAggregate(r.type) ||
+        !sameType(l.type, r.type)
+      ) {
         throw new Error(
-          `Cannot compare '${displayType(l.type)}' and '${displayType(r.type)}' with '${e.op}'`
+          `Cannot compare '${displayType(l.type)}' and '${displayType(r.type)}' with '${e.op}'`,
         );
       }
       return { code, type: "boolean" };
@@ -530,26 +610,28 @@ class Emitter {
   // position a void call is an error.
   private emitCall(
     e: { callee: string; args: Expr[] },
-    asStatement: boolean
+    asStatement: boolean,
   ): { code: string; type: RetType } {
     const sig = this.sigs.get(e.callee);
     if (!sig) throw new Error(`Unknown function: ${e.callee}`);
     if (e.args.length !== sig.params.length) {
       throw new Error(
-        `Function '${e.callee}' expects ${sig.params.length} argument(s), got ${e.args.length}`
+        `Function '${e.callee}' expects ${sig.params.length} argument(s), got ${e.args.length}`,
       );
     }
     const args = e.args.map((a, i) => {
       const val = this.emitExpr(a);
       if (!sameType(val.type, sig.params[i])) {
         throw new Error(
-          `Argument ${i + 1} of '${e.callee}': type '${displayType(val.type)}' is not assignable to '${displayType(sig.params[i])}'`
+          `Argument ${i + 1} of '${e.callee}': type '${displayType(val.type)}' is not assignable to '${displayType(sig.params[i])}'`,
         );
       }
       return val.code;
     });
     if (sig.ret === "void" && !asStatement) {
-      throw new Error(`'${e.callee}' returns void and cannot be used as a value`);
+      throw new Error(
+        `'${e.callee}' returns void and cannot be used as a value`,
+      );
     }
     return { code: `${e.callee}(${args.join(", ")})`, type: sig.ret };
   }
@@ -558,7 +640,7 @@ class Emitter {
   // result can't be used as a value yet), mapped to std::vector::push_back.
   private emitMethodCall(
     e: { receiver: Expr; method: string; args: Expr[] },
-    asStatement: boolean
+    asStatement: boolean,
   ): { code: string; type: RetType } {
     const recv = this.emitExpr(e.receiver);
     if (isArray(recv.type)) {
@@ -569,17 +651,21 @@ class Emitter {
         const arg = this.emitExpr(e.args[0]);
         if (!sameType(arg.type, recv.type.element)) {
           throw new Error(
-            `Cannot push '${displayType(arg.type)}' onto '${displayType(recv.type)}'`
+            `Cannot push '${displayType(arg.type)}' onto '${displayType(recv.type)}'`,
           );
         }
         if (!asStatement) {
-          throw new Error("'push' result cannot be used as a value yet (call it as a statement)");
+          throw new Error(
+            "'push' result cannot be used as a value yet (call it as a statement)",
+          );
         }
         return { code: `${recv.code}.push_back(${arg.code})`, type: "void" };
       }
       throw new Error(`Unsupported array method '${e.method}'`);
     }
-    throw new Error(`Type '${displayType(recv.type)}' has no method '${e.method}'`);
+    throw new Error(
+      `Type '${displayType(recv.type)}' has no method '${e.method}'`,
+    );
   }
 }
 
