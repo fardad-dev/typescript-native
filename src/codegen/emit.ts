@@ -369,6 +369,62 @@ class Emitter {
       `  return tsn_str(out);`,
       `}`,
       ``,
+      // Array methods (templates over the element type T). push/pop take the
+      // receiver by mutable reference so the mutation is visible to the caller;
+      // slice/indexOf take it by const& (no copy, read-only).
+      //
+      // JS Array.prototype.push: append, return the new length (as an f64 number,
+      // like the other number-returning methods). The element forwards through a
+      // second deduced type U, so an i64 literal converts to a double element and
+      // an rvalue aggregate moves instead of copying.
+      `template <class T, class U>`,
+      `static double tsn_push(std::vector<T>& v, U&& x) {`,
+      `  v.push_back(std::forward<U>(x));`,
+      `  return static_cast<double>(v.size());`,
+      `}`,
+      ``,
+      // JS Array.prototype.pop: remove and return the last element. This subset has
+      // no `undefined`, so popping an empty array yields the element type's default
+      // (0 for number, "" for string) rather than `undefined`.
+      `template <class T>`,
+      `static T tsn_pop(std::vector<T>& v) {`,
+      `  if (v.empty()) return T();`,
+      `  T x = std::move(v.back());`,
+      `  v.pop_back();`,
+      `  return x;`,
+      `}`,
+      ``,
+      // JS Array.prototype.slice: a shallow copy of [start, end). Negatives count
+      // from the end; an omitted (NaN) start/end defaults to 0/length. Mirrors the
+      // index handling of the string tsn_slice helper.
+      `template <class T>`,
+      `static std::vector<T> tsn_array_slice(const std::vector<T>& v, double startD, double endD) {`,
+      `  long long len = (long long)v.size();`,
+      `  long long start = std::isnan(startD) ? 0 : (long long)startD;`,
+      `  long long end = std::isnan(endD) ? len : (long long)endD;`,
+      `  if (start < 0) start = len + start;`,
+      `  if (end < 0) end = len + end;`,
+      `  if (start < 0) start = 0;`,
+      `  if (end < 0) end = 0;`,
+      `  if (start > len) start = len;`,
+      `  if (end > len) end = len;`,
+      `  if (start >= end) return std::vector<T>();`,
+      `  return std::vector<T>(v.begin() + start, v.begin() + end);`,
+      `}`,
+      ``,
+      // JS Array.prototype.indexOf: first index where the element === x, else -1.
+      // fromIndex (NaN = 0) may be negative (counts from the end). Element equality
+      // uses operator==, defined for number/string/boolean (and instance identity).
+      `template <class T>`,
+      `static double tsn_array_index_of(const std::vector<T>& v, const T& x, double fromD) {`,
+      `  long long len = (long long)v.size();`,
+      `  long long from = std::isnan(fromD) ? 0 : (long long)fromD;`,
+      `  if (from < 0) { from = len + from; if (from < 0) from = 0; }`,
+      `  for (long long i = from; i < len; ++i)`,
+      `    if (v[(std::size_t)i] == x) return (double)i;`,
+      `  return -1.0;`,
+      `}`,
+      ``,
       // Ordering matters for C++: forward class decls, then object structs (may
       // hold instances via shared_ptr), then full class struct definitions (their
       // fields may use object structs by value), then out-of-line class method/
@@ -1136,8 +1192,9 @@ class Emitter {
     return { code: `${e.callee}(${args.join(", ")})`, type: sig.ret };
   }
 
-  // Emit a method call: `array.push(v)` (statement-only, → push_back) or one of
-  // the string methods (substring/slice/indexOf/charAt/toUpperCase/toLowerCase).
+  // Emit a method call: an instance method, a string method (substring/slice/
+  // indexOf/charAt/…), or an array method (push/pop/slice/indexOf/join). Array
+  // push returns the new length; pop/slice/indexOf map to tsn_* template helpers.
   private emitMethodCall(
     e: { receiver: Expr; method: string; args: Expr[] },
     asStatement: boolean,
@@ -1150,47 +1207,108 @@ class Emitter {
       return this.emitStringMethod(recv, e);
     }
     if (isArray(recv.type)) {
-      if (e.method === "push") {
-        if (e.args.length !== 1) {
-          throw new Error(`'push' expects 1 argument, got ${e.args.length}`);
-        }
-        const arg = this.emitExpr(e.args[0]);
-        if (!sameType(arg.type, recv.type.element)) {
-          throw new Error(
-            `Cannot push '${displayType(arg.type)}' onto '${displayType(recv.type)}'`,
-          );
-        }
-        if (!asStatement) {
-          throw new Error(
-            "'push' result cannot be used as a value yet (call it as a statement)",
-          );
-        }
-        // push mutates the receiver — forbidden through a const& aggregate param.
-        this.assertMutable(e.receiver);
-        return { code: `${recv.code}.push_back(${arg.code})`, type: "void" };
-      }
-      if (e.method === "join") {
-        if (e.args.length > 1) {
-          throw new Error(`'join' expects 0-1 argument(s), got ${e.args.length}`);
-        }
-        const elem = recv.type.element;
-        if (elem !== "string" && elem !== "number") {
-          throw new Error(
-            `'join' is only supported on string[] or number[], not '${displayType(recv.type)}'`,
-          );
-        }
-        // Separator defaults to "," (JS); a provided one must be a string.
-        let sep = `","`;
-        if (e.args.length === 1) {
-          const arg = this.emitExpr(e.args[0]);
-          if (arg.type !== "string") {
-            throw new Error("'join' separator must be a string");
+      const elem = recv.type.element;
+      switch (e.method) {
+        case "push": {
+          if (e.args.length !== 1) {
+            throw new Error(`'push' expects 1 argument, got ${e.args.length}`);
           }
-          sep = arg.code;
+          const arg = this.emitExpr(e.args[0]);
+          if (!sameType(arg.type, elem)) {
+            throw new Error(
+              `Cannot push '${displayType(arg.type)}' onto '${displayType(recv.type)}'`,
+            );
+          }
+          // push mutates the receiver — forbidden through a const& aggregate param.
+          this.assertMutable(e.receiver);
+          // Returns the new length (a number); usable as a value or a statement.
+          return { code: `tsn_push(${recv.code}, ${arg.code})`, type: "number" };
         }
-        return { code: `tsn_join(${recv.code}, ${sep})`, type: "string" };
+        case "pop": {
+          if (e.args.length !== 0) {
+            throw new Error(`'pop' expects 0 arguments, got ${e.args.length}`);
+          }
+          // pop mutates the receiver — forbidden through a const& aggregate param.
+          this.assertMutable(e.receiver);
+          // Returns the removed last element (the array's element type).
+          return { code: `tsn_pop(${recv.code})`, type: elem };
+        }
+        case "slice": {
+          // `slice(start?, end?)` — both optional numbers; an omitted one is NaN
+          // ("default") in the helper. Returns a new array of the same type.
+          if (e.args.length > 2) {
+            throw new Error(`'slice' expects 0-2 argument(s), got ${e.args.length}`);
+          }
+          const nums = e.args.map((a) => this.emitExpr(a));
+          for (const n of nums) {
+            if (n.type !== "number") {
+              throw new Error("'slice' arguments must be numbers");
+            }
+          }
+          const start = nums[0]?.code ?? "NAN";
+          const end = nums[1]?.code ?? "NAN";
+          return {
+            code: `tsn_array_slice(${recv.code}, ${start}, ${end})`,
+            type: recv.type,
+          };
+        }
+        case "indexOf": {
+          // `indexOf(searchElement, fromIndex?)` -> number (-1 if absent). Needs
+          // element equality, so aggregate (object/array) elements are rejected.
+          if (e.args.length < 1 || e.args.length > 2) {
+            throw new Error(
+              `'indexOf' expects 1-2 argument(s), got ${e.args.length}`,
+            );
+          }
+          if (isAggregate(elem)) {
+            throw new Error(
+              `'indexOf' is not supported on '${displayType(recv.type)}' (elements have no equality)`,
+            );
+          }
+          const search = this.emitExpr(e.args[0]);
+          if (!sameType(search.type, elem)) {
+            throw new Error(
+              `'indexOf' search type '${displayType(search.type)}' does not match element type '${displayType(elem)}'`,
+            );
+          }
+          let from = "NAN";
+          if (e.args.length === 2) {
+            const f = this.emitExpr(e.args[1]);
+            if (f.type !== "number") {
+              throw new Error("'indexOf' fromIndex must be a number");
+            }
+            from = f.code;
+          }
+          // f64SlotCode casts an i64-literal search value to the element's double
+          // rep (a no-op for string/boolean/class), so the template deduces one T.
+          return {
+            code: `tsn_array_index_of(${recv.code}, ${this.f64SlotCode(search)}, ${from})`,
+            type: "number",
+          };
+        }
+        case "join": {
+          if (e.args.length > 1) {
+            throw new Error(`'join' expects 0-1 argument(s), got ${e.args.length}`);
+          }
+          if (elem !== "string" && elem !== "number") {
+            throw new Error(
+              `'join' is only supported on string[] or number[], not '${displayType(recv.type)}'`,
+            );
+          }
+          // Separator defaults to "," (JS); a provided one must be a string.
+          let sep = `","`;
+          if (e.args.length === 1) {
+            const arg = this.emitExpr(e.args[0]);
+            if (arg.type !== "string") {
+              throw new Error("'join' separator must be a string");
+            }
+            sep = arg.code;
+          }
+          return { code: `tsn_join(${recv.code}, ${sep})`, type: "string" };
+        }
+        default:
+          throw new Error(`Unsupported array method '${e.method}'`);
       }
-      throw new Error(`Unsupported array method '${e.method}'`);
     }
     throw new Error(
       `Type '${displayType(recv.type)}' has no method '${e.method}'`,

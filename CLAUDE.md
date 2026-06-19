@@ -31,14 +31,14 @@ which makes heap-backed values like strings and arrays straightforward.)
 
 ## Tech stack (decided)
 
-| Concern             | Choice                                                              |
-| ------------------- | ------------------------------------------------------------------- |
-| Compiler language   | **TypeScript**, run on Node (>= 22)                                 |
-| Front-end (parsing) | **Official `typescript` package** — reuse its lexer/parser          |
-| Backend             | **Emit C++ source**, compile with **`clang++ -std=c++17 -O3`**      |
-| Target              | native binary for this host (Apple Silicon / arm64 macOS)           |
-| CLI                 | **commander**                                                       |
-| Tests               | **vitest** (end-to-end: compile → run → diff stdout)                |
+| Concern             | Choice                                                         |
+| ------------------- | -------------------------------------------------------------- |
+| Compiler language   | **TypeScript**, run on Node (>= 22)                            |
+| Front-end (parsing) | **Official `typescript` package** — reuse its lexer/parser     |
+| Backend             | **Emit C++ source**, compile with **`clang++ -std=c++17 -O3`** |
+| Target              | native binary for this host (Apple Silicon / arm64 macOS)      |
+| CLI                 | **commander**                                                  |
+| Tests               | **vitest** (end-to-end: compile → run → diff stdout)           |
 
 ## Project structure
 
@@ -107,8 +107,12 @@ Implemented and tested end-to-end:
 - **Variables:** `let` / `const` (initializer required); a type annotation is optional — without
   one the type is **inferred from the initializer**. `var` is **not supported** (errors). Assignment
   `x = e`, `a[i] = e`, `obj.f = e`, compound `+= -= *= /= %=`, and `i++` / `i--`.
-- **Arrays:** literals (incl. empty `[]` with an annotation), `xs.push(v)`, and `xs.join(sep?)`
-  → `string` (separator defaults to `","`; `string[]` and `number[]`).
+- **Arrays:** literals (incl. empty `[]` with an annotation); `xs.push(v)` (returns the new
+  `length`, usable as a value); `xs.pop()` → the removed last element (empty array → the element
+  type's default, since the subset has no `undefined`); `xs.slice(start?, end?)` → a new array
+  (negatives count from the end); `xs.indexOf(v[, from])` → `number` (`-1` if absent; element
+  `===`, so object/array-element arrays are rejected; class elements compare by identity); and
+  `xs.join(sep?)` → `string` (separator defaults to `","`; `string[]` and `number[]`).
 - **Control flow:** `if` / `else`, `while`, `for (init; cond; update)`.
 - **Functions:** top-level, typed params + return type, `return`, calls, `void`; recursion works.
   Params and returns may be **arrays and objects**, not just scalars — aggregate params pass by
@@ -125,20 +129,20 @@ Implemented and tested end-to-end:
 
 tsn types map onto C++ types (see [src/codegen/CLAUDE.md](src/codegen/CLAUDE.md)):
 
-| tsn type | C++ type           | notes                                                       |
-| -------- | ------------------ | ----------------------------------------------------------- |
-| number   | `double` or `long long` | IEEE f64 by default; **integer-valued numbers use a 64-bit int rep** (see below). Printed JS-style |
-| boolean  | `bool`             | `std::cout` prints `1` / `0`                                |
-| string   | `tsn_str`          | ref-counted immutable string; copy = pointer + refcount bump (no char copy); methods → `tsn_*` helpers |
-| `T[]`    | `std::vector<T>`   | heap-backed; `.length` → `.size()`; `.push()` → `push_back` |
-| `{ ... }`| generated `struct` | one struct per distinct field shape                         |
-| class `C`| `std::shared_ptr<C>` | **reference** type: `new C()` is heap + ref-counted; copy/assign aliases (shared mutation, identity via `==`); `struct C { fields; ctor; methods; }` |
+| tsn type  | C++ type                | notes                                                                                                                                                |
+| --------- | ----------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
+| number    | `double` or `long long` | IEEE f64 by default; **integer-valued numbers use a 64-bit int rep** (see below). Printed JS-style                                                   |
+| boolean   | `bool`                  | `std::cout` prints `1` / `0`                                                                                                                         |
+| string    | `tsn_str`               | ref-counted immutable string; copy = pointer + refcount bump (no char copy); methods → `tsn_*` helpers                                               |
+| `T[]`     | `std::vector<T>`        | heap-backed; `.length` → `.size()`; `.push()` → `push_back`                                                                                          |
+| `{ ... }` | generated `struct`      | one struct per distinct field shape                                                                                                                  |
+| class `C` | `std::shared_ptr<C>`    | **reference** type: `new C()` is heap + ref-counted; copy/assign aliases (shared mutation, identity via `==`); `struct C { fields; ctor; methods; }` |
 
 - **`number` is f64, but integer-valued numbers use a 64-bit integer representation.** A
   pre-pass ([src/codegen/repr.ts](src/codegen/repr.ts)) infers, per variable / parameter / return,
   whether every value reaching it is provably integer-valued; if so it's emitted as `long long`
   (`i64`) instead of `double` (`f64`). This gives integer arithmetic, `%`, and comparisons the
-  CPU's integer units — **~1.8× on integer-heavy loops** (a prime sieve; and tsnc now *beats* V8
+  CPU's integer units — **~1.8× on integer-heavy loops** (a prime sieve; and tsnc now _beats_ V8
   by ~2× in its own JIT-warm regime, where it used to reach parity). Soundness: a slot is `i64`
   only when no fractional value can flow in; `/` is **always** float division (`5 / 2 === 2.5`,
   and two integer vars no longer do C++ integer division), and `%` returns f64 so `x % 0 === NaN`
@@ -165,7 +169,7 @@ tsn types map onto C++ types (see [src/codegen/CLAUDE.md](src/codegen/CLAUDE.md)
 - **Aggregates nest:** object fields and array elements may themselves be aggregates —
   `{ pts: number[] }`, `{ inner: { x: number } }`, `number[][]`, `{ x: number }[]`. These map
   directly to C++ (`std::vector<std::vector<double>>`, a struct with `vector`/struct members), and
-  `lowerType` / struct generation recurse through the shape. Nested *number* fields and elements
+  `lowerType` / struct generation recurse through the shape. Nested _number_ fields and elements
   always use the f64 rep (`double`). Reading, mutating (`box.inner.x = 9`, `poly.pts[0] = 9`), and
   pushing onto a nested array (`poly.pts.push(v)`) all work; an empty array as a field
   (`{ pts: [] }`) still errors (no annotation to infer the element type from).
@@ -179,17 +183,17 @@ Every type annotation must lower to one of the supported types above; anything e
 `tsnc: Unsupported type annotation: <SyntaxKind>` from `lowerType` ([src/frontend/lower.ts](src/frontend/lower.ts)).
 Not yet supported:
 
-| Type                    | Example                       | Notes                                                       |
-| ----------------------- | ----------------------------- | ----------------------------------------------------------- |
-| Union                   | `number \| string`            | No tagged-union representation yet.                         |
-| `any`                   | `let x: any`                  | Would erase the static type codegen relies on.              |
-| `unknown` / `never`     | `let x: unknown`              | Same reason as `any`.                                       |
-| Tuple                   | `[number, string]`            | Only homogeneous `T[]` arrays are supported.                |
-| Literal / enum          | `"a" \| "b"`, `enum E {}`     | No literal types or enums.                                  |
-| Intersection            | `A & B`                       | No type composition.                                        |
-| Function type           | `(x: number) => number`       | No first-class function values / closures.                  |
-| Generic / type param    | `Map<K, V>`, `<T>(x: T) => T` | Only the built-in `Array<T>` is special-cased.              |
-| `null` / `undefined`    | `string \| null`             | No nullable types; no optional (`x?:`) fields/params.       |
+| Type                 | Example                       | Notes                                                 |
+| -------------------- | ----------------------------- | ----------------------------------------------------- |
+| Union                | `number \| string`            | No tagged-union representation yet.                   |
+| `any`                | `let x: any`                  | Would erase the static type codegen relies on.        |
+| `unknown` / `never`  | `let x: unknown`              | Same reason as `any`.                                 |
+| Tuple                | `[number, string]`            | Only homogeneous `T[]` arrays are supported.          |
+| Literal / enum       | `"a" \| "b"`, `enum E {}`     | No literal types or enums.                            |
+| Intersection         | `A & B`                       | No type composition.                                  |
+| Function type        | `(x: number) => number`       | No first-class function values / closures.            |
+| Generic / type param | `Map<K, V>`, `<T>(x: T) => T` | Only the built-in `Array<T>` is special-cased.        |
+| `null` / `undefined` | `string \| null`              | No nullable types; no optional (`x?:`) fields/params. |
 
 ## Conventions
 
@@ -241,7 +245,7 @@ pair** (red → green).
       `tsn_*` runtime helpers).
 - [x] **Native-speed backend** — `clang++ -O3`; ~10–17× faster than `node app.ts` for normal
       program sizes (Node's startup/JIT-warmup tax dominates). On sustained hot loops it now
-      *beats* a JIT-warm V8 on integer work (~2× on the prime sieve; see the integer fast path
+      _beats_ a JIT-warm V8 on integer work (~2× on the prime sieve; see the integer fast path
       below) and stays ~parity on string-comparison-bound work.
 - [x] **Ref-counted immutable strings (`tsn_str`)** — strings are shared, not copied, so
       element-shuffling code (sorts) moves a pointer + bumps a counter instead of copying chars
@@ -256,19 +260,19 @@ pair** (red → green).
 - [x] **`split` / `join`** — `paragraph.split(" ")` → `string[]` (string separators + optional
       `limit`, full JS edge-case semantics), `words.join(sep?)` → `string` (`string[]` / `number[]`,
       separator defaults to `","`), so a paragraph can be tokenized and reassembled in-language.
-      Turned out *not* to need the scalar-only boundary lifted: a `methodCall` result already flows
+      Turned out _not_ to need the scalar-only boundary lifted: a `methodCall` result already flows
       through `RetType`, and arrays are first-class in `let` / indexing / `.length`, so a method
       returning `string[]` just works. Runtime helpers `tsn_split` / `tsn_join`.
 - [x] **Lift scalar-only boundaries** — function params and returns may be arrays/objects now
       (front-end checks dropped). Aggregate params pass by `const&` (read-only — mutating one is a
       clean `tsnc:` error rather than a silent JS-semantics divergence); aggregate returns pass by
       value via RVO/move, so a copy lands only where the result is bound or used. Exposed and fixed
-      a latent aggregate-literal bug: building a `vector`/`struct` from a *non-constant* integer
+      a latent aggregate-literal bug: building a `vector`/`struct` from a _non-constant_ integer
       number now casts `long long`→`double` (a brace-init narrowing clang rejected; literal
-      constants like `3LL` had slipped through). Object *fields* stay scalar-only.
+      constants like `3LL` had slipped through). Object _fields_ stay scalar-only.
 - [x] **Nested objects and arrays** — aggregates nest: object fields that are arrays or objects
       (`{ pts: number[] }`, `{ inner: { x: number } }`) and arrays of aggregates (`number[][]`,
-      `{ x: number }[]`). Turned out to be mostly *removing* code: arrays of aggregates and
+      `{ x: number }[]`). Turned out to be mostly _removing_ code: arrays of aggregates and
       `number[][]` already worked (`lowerType` recurses through array element types, and
       `f64SlotCode`/struct generation handle aggregate values), so the only blocks were two
       scalar-field guards — one in `lowerType`, one in the object-literal emitter. Dropping both
@@ -276,27 +280,39 @@ pair** (red → green).
       `poly.pts[0] = 9`), `push` onto a nested array, and crossing function boundaries
       (`{x;y}[]` param by `const&`, `number[][]` return by value). Nested structs generate inner
       before outer (correct C++ order); nested numbers stay f64. `console.log` of an aggregate is
-      still a clean error (JS-style printing is the separate *Richer `console.log`* item); an empty
+      still a clean error (JS-style printing is the separate _Richer `console.log`_ item); an empty
       array field (`{ pts: [] }`) still errors (no element type to infer).
 - [x] **Classes (basic shape)** — fields, one constructor, instance methods, `new C(...)`,
       `this.field` / `this.method()` (read + write), instances in variables / params / returns /
-      arrays. The design decision the roadmap flagged was **identity**: instances are *reference*
+      arrays. The design decision the roadmap flagged was **identity**: instances are _reference_
       types, solved by compiling a class to `struct C { fields; ctor; methods; }` and an instance to
       `std::shared_ptr<C>` — exactly the "heap + ref-counted, like `tsn_str`" the roadmap called for,
       and reference semantics (aliasing, shared mutation, `===` identity) fall out for free. Methods
       and the constructor are first-class analyzed scopes (keys `C#method` / `C#$ctor`), so `repr.ts`
-      gives method-local numbers the same i64/f64 treatment *and* keeps cross-calls sound; fields are
+      gives method-local numbers the same i64/f64 treatment _and_ keeps cross-calls sound; fields are
       always f64. Instances are deliberately **not** `isAggregate` — they pass **by value** (a
       `shared_ptr` copy = a refcount bump) and stay **mutable**, so a callee's `p.x = …` is visible to
       the caller (JS reference semantics), whereas value-typed array/object params are `const&`/
       read-only. Classes are forward-declared so fields can reference a later/self class; method/ctor
       bodies are emitted out-of-line. Deferred (clean `tsnc:` errors): `extends`/`implements`,
       `static`, accessors, parameter properties, field initializers, no-constructor classes, and bare
-      `this` as a value. `console.log` of an instance is a clean error (see *Richer `console.log`*).
+      `this` as a value. `console.log` of an instance is a clean error (see _Richer `console.log`_).
+- [x] **More array methods** — `pop`, `indexOf`, `slice`, and `push` as a value. No IR or front-end
+      change was needed: `xs.pop()` / `xs.slice(…)` / `xs.indexOf(…)` already lower to `methodCall`,
+      so this was purely codegen — four `tsn_*` **template** helpers (over the element type `T`) plus
+      a rewritten array branch in `emitMethodCall`. `push` now returns the new `length` (an f64
+      number) instead of `void`, so it's usable as a value _or_ a statement; `pop` returns the
+      element type and mutates (so it's rejected through a `const&` aggregate param, like `push`);
+      `slice` returns a new array by value (negatives count from the end, omitted args = NaN
+      "default", mirroring the string `tsn_slice`); `indexOf` returns `-1`/index via element `==`
+      (so object/array-element arrays are a clean `tsnc:` error, while class elements compare by
+      identity = JS `===`). The one subset divergence: popping an empty array yields the element
+      type's default (`0` / `""`) — there's no `undefined` to return. `repr.ts` learned the array
+      methods' return types (e.g. array `slice` is an array, not a string) so number-rep slots stay
+      sound; all number method-returns remain f64, so the emitter's rep-tagging was untouched.
 
 ### Will support — core completeness
 
-- [ ] **More array methods** — `pop`, `indexOf`, `slice`; `push` as a value (returns length).
 - [ ] **Richer `console.log`** — booleans as `true`/`false`; arrays/objects printed JS-style.
 
 ### Will support — correctness & performance
@@ -313,3 +329,8 @@ pair** (red → green).
       (via `std::enable_shared_from_this`, so `let b = this` / passing `this` around works).
 - [ ] **Closures, modules, generics** — first-class function values, `import`/`export`, and
       type parameters.
+
+## will never support
+
+- class bare `this` as a value ( `let b = this` / passing `this` around works)
+- typescript any type

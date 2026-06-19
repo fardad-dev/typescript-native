@@ -341,6 +341,24 @@ class RepAnalyzer {
           });
           return { type: method ? method.returnType : "number", rep: "f64" };
         }
+        // Array methods: dispatch on the receiver type so the result type matches
+        // the emitter (e.g. array `slice` is an array, not a string). Number
+        // results stay f64, like every other method's number return.
+        if (typeof recv.type === "object" && recv.type.kind === "array") {
+          e.args.forEach((a) => this.visit(a, scope, fk));
+          const elem = recv.type.element;
+          switch (e.method) {
+            case "pop":
+              return { type: elem, rep: "f64" };
+            case "slice":
+              return { type: recv.type, rep: "f64" };
+            case "join":
+              return { type: "string", rep: "f64" };
+            // push (new length) / indexOf (-1 or index) -> number.
+            default:
+              return { type: "number", rep: "f64" };
+          }
+        }
         e.args.forEach((a) => this.visit(a, scope, fk));
         switch (e.method) {
           case "toUpperCase":
@@ -353,7 +371,7 @@ class RepAnalyzer {
           case "split":
             return { type: { kind: "array", element: "string" }, rep: "f64" };
           default:
-            // charCodeAt / indexOf -> number (can be NaN/-1, kept f64); push -> void.
+            // String charCodeAt / indexOf -> number (can be NaN/-1, kept f64).
             return { type: "number", rep: "f64" };
         }
       }
