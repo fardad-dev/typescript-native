@@ -44,7 +44,9 @@ export type Expr =
   | { kind: "object"; properties: { name: string; value: Expr }[] }
   // member covers both `obj.field` and `arr.length` — the emitter resolves it by type.
   | { kind: "member"; obj: Expr; name: string }
-  | { kind: "call"; callee: string; args: Expr[] };
+  | { kind: "call"; callee: string; args: Expr[] }
+  // a method call like `xs.push(v)` — resolved by receiver type during codegen
+  | { kind: "methodCall"; receiver: Expr; method: string; args: Expr[] };
 
 export type Stmt =
   | { kind: "let"; name: string; type: Type; init: Expr }
@@ -52,7 +54,8 @@ export type Stmt =
   | { kind: "return"; value?: Expr }
   // a bare expression evaluated for effect (e.g. a function call), result discarded
   | { kind: "exprStmt"; expr: Expr }
-  | { kind: "assign"; name: string; value: Expr }
+  // `target = value`; target is an lvalue: `var`, `index` (a[i]), or `member` (obj.f)
+  | { kind: "assign"; target: Expr; value: Expr }
   | { kind: "if"; cond: Expr; then: Stmt[]; else?: Stmt[] }
   | { kind: "while"; cond: Expr; body: Stmt[] }
   // `for (init; cond; update) { body }` — `++`/compound-assign desugar into `update`

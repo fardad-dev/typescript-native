@@ -159,36 +159,43 @@ function isAssignmentLike(expr: ts.Expression): boolean {
   return false;
 }
 
+// An assignment target (lvalue): a variable, an array element, or an object
+// field. Reuses `lowerExpr`, which produces `var` / `index` / `member` nodes.
+function lowerAssignTarget(node: ts.Expression): Expr {
+  if (
+    ts.isIdentifier(node) ||
+    ts.isElementAccessExpression(node) ||
+    ts.isPropertyAccessExpression(node)
+  ) {
+    return lowerExpr(node);
+  }
+  throw new Error("Assignment target must be a variable, array element, or object field");
+}
+
 // Lower an assignment-like expression to an `assign` statement, desugaring
-// compound assignment and `++`/`--` into `name = name <op> rhs`.
+// compound assignment and `++`/`--` into `target = target <op> rhs`.
 function lowerAssignLike(expr: ts.Expression): Stmt {
   if (ts.isBinaryExpression(expr)) {
-    if (!ts.isIdentifier(expr.left)) {
-      throw new Error("Assignment target must be a simple variable (v1)");
-    }
-    const name = expr.left.text;
+    const target = lowerAssignTarget(expr.left);
     if (expr.operatorToken.kind === ts.SyntaxKind.EqualsToken) {
-      return { kind: "assign", name, value: lowerExpr(expr.right) };
+      return { kind: "assign", target, value: lowerExpr(expr.right) };
     }
     const op = compoundOp(expr.operatorToken.kind);
     if (op) {
       return {
         kind: "assign",
-        name,
-        value: { kind: "binary", op, left: { kind: "var", name }, right: lowerExpr(expr.right) },
+        target,
+        value: { kind: "binary", op, left: target, right: lowerExpr(expr.right) },
       };
     }
   }
   if (ts.isPostfixUnaryExpression(expr) || ts.isPrefixUnaryExpression(expr)) {
-    if (!ts.isIdentifier(expr.operand)) {
-      throw new Error("'++'/'--' target must be a simple variable (v1)");
-    }
-    const name = expr.operand.text;
+    const target = lowerAssignTarget(expr.operand);
     const op: BinaryOp = expr.operator === ts.SyntaxKind.PlusPlusToken ? "+" : "-";
     return {
       kind: "assign",
-      name,
-      value: { kind: "binary", op, left: { kind: "var", name }, right: { kind: "num", value: 1 } },
+      target,
+      value: { kind: "binary", op, left: target, right: { kind: "num", value: 1 } },
     };
   }
   throw new Error("Unsupported assignment expression");
@@ -310,6 +317,15 @@ function lowerExpr(node: ts.Expression): Expr {
     return { kind: "member", obj: lowerExpr(node.expression), name: node.name.text };
   }
   if (ts.isCallExpression(node)) {
+    // `recv.method(args)` -> methodCall (e.g. xs.push(v)).
+    if (ts.isPropertyAccessExpression(node.expression)) {
+      return {
+        kind: "methodCall",
+        receiver: lowerExpr(node.expression.expression),
+        method: node.expression.name.text,
+        args: node.arguments.map(lowerExpr),
+      };
+    }
     if (!ts.isIdentifier(node.expression)) {
       throw new Error("Only direct calls to named functions are supported (v1)");
     }

@@ -7,13 +7,13 @@ real lowering — no SSA temporaries or pointer bookkeeping here.
 
 ## Type mapping (`cppType`)
 
-| tsn type            | C++ type             | notes                                          |
-| ------------------- | -------------------- | ---------------------------------------------- |
-| `number`            | `long long`          | 64-bit integer; integer division as before     |
-| `boolean`           | `bool`               | `std::cout` prints `1`/`0`                      |
-| `string`            | `std::string`        | literals are `const char*`, convert implicitly  |
-| `T[]`               | `std::vector<T>`     | `.length` → `static_cast<long long>(v.size())`  |
-| `{ ... }`           | generated `struct`   | `structName()` dedupes by field shape           |
+| tsn type            | C++ type             | notes                                                  |
+| ------------------- | -------------------- | ------------------------------------------------------ |
+| `number`            | `double`             | IEEE f64; `%` → `std::fmod`; printed via `tsn_num_to_string` |
+| `boolean`           | `bool`               | `std::cout` prints `1`/`0`                             |
+| `string`            | `std::string`        | literals are `const char*`, convert implicitly         |
+| `T[]`               | `std::vector<T>`     | `.length` → `static_cast<double>(v.size())`; `.push()` → `push_back`; index cast to `std::size_t` |
+| `{ ... }`           | generated `struct`   | `structName()` dedupes by field shape                  |
 
 A `Value` is `{ code, type }` — the C++ expression text and its tsn `Type`. No length
 tracking is needed anymore (arrays are real `std::vector`s).

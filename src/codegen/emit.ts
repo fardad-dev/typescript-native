@@ -103,10 +103,20 @@ class Emitter {
     const mainDef = this.emitMain(mod.main);
 
     return [
-      `#include <cstdint>`,
+      `#include <array>`,
+      `#include <charconv>`,
+      `#include <cmath>`,
       `#include <iostream>`,
       `#include <string>`,
       `#include <vector>`,
+      ``,
+      // `number` is a double; print it JS-style (shortest round-trip, integers
+      // without a trailing ".0") via std::to_chars.
+      `static std::string tsn_num_to_string(double v) {`,
+      `  std::array<char, 32> buf;`,
+      `  auto res = std::to_chars(buf.data(), buf.data() + buf.size(), v);`,
+      `  return std::string(buf.data(), res.ptr);`,
+      `}`,
       ``,
       ...(this.structDefs.length ? [...this.structDefs, ``] : []),
       ...(protos.length ? [...protos, ``] : []),
@@ -122,7 +132,7 @@ class Emitter {
   private cppType(t: Type): string {
     if (isArray(t)) return `std::vector<${this.cppType(t.element)}>`;
     if (isObject(t)) return this.structName(t);
-    if (t === "number") return "long long";
+    if (t === "number") return "double";
     if (t === "boolean") return "bool";
     return "std::string"; // string
   }
@@ -205,6 +215,15 @@ class Emitter {
   // inline inside a `for (...)` header). `let` registers the variable.
   private inlineStmt(stmt: Stmt): string {
     if (stmt.kind === "let") {
+      // Empty array literal: element type can't be inferred from `[]`, so take
+      // it from the declared annotation (e.g. `let xs: number[] = []`).
+      if (stmt.init.kind === "array" && stmt.init.elements.length === 0) {
+        if (!isArray(stmt.type)) {
+          throw new Error("Empty array literal needs an array type annotation");
+        }
+        this.vars.set(stmt.name, stmt.type);
+        return `${this.cppType(stmt.type)} ${stmt.name} = {}`;
+      }
       const init = this.emitExpr(stmt.init);
       if (!sameType(stmt.type, init.type)) {
         throw new Error(
@@ -216,17 +235,55 @@ class Emitter {
       return `${this.cppType(init.type)} ${stmt.name} = ${init.code}`;
     }
     if (stmt.kind === "assign") {
-      const cur = this.vars.get(stmt.name);
-      if (!cur) throw new Error(`Cannot assign to undeclared variable '${stmt.name}'`);
+      const target = this.emitLValue(stmt.target);
       const val = this.emitExpr(stmt.value);
-      if (!sameType(cur, val.type)) {
+      if (!sameType(target.type, val.type)) {
         throw new Error(
-          `Type '${displayType(val.type)}' is not assignable to '${displayType(cur)}'`
+          `Type '${displayType(val.type)}' is not assignable to '${displayType(target.type)}'`
         );
       }
-      return `${stmt.name} = ${val.code}`;
+      return `${target.code} = ${val.code}`;
     }
     throw new Error(`Statement '${stmt.kind}' is not valid here`);
+  }
+
+  // Emit an assignable lvalue: a variable, an array element, or an object field.
+  // (`arr.length` and other non-assignable members are rejected.)
+  private emitLValue(target: Expr): Value {
+    switch (target.kind) {
+      case "var": {
+        const type = this.vars.get(target.name);
+        if (!type) throw new Error(`Cannot assign to undeclared variable '${target.name}'`);
+        return { code: target.name, type };
+      }
+      case "index": {
+        const arr = this.emitExpr(target.arr);
+        if (!isArray(arr.type)) {
+          throw new Error(`Cannot index a value of type '${displayType(arr.type)}'`);
+        }
+        const idx = this.emitExpr(target.index);
+        if (idx.type !== "number") throw new Error("Array index must be a number");
+        return {
+          code: `${arr.code}[static_cast<std::size_t>(${idx.code})]`,
+          type: arr.type.element,
+        };
+      }
+      case "member": {
+        const obj = this.emitExpr(target.obj);
+        if (!isObject(obj.type)) {
+          throw new Error(`Cannot assign to property '${target.name}' of '${displayType(obj.type)}'`);
+        }
+        const field = obj.type.fields.find((f) => f.name === target.name);
+        if (!field) {
+          throw new Error(
+            `Property '${target.name}' does not exist on type '${displayType(obj.type)}'`
+          );
+        }
+        return { code: `(${obj.code}).${target.name}`, type: field.type };
+      }
+      default:
+        throw new Error("Invalid assignment target");
+    }
   }
 
   private emitStmt(stmt: Stmt): void {
@@ -248,7 +305,9 @@ class Emitter {
             "console.log of an object is not supported yet (log fields individually)"
           );
         }
-        this.push(`std::cout << ${val.code} << "\\n";`);
+        // Numbers (doubles) print JS-style; strings/booleans stream directly.
+        const out = val.type === "number" ? `tsn_num_to_string(${val.code})` : val.code;
+        this.push(`std::cout << ${out} << "\\n";`);
         return;
       }
       case "return": {
@@ -268,11 +327,15 @@ class Emitter {
         return;
       }
       case "exprStmt": {
-        // Evaluate for effect; discard any result. (Today only calls reach here.)
-        const code =
-          stmt.expr.kind === "call"
-            ? this.emitCall(stmt.expr, /*asStatement*/ true).code
-            : this.emitExpr(stmt.expr).code;
+        // Evaluate for effect; discard any result. (Calls / method calls.)
+        let code: string;
+        if (stmt.expr.kind === "call") {
+          code = this.emitCall(stmt.expr, /*asStatement*/ true).code;
+        } else if (stmt.expr.kind === "methodCall") {
+          code = this.emitMethodCall(stmt.expr, /*asStatement*/ true).code;
+        } else {
+          code = this.emitExpr(stmt.expr).code;
+        }
         this.push(`${code};`);
         return;
       }
@@ -313,8 +376,11 @@ class Emitter {
   // Returns a C++ expression string plus the tsn type it represents.
   private emitExpr(e: Expr): Value {
     switch (e.kind) {
-      case "num":
-        return { code: `${Math.trunc(e.value)}LL`, type: "number" };
+      case "num": {
+        // Emit a C++ double literal: "2" -> "2.0", but keep "2.5" / "1e21" as-is.
+        const s = String(e.value);
+        return { code: /[.eE]/.test(s) ? s : `${s}.0`, type: "number" };
+      }
       case "bool":
         return { code: e.value ? "true" : "false", type: "boolean" };
       case "str":
@@ -374,14 +440,18 @@ class Emitter {
         if (idx.type !== "number") {
           throw new Error("Array index must be a number");
         }
-        return { code: `${arr.code}[${idx.code}]`, type: arr.type.element };
+        // `number` is a double; vector::operator[] needs an integer index.
+        return {
+          code: `${arr.code}[static_cast<std::size_t>(${idx.code})]`,
+          type: arr.type.element,
+        };
       }
       case "member": {
         const obj = this.emitExpr(e.obj);
-        // `arr.length` — std::vector::size() (cast unsigned -> long long).
+        // `arr.length` — std::vector::size() as a number (double).
         if (isArray(obj.type)) {
           if (e.name === "length") {
-            return { code: `static_cast<long long>((${obj.code}).size())`, type: "number" };
+            return { code: `static_cast<double>((${obj.code}).size())`, type: "number" };
           }
           throw new Error(`Arrays have no property '${e.name}'`);
         }
@@ -401,6 +471,10 @@ class Emitter {
         const val = this.emitCall(e, /*asStatement*/ false);
         return { code: val.code, type: val.type as Type };
       }
+      case "methodCall": {
+        const val = this.emitMethodCall(e, /*asStatement*/ false);
+        return { code: val.code, type: val.type as Type };
+      }
     }
   }
 
@@ -410,16 +484,26 @@ class Emitter {
     const code = `(${l.code} ${CPP_OP[e.op]} ${r.code})`;
 
     if (ARITH.has(e.op)) {
-      if (l.type === "string" || r.type === "string") {
-        if (e.op === "+") {
-          throw new Error("String concatenation is not supported yet (needs a heap/runtime)");
+      // `+` with a string operand is concatenation (numbers coerce via the same
+      // JS-style formatter; std::string(...) on the left makes operator+ resolve
+      // even when both operands are bare `const char*` literals).
+      if (e.op === "+" && (l.type === "string" || r.type === "string")) {
+        const okConcat = (t: Type) => t === "string" || t === "number";
+        if (!okConcat(l.type) || !okConcat(r.type)) {
+          throw new Error(
+            `Cannot concatenate '${displayType(l.type)}' and '${displayType(r.type)}'`
+          );
         }
-        throw new Error(`Operator '${e.op}' expects numbers`);
+        const strForm = (v: Value) =>
+          v.type === "number" ? `tsn_num_to_string(${v.code})` : v.code;
+        return { code: `(std::string(${strForm(l)}) + ${strForm(r)})`, type: "string" };
       }
       if (l.type !== "number" || r.type !== "number") {
         throw new Error(`Operator '${e.op}' expects numbers`);
       }
-      return { code, type: "number" };
+      // `number` is a double, so `%` uses std::fmod (C++ `%` is integer-only).
+      const arithCode = e.op === "%" ? `std::fmod(${l.code}, ${r.code})` : code;
+      return { code: arithCode, type: "number" };
     }
     if (RELATIONAL.has(e.op)) {
       if (l.type !== "number" || r.type !== "number") {
@@ -468,6 +552,34 @@ class Emitter {
       throw new Error(`'${e.callee}' returns void and cannot be used as a value`);
     }
     return { code: `${e.callee}(${args.join(", ")})`, type: sig.ret };
+  }
+
+  // Emit a method call. Currently only `array.push(v)` — statement-only (its
+  // result can't be used as a value yet), mapped to std::vector::push_back.
+  private emitMethodCall(
+    e: { receiver: Expr; method: string; args: Expr[] },
+    asStatement: boolean
+  ): { code: string; type: RetType } {
+    const recv = this.emitExpr(e.receiver);
+    if (isArray(recv.type)) {
+      if (e.method === "push") {
+        if (e.args.length !== 1) {
+          throw new Error(`'push' expects 1 argument, got ${e.args.length}`);
+        }
+        const arg = this.emitExpr(e.args[0]);
+        if (!sameType(arg.type, recv.type.element)) {
+          throw new Error(
+            `Cannot push '${displayType(arg.type)}' onto '${displayType(recv.type)}'`
+          );
+        }
+        if (!asStatement) {
+          throw new Error("'push' result cannot be used as a value yet (call it as a statement)");
+        }
+        return { code: `${recv.code}.push_back(${arg.code})`, type: "void" };
+      }
+      throw new Error(`Unsupported array method '${e.method}'`);
+    }
+    throw new Error(`Type '${displayType(recv.type)}' has no method '${e.method}'`);
   }
 }
 

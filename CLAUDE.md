@@ -93,32 +93,35 @@ Implemented and tested end-to-end:
 - **Types:** `number`, `boolean`, `string`, arrays (`T[]` / `Array<T>`), object literal types
   (`{ x: number; y: string }`).
 - **Values:** numeric/boolean/string literals, array literals `[...]`, object literals `{...}`.
-- **Operators:** arithmetic `+ - * / %` (integer), array indexing `a[i]`, member access
+- **Operators:** arithmetic `+ - * / %`, comparison `< <= > >= === !==`, logical `&& || !`,
+  string concatenation (`"a" + b`, numbers coerce), array indexing `a[i]`, member access
   `obj.field`, array `.length`.
 - **`console.log(x)`** for numbers/booleans and strings.
-- **Variables:** `let`/`const` with annotations (initializer required).
-- **Functions:** top-level, typed params + return type, `return`, calls, `void`.
+- **Variables:** `let`/`const` with annotations (initializer required); assignment `x = e`,
+  `a[i] = e`, `obj.f = e`, compound `+= -= *= /= %=`, and `i++` / `i--`.
+- **Arrays:** literals (incl. empty `[]` with an annotation) and `xs.push(v)`.
+- **Control flow:** `if` / `else`, `while`, `for (init; cond; update)`.
+- **Functions:** top-level, typed params + return type, `return`, calls, `void`; recursion works.
 
 ### Representation / behavior notes (read these — they bite)
 
 tsn types map onto C++ types (see [src/codegen/CLAUDE.md](src/codegen/CLAUDE.md)):
 
-| tsn type | C++ type           | notes                                              |
-| -------- | ------------------ | -------------------------------------------------- |
-| number   | `long long`        | **64-bit integer** — `console.log(5 / 2)` prints `2` |
-| boolean  | `bool`             | `std::cout` prints `1` / `0`                       |
-| string   | `std::string`      | literals are `const char*`, convert implicitly     |
-| `T[]`    | `std::vector<T>`   | heap-backed; `.length` → `.size()`                 |
-| `{ ... }`| generated `struct` | one struct per distinct field shape                |
+| tsn type | C++ type           | notes                                                       |
+| -------- | ------------------ | ----------------------------------------------------------- |
+| number   | `double`           | IEEE f64 — `5 / 2 === 2.5`; printed JS-style via `to_chars` |
+| boolean  | `bool`             | `std::cout` prints `1` / `0`                                |
+| string   | `std::string`      | literals are `const char*`, convert implicitly              |
+| `T[]`    | `std::vector<T>`   | heap-backed; `.length` → `.size()`; `.push()` → `push_back` |
+| `{ ... }`| generated `struct` | one struct per distinct field shape                         |
 
-- **`number` is an integer, not IEEE `f64`.** Moving to `f64` is now a one-type change
-  (`long long` → `double`) — deferred to keep current test behavior.
+- **`number` is `double`.** `%` compiles to `std::fmod`; array indices are cast to an integer.
 - **Scalar-only boundaries (v1):** object fields and function params/returns must be
   `number`/`boolean`/`string`. (C++ value semantics would now make aggregate params/returns
   safe — this restriction is enforced in the front-end and can be lifted next.)
 
 The compiler **errors cleanly** (a `tsnc:` message) on unsupported constructs rather than
-miscompiling — e.g. string concatenation, `console.log` of an aggregate, void-as-value.
+miscompiling — e.g. `console.log` of an aggregate, void-as-value, type mismatches.
 
 ## Conventions
 
@@ -152,17 +155,23 @@ int main() {
 
 ## Roadmap / known limits
 
-Roughly in dependency order:
+**Done** — the foundational basics:
 
-1. **`if` / `while` / `for`** — control flow. Maps directly to C++ `if`/`while`/`for`; unblocks
-   loops and terminating recursion.
-2. **Assignment statements** — `x = e`, `a[i] = e`, `obj.f = e` (mutation). C++ makes these direct.
-3. **Lift scalar-only boundaries** — pass/return arrays and objects (C++ `std::vector`/`struct`
-   value semantics make this safe now).
-4. **String concatenation / array `push`** — now trivial via `std::string` / `std::vector`;
-   currently still guarded off.
-5. **`f64` numbers** — change the `number` mapping from `long long` to `double`.
-6. **Full `ts.Program` + TypeChecker** — replace AST-annotation reading with real semantic
-   diagnostics, abort before codegen on type errors.
+- [x] **`if` / `while` / `for`** — control flow (+ comparison/logical operators, recursion).
+- [x] **Assignment** — `x = e`, `a[i] = e`, `obj.f = e`, compound `+= …`, `i++` / `i--`.
+- [x] **`f64` numbers** — `number` is IEEE double (`5 / 2 === 2.5`); `%` via `std::fmod`.
+- [x] **String concatenation + array `push`** — `"a" + b` (numbers coerce); `xs.push(v)` and
+      empty array literals (`let xs: number[] = []`).
+
+**Planned — ordered most-essential first.** Ordering principle: correctness of core types →
+completeness of what already exists → new capabilities → robustness tooling.
+
+1. [ ] **Lift scalar-only boundaries** — pass/return arrays and objects to functions (C++ value
+   semantics make this safe now). Drop the front-end's scalar-only checks on params/returns.
+2. [ ] **Full `ts.Program` + TypeChecker** — replace AST-annotation reading with real semantic
+   diagnostics; abort before codegen on type errors.
+
+**Smaller follow-ups:** more array methods (`pop`/`indexOf`), `push` as a value (returns length),
+boolean/aggregate in `console.log`, `string[]`/object array fields.
 
 Later: classes, closures, modules, generics.
