@@ -17,7 +17,7 @@ tests/
 ## How the harness works ([e2e.test.ts](e2e.test.ts))
 
 For every `cases/*.ts`, it:
-1. compiles via `driver.compile({ input, output, emitLlvm: false })` (the same path the CLI uses),
+1. compiles via `driver.compile({ input, output, emitCpp: false })` (the same path the CLI uses),
 2. runs the produced binary with `execFileSync`,
 3. asserts stdout `===` the matching `.expected`,
 4. cleans up the temp binary.
@@ -28,7 +28,7 @@ Cases are auto-discovered — **adding a pair is adding a test**, no harness edi
 
 - Drop `cases/<name>.ts` and `cases/<name>.expected`.
 - `.expected` must match stdout **exactly, including the trailing newline** — `console.log`
-  emits `printf "%d\n"` / `"%s\n"`, so a single `console.log(4)` expects `"4\n"`.
+  emits `std::cout << expr << "\n"`, so a single `console.log(4)` expects `"4\n"`.
 - Keep each case focused on one feature; name it after the feature.
 
 ## TDD loop (how this project is built)

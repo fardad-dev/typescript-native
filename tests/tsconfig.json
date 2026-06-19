@@ -1,0 +1,16 @@
+{
+  // Editor-only project for the test suite. The root tsconfig.json scopes the
+  // build to src/ (rootDir: src), so the tests live outside it and the editor
+  // would otherwise type-check them without @types/node. This config brings the
+  // tests into a real project so node globals (fs, os, path, __dirname, …) resolve.
+  "extends": "../tsconfig.json",
+  "compilerOptions": {
+    "rootDir": "..",
+    "noEmit": true,
+    "types": ["node"]
+  },
+  // Only the harness; cases/*.ts are tsn programs (inputs to our compiler),
+  // not TypeScript the editor should type-check.
+  "include": ["**/*.ts"],
+  "exclude": ["cases"]
+}

@@ -17,13 +17,12 @@ is added or changed.
 - **`RetType`** — `Type | "void"` (functions may return nothing; values never have `void` type).
 - **`Param`**, **`Func`** (`name`, `params`, `returnType`, `body`).
 - **`Module`** — `{ functions: Func[]; main: Stmt[] }`. `main` is the top-level program body
-  → LLVM `@main`.
+  → C++ `main()`.
 
 ## Design notes
 
-- **Arrays carry only their element type**, not a length. Length is *value-level* — our arrays
-  are stack-allocated with a compile-time-known size, tracked alongside the value in codegen
-  (see the `Value.length` field there), not encoded in the `Type`.
+- **Arrays carry only their element type**, not a length. Length is *value-level* — arrays
+  compile to `std::vector`, so `.length` is `.size()` at runtime, not encoded in the `Type`.
 - **Objects carry their fields in declaration order**, and that order **is** the struct layout
   used by codegen. Type *equality* is structural and order-independent, but the stored layout
   follows the object literal.

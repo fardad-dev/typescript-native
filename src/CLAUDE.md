@@ -11,17 +11,17 @@ frontend/lower.ts   (1) parse with `typescript`  (2) lower AST -> IR     ──�
    ▼                                                                       │
 ir/nodes.ts         the typed IR — the contract between lower and emit  ◄──┘
    ▼
-codegen/emit.ts     (3) IR -> LLVM IR text (the .ll)                     ◄── consumes IR
+codegen/emit.ts     (3) IR -> C++ source text (the .cpp)                 ◄── consumes IR
    ▼
-backend/clang.ts    (4) clang .ll -> native executable
+backend/clang.ts    (4) clang++ .cpp -> native executable
 ```
 
 - [index.ts](index.ts) — entry; only CLI concerns. Defers all work to `driver.compile`.
-- [driver.ts](driver.ts) — `compile(opts)` glues the four stages; owns where the `.ll` is written.
+- [driver.ts](driver.ts) — `compile(opts)` glues the four stages; owns where the `.cpp` is written.
 - [frontend/lower.ts](frontend/lower.ts) — TypeScript AST → our IR. See [frontend/CLAUDE.md](frontend/CLAUDE.md).
 - [ir/nodes.ts](ir/nodes.ts) — IR node definitions. See [ir/CLAUDE.md](ir/CLAUDE.md).
-- [codegen/emit.ts](codegen/emit.ts) — IR → LLVM IR text. See [codegen/CLAUDE.md](codegen/CLAUDE.md).
-- [backend/clang.ts](backend/clang.ts) — assemble + link. See [backend/CLAUDE.md](backend/CLAUDE.md).
+- [codegen/emit.ts](codegen/emit.ts) — IR → C++ source. See [codegen/CLAUDE.md](codegen/CLAUDE.md).
+- [backend/clang.ts](backend/clang.ts) — compile + link via clang++. See [backend/CLAUDE.md](backend/CLAUDE.md).
 
 ## Adding a language feature (the repeated 3-touch pattern)
 
@@ -41,6 +41,7 @@ points you at every site that must handle a newly added node.
 
 - Reading type info: lowering reads annotations straight off the AST; there is no full
   type-checker yet (a `ts.Program` + `TypeChecker` is on the roadmap).
-- Emitted IR uses **opaque pointers** (`ptr`) and starts with the `target triple`.
+- Codegen is **expression-based**: it emits readable C++ and lets `clang++` do the real
+  lowering (no SSA/pointer bookkeeping in our emitter).
 - Out-of-scope constructs throw a clear `Error` (surfaced as `tsnc: <message>`) — never a
   silent miscompile.

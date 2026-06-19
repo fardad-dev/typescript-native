@@ -35,7 +35,7 @@
 - **Scalar-only boundaries (v1):** object fields and function params/returns must lower to a
   scalar type; otherwise throw. Aggregates as params/returns aren't supported yet.
 - **String values come pre-decoded:** use `node.text` for string/template literals (TS already
-  resolved escapes); codegen re-encodes them for LLVM.
+  resolved escapes); codegen re-encodes them as C++ string literals.
 - **Fail loud:** any unsupported syntax throws `Error("Unsupported ... ")`. Keep messages
   specific — they surface to the user as `tsnc: <message>`.
 

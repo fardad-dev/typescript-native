@@ -1,8 +1,7 @@
-// Stage 4: hand the LLVM IR to clang, which assembles + links a native binary.
-// clang compiles .ll directly, so no separate llc/opt step is needed.
+// Stage 4: hand the generated C++ to clang++, which compiles + links a native binary.
 
 import { execFileSync } from "child_process";
 
-export function buildExecutable(llPath: string, outPath: string): void {
-  execFileSync("clang", [llPath, "-o", outPath], { stdio: "inherit" });
+export function buildExecutable(cppPath: string, outPath: string): void {
+  execFileSync("clang++", ["-std=c++17", cppPath, "-o", outPath], { stdio: "inherit" });
 }

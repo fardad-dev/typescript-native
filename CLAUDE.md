@@ -1,7 +1,7 @@
 # typescript-native (`tsnc`)
 
 An ahead-of-time (AOT) compiler that turns a subset of **TypeScript** into a native
-**executable**, the way C++ or Rust do — TypeScript source → **LLVM IR** → machine code →
+**executable**, the way C++ or Rust do — TypeScript source → **C++** → machine code →
 linked executable. No Node, no V8, no JIT at runtime: the output is a standalone binary.
 
 This is a learning-oriented compiler. Favor clarity and a working end-to-end pipeline over
@@ -19,14 +19,15 @@ TypeScript AST
 Internal IR (typed)
    │  (3) codegen                   src/codegen/emit.ts
    ▼
-LLVM IR text (.ll)
-   │  (4) assemble + link           src/backend/clang.ts  (clang program.ll -o program)
+C++ source (.cpp)
+   │  (4) compile + link            src/backend/clang.ts  (clang++ program.cpp -o program)
    ▼
 native executable
 ```
 
-Step 4 uses `clang` as the assembler+linker — it compiles `.ll` directly, so **no separate
-`llc`/`opt` is required**.
+C++ is our intermediate language: codegen emits readable C++, and `clang++` does the real
+lowering to machine code. (The compiler used to emit LLVM IR directly; it now targets C++,
+which makes heap-backed values like strings and arrays straightforward.)
 
 ## Tech stack (decided)
 
@@ -34,8 +35,8 @@ Step 4 uses `clang` as the assembler+linker — it compiles `.ll` directly, so *
 | ------------------- | ------------------------------------------------------------------- |
 | Compiler language   | **TypeScript**, run on Node (>= 22)                                 |
 | Front-end (parsing) | **Official `typescript` package** — reuse its lexer/parser          |
-| Backend             | **Emit LLVM IR text**, compile with **`clang`**                     |
-| Target              | **arm64-apple-macosx** (Apple Silicon) — single target for now      |
+| Backend             | **Emit C++ source**, compile with **`clang++ -std=c++17`**          |
+| Target              | native binary for this host (Apple Silicon / arm64 macOS)           |
 | CLI                 | **commander**                                                       |
 | Tests               | **vitest** (end-to-end: compile → run → diff stdout)                |
 
@@ -50,9 +51,9 @@ src/
   ir/
     nodes.ts        # internal IR node definitions (typed)
   codegen/
-    emit.ts         # (3) internal IR -> LLVM IR text
+    emit.ts         # (3) internal IR -> C++ source text
   backend/
-    clang.ts        # (4) shell out to clang to assemble + link the .ll
+    clang.ts        # (4) shell out to clang++ to compile + link the .cpp
 tests/
   e2e.test.ts       # harness: compile each case, run binary, diff stdout
   cases/            # *.ts inputs + *.expected stdout (one pair per feature)
@@ -68,10 +69,10 @@ npm run build                                       # tsc -> dist/
 node dist/index.js examples/test1.ts -o test1       # compile a .ts program to a binary
 ./test1                                             # run it
 
-node dist/index.js examples/test1.ts -o test1 --emit-llvm   # also writes test1.ll
+node dist/index.js examples/test1.ts -o test1 --emit-cpp   # also writes test1.cpp
 ```
 
-Manual pipeline sanity check (no compiler needed): `clang file.ll -o file && ./file`.
+Manual pipeline sanity check (no compiler needed): `clang++ -std=c++17 file.cpp -o file && ./file`.
 
 ## How to test
 
@@ -94,52 +95,58 @@ Implemented and tested end-to-end:
 - **Values:** numeric/boolean/string literals, array literals `[...]`, object literals `{...}`.
 - **Operators:** arithmetic `+ - * / %` (integer), array indexing `a[i]`, member access
   `obj.field`, array `.length`.
-- **`console.log(x)`** for numbers/booleans (`%d`) and strings (`%s`).
+- **`console.log(x)`** for numbers/booleans and strings.
 - **Variables:** `let`/`const` with annotations (initializer required).
 - **Functions:** top-level, typed params + return type, `return`, calls, `void`.
 
-### Representation notes (read these — they bite)
+### Representation / behavior notes (read these — they bite)
 
-- **`number` is a 64-bit integer (`i64`)**, not IEEE `f64`. `console.log(5 / 2)` prints `2`.
-  Moving to `f64` is a planned step; document where the integer model leaks.
-- Booleans are `i64` `0`/`1` and print as `0`/`1` (not `true`/`false`).
-- **Strings, arrays, and objects are pointers.** Strings → a private global byte array;
-  arrays → a stack buffer `[N x T]`; objects → a stack struct `{ ... }`. Array length is a
-  **compile-time constant** (tracked in the compiler, not stored in memory).
+tsn types map onto C++ types (see [src/codegen/CLAUDE.md](src/codegen/CLAUDE.md)):
+
+| tsn type | C++ type           | notes                                              |
+| -------- | ------------------ | -------------------------------------------------- |
+| number   | `long long`        | **64-bit integer** — `console.log(5 / 2)` prints `2` |
+| boolean  | `bool`             | `std::cout` prints `1` / `0`                       |
+| string   | `std::string`      | literals are `const char*`, convert implicitly     |
+| `T[]`    | `std::vector<T>`   | heap-backed; `.length` → `.size()`                 |
+| `{ ... }`| generated `struct` | one struct per distinct field shape                |
+
+- **`number` is an integer, not IEEE `f64`.** Moving to `f64` is now a one-type change
+  (`long long` → `double`) — deferred to keep current test behavior.
 - **Scalar-only boundaries (v1):** object fields and function params/returns must be
-  `number`/`boolean`/`string`. Aggregates aren't passed/returned yet — a pointer into a
-  callee frame would dangle, and array `.length` can't be a compile-time constant across callers.
+  `number`/`boolean`/`string`. (C++ value semantics would now make aggregate params/returns
+  safe — this restriction is enforced in the front-end and can be lifted next.)
 
 The compiler **errors cleanly** (a `tsnc:` message) on unsupported constructs rather than
 miscompiling — e.g. string concatenation, `console.log` of an aggregate, void-as-value.
 
 ## Conventions
 
-- **Opaque pointers only** in emitted IR (`ptr`). Never emit `i8*` or other typed pointers.
-- Each emitted `.ll` starts with `target triple = "arm64-apple-macosx15.0.0"`.
-- Generate fresh SSA temp names per function (`%t0`, `%t1`, …). Route variables **and params**
-  through stack slots (`alloca` + `load`/`store`) rather than hand-managing SSA.
+- **Codegen is expression-based:** `emitExpr` returns a C++ expression string; we lean on
+  the C++ compiler instead of hand-managing temporaries.
+- Binary expressions are fully parenthesized to preserve precedence.
+- `console.log` → `std::cout << expr << "\n"`.
+- Out-of-scope constructs throw a clear `Error` (surfaced as `tsnc: <message>`) — never a
+  silent miscompile.
 - Prefer small, pure helpers; one `emitX` / `lowerX` per node kind.
-- Lean on clear error messages for anything out of scope — don't silently miscompile.
 
 ### Verified environment (2026-06-19, this machine)
 
 - Apple Silicon (`arm64`), macOS (Darwin 24.6).
-- Apple clang **17.0.0**, target `arm64-apple-darwin24.6.0`. **Opaque pointers** are the
-  default — use `ptr`.
-- `node` v22, `tsc`, `clang`, `as`, `ld` present. `llc` is **not** installed (not needed).
+- Apple **clang++ 17.0.0** at `/usr/bin/clang++`; we compile with `-std=c++17`.
+- `node` v22, `tsc` present.
 
-A known-good minimal IR (computes 20+22, prints 42) — the shape codegen produces:
+A minimal generated program (the shape codegen produces) — computes 20+22, prints 42:
 
-```llvm
-target triple = "arm64-apple-macosx15.0.0"
-@.fmt = private unnamed_addr constant [4 x i8] c"%d\0A\00"
-declare i32 @printf(ptr, ...)
-define i32 @main() {
-entry:
-  %sum = add i64 20, 22
-  call i32 (ptr, ...) @printf(ptr @.fmt, i64 %sum)
-  ret i32 0
+```cpp
+#include <cstdint>
+#include <iostream>
+#include <string>
+#include <vector>
+
+int main() {
+  std::cout << (20LL + 22LL) << "\n";
+  return 0;
 }
 ```
 
@@ -147,14 +154,15 @@ entry:
 
 Roughly in dependency order:
 
-1. **`if` / `while` / `for`** — control flow (basic blocks + branches). Unblocks loops and
-   terminating recursion.
-2. **Assignment statements** — `x = e`, `a[i] = e`, `obj.f = e` (mutation).
-3. **`f64` numbers** — make `number` behave like JS (so `5 / 2 === 2.5`).
-4. **A heap (`malloc`) + minimal runtime** — unlocks string concatenation, array `push`/resize,
-   returning/passing aggregates, and a length-carrying array representation.
-5. **Bounds-checked indexing** — trap on out-of-range `a[i]`.
-6. **Full `ts.Program` + TypeChecker** — replace the AST-annotation reading with real semantic
+1. **`if` / `while` / `for`** — control flow. Maps directly to C++ `if`/`while`/`for`; unblocks
+   loops and terminating recursion.
+2. **Assignment statements** — `x = e`, `a[i] = e`, `obj.f = e` (mutation). C++ makes these direct.
+3. **Lift scalar-only boundaries** — pass/return arrays and objects (C++ `std::vector`/`struct`
+   value semantics make this safe now).
+4. **String concatenation / array `push`** — now trivial via `std::string` / `std::vector`;
+   currently still guarded off.
+5. **`f64` numbers** — change the `number` mapping from `long long` to `double`.
+6. **Full `ts.Program` + TypeChecker** — replace AST-annotation reading with real semantic
    diagnostics, abort before codegen on type errors.
 
-Later: classes, closures, modules, generics, GC.
+Later: classes, closures, modules, generics.

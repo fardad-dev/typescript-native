@@ -1,27 +1,25 @@
-// Stage 3: lower our internal IR to textual LLVM IR.
+// Stage 3: lower our internal IR to C++ source text.
 //
-// v1 representation:
-//   number, boolean -> i64 (booleans are 0/1)
-//   string          -> ptr to a private global byte array (a NUL-terminated C string)
-//   T[]             -> ptr to a stack buffer (`alloca [N x repr(T)]`), compile-time-sized
-//   { ... }         -> ptr to a stack struct (`alloca { repr(f0), repr(f1), ... }`)
+// C++ is a high-level target, so codegen is expression-based: emitExpr returns a
+// C++ expression string (e.g. "(a + b)", "xs[i]", "p.x", "add(2, 3)") rather than
+// breaking everything into temporaries. The C++ compiler (clang++) then does the
+// real lowering to machine code.
 //
-// Each tsn function becomes one LLVM `define`; top-level statements become @main.
-// Params and locals both live in stack slots (alloca + load/store) for a uniform
-// variable model. Every emitted value carries its IR type (and, for arrays, a
-// compile-time length) so we know its representation, store/load width, printf
-// format, and how to index/project/return it.
+// Type mapping (chosen to preserve the previous backend's observable behavior):
+//   number  -> long long      (64-bit integer; integer division, as before)
+//   boolean -> bool           (std::cout prints 1/0)
+//   string  -> std::string    (literals are const char*, convert implicitly)
+//   T[]     -> std::vector<T>  (heap-backed; .length -> .size())
+//   { ... } -> a generated `struct` (one per distinct field shape)
 
 import { Module, Expr, Stmt, BinaryOp, Type, Field, Func, RetType } from "../ir/nodes";
 
-const TARGET_TRIPLE = "arm64-apple-macosx15.0.0";
-
 const OPCODE: Record<BinaryOp, string> = {
-  "+": "add",
-  "-": "sub",
-  "*": "mul",
-  "/": "sdiv",
-  "%": "srem",
+  "+": "+",
+  "-": "-",
+  "*": "*",
+  "/": "/",
+  "%": "%",
 };
 
 type ArrayType = { kind: "array"; element: Type };
@@ -35,20 +33,6 @@ function isObject(t: Type): t is ObjectType {
 }
 function isAggregate(t: Type): boolean {
   return isArray(t) || isObject(t);
-}
-
-// The LLVM type used to represent a tsn value. Aggregates and strings are pointers.
-function reprOf(t: Type): "i64" | "ptr" {
-  return typeof t === "object" || t === "string" ? "ptr" : "i64";
-}
-function retRepr(t: RetType): string {
-  return t === "void" ? "void" : reprOf(t);
-}
-
-// The LLVM struct type literal for an object, e.g. `{ i64, ptr }`.
-function structType(o: ObjectType): string {
-  if (o.fields.length === 0) return "{}";
-  return `{ ${o.fields.map((f) => reprOf(f.type)).join(", ")} }`;
 }
 
 function displayType(t: RetType): string {
@@ -74,12 +58,10 @@ function sameType(a: Type, b: Type): boolean {
   return a === b;
 }
 
-// An emitted value: its LLVM operand text, the tsn type it represents, and —
-// for arrays — its compile-time element count.
+// An emitted value: its C++ expression text and the tsn type it represents.
 interface Value {
-  v: string;
+  code: string;
   type: Type;
-  length?: number;
 }
 
 interface Sig {
@@ -92,47 +74,79 @@ export function emit(mod: Module): string {
 }
 
 class Emitter {
-  // Module-level state, shared across functions.
-  private globals: string[] = []; // string-literal constants
-  private strCount = 0;
+  // Module-level state.
   private sigs = new Map<string, Sig>();
+  private structDefs: string[] = []; // generated `struct ... { ... };` lines
+  private structNames = new Map<string, string>(); // field-shape key -> struct name
 
-  // Per-function scratch, reset by emitBody().
+  // Per-function scratch, reset by resetForFunction().
   private body: string[] = [];
-  private temp = 0;
-  private vars = new Map<string, { ptr: string; type: Type; length?: number }>();
+  private vars = new Map<string, Type>();
   private curReturn: RetType = "void";
   private terminated = false;
 
   emitModule(mod: Module): string {
-    // First pass: collect signatures so calls can reference any function
-    // (including ones declared later, and recursion).
+    // First pass: collect signatures so calls can reference any function.
     for (const fn of mod.functions) {
       if (this.sigs.has(fn.name)) throw new Error(`Duplicate function '${fn.name}'`);
       this.sigs.set(fn.name, { params: fn.params.map((p) => p.type), ret: fn.returnType });
     }
 
-    // Emit bodies first — this populates `globals` with any string constants.
+    // Emit bodies first — this populates structDefs as object types are seen.
+    const protos = mod.functions.map((fn) => this.prototype(fn));
     const defs = mod.functions.map((fn) => this.emitFunction(fn));
-    defs.push(this.emitMain(mod.main));
+    const mainDef = this.emitMain(mod.main);
 
     return [
-      `target triple = "${TARGET_TRIPLE}"`,
+      `#include <cstdint>`,
+      `#include <iostream>`,
+      `#include <string>`,
+      `#include <vector>`,
       ``,
-      `@.fmt.int = private unnamed_addr constant [4 x i8] c"%d\\0A\\00"`,
-      `@.fmt.str = private unnamed_addr constant [4 x i8] c"%s\\0A\\00"`,
-      ...this.globals,
-      ``,
-      `declare i32 @printf(ptr, ...)`,
-      ``,
+      ...(this.structDefs.length ? [...this.structDefs, ``] : []),
+      ...(protos.length ? [...protos, ``] : []),
       defs.join("\n\n"),
+      ...(defs.length ? [``] : []),
+      mainDef,
       ``,
     ].join("\n");
   }
 
+  // --- type mapping -------------------------------------------------------
+
+  private cppType(t: Type): string {
+    if (isArray(t)) return `std::vector<${this.cppType(t.element)}>`;
+    if (isObject(t)) return this.structName(t);
+    if (t === "number") return "long long";
+    if (t === "boolean") return "bool";
+    return "std::string"; // string
+  }
+
+  private retType(t: RetType): string {
+    return t === "void" ? "void" : this.cppType(t);
+  }
+
+  // Generate (or reuse) a named struct for an object type. Keyed by field shape.
+  private structName(o: ObjectType): string {
+    const key = o.fields.map((f) => `${f.name}:${displayType(f.type)}`).join(";");
+    const existing = this.structNames.get(key);
+    if (existing) return existing;
+    const name = `tsn_Obj${this.structNames.size}`;
+    this.structNames.set(key, name);
+    const members = o.fields.map((f) => `${this.cppType(f.type)} ${f.name};`).join(" ");
+    this.structDefs.push(`struct ${name} { ${members} };`);
+    return name;
+  }
+
+  // --- functions ----------------------------------------------------------
+
+  private prototype(fn: Func): string {
+    const params = fn.params.map((p) => this.cppType(p.type)).join(", ");
+    return `${this.retType(fn.returnType)} ${fn.name}(${params});`;
+  }
+
   private resetForFunction(ret: RetType): void {
     this.body = [];
-    this.temp = 0;
     this.vars = new Map();
     this.curReturn = ret;
     this.terminated = false;
@@ -140,29 +154,19 @@ class Emitter {
 
   private emitFunction(fn: Func): string {
     this.resetForFunction(fn.returnType);
-
-    const paramList = fn.params.map((p) => `${reprOf(p.type)} %${p.name}`).join(", ");
-    // Spill each param into a stack slot so it behaves like any other local.
-    for (const p of fn.params) {
-      const r = reprOf(p.type);
-      const ptr = `%${p.name}.addr`;
-      this.body.push(`  ${ptr} = alloca ${r}`);
-      this.body.push(`  store ${r} %${p.name}, ptr ${ptr}`);
-      this.vars.set(p.name, { ptr, type: p.type });
-    }
+    for (const p of fn.params) this.vars.set(p.name, p.type);
 
     for (const s of fn.body) {
       if (this.terminated) break; // ignore code after a `return` (no control flow yet)
       this.emitStmt(s);
     }
-    if (!this.terminated) {
-      if (fn.returnType === "void") this.body.push("  ret void");
-      else throw new Error(`Function '${fn.name}' must return a value`);
+    if (!this.terminated && fn.returnType !== "void") {
+      throw new Error(`Function '${fn.name}' must return a value`);
     }
 
+    const params = fn.params.map((p) => `${this.cppType(p.type)} ${p.name}`).join(", ");
     return [
-      `define ${retRepr(fn.returnType)} @${fn.name}(${paramList}) {`,
-      `entry:`,
+      `${this.retType(fn.returnType)} ${fn.name}(${params}) {`,
       ...this.body,
       `}`,
     ].join("\n");
@@ -171,28 +175,10 @@ class Emitter {
   private emitMain(stmts: Stmt[]): string {
     this.resetForFunction("void"); // top-level `return` is rejected during lowering
     for (const s of stmts) this.emitStmt(s);
-    return [
-      `define i32 @main() {`,
-      `entry:`,
-      ...this.body,
-      `  ret i32 0`,
-      `}`,
-    ].join("\n");
+    return [`int main() {`, ...this.body, `  return 0;`, `}`].join("\n");
   }
 
-  private fresh(): string {
-    return `%t${this.temp++}`;
-  }
-
-  // Register a string literal as a private global and return its symbol (a ptr).
-  private internString(value: string): string {
-    const { text, length } = encodeCString(value);
-    const name = `@.str.${this.strCount++}`;
-    this.globals.push(
-      `${name} = private unnamed_addr constant [${length} x i8] c"${text}"`
-    );
-    return name;
-  }
+  // --- statements ---------------------------------------------------------
 
   private emitStmt(stmt: Stmt): void {
     switch (stmt.kind) {
@@ -203,17 +189,9 @@ class Emitter {
             `Type '${displayType(init.type)}' is not assignable to '${displayType(stmt.type)}'`
           );
         }
-        // Aggregates reuse the buffer their literal already allocated. We bind
-        // the *literal's* type, whose field/element order matches the layout.
-        if (isAggregate(stmt.type)) {
-          this.vars.set(stmt.name, { ptr: init.v, type: init.type, length: init.length });
-          return;
-        }
-        const r = reprOf(stmt.type);
-        const ptr = `%${stmt.name}.addr`;
-        this.body.push(`  ${ptr} = alloca ${r}`);
-        this.body.push(`  store ${r} ${init.v}, ptr ${ptr}`);
-        this.vars.set(stmt.name, { ptr, type: stmt.type });
+        // Bind the initializer's type (for aggregates, its field/element shape).
+        this.body.push(`  ${this.cppType(init.type)} ${stmt.name} = ${init.code};`);
+        this.vars.set(stmt.name, init.type);
         return;
       }
       case "log": {
@@ -228,18 +206,13 @@ class Emitter {
             "console.log of an object is not supported yet (log fields individually)"
           );
         }
-        const t = this.fresh();
-        if (reprOf(val.type) === "ptr") {
-          this.body.push(`  ${t} = call i32 (ptr, ...) @printf(ptr @.fmt.str, ptr ${val.v})`);
-        } else {
-          this.body.push(`  ${t} = call i32 (ptr, ...) @printf(ptr @.fmt.int, i64 ${val.v})`);
-        }
+        this.body.push(`  std::cout << ${val.code} << "\\n";`);
         return;
       }
       case "return": {
         if (this.curReturn === "void") {
           if (stmt.value) throw new Error("Cannot return a value from a void function");
-          this.body.push(`  ret void`);
+          this.body.push(`  return;`);
         } else {
           if (!stmt.value) throw new Error("Missing return value");
           const val = this.emitExpr(stmt.value);
@@ -248,43 +221,38 @@ class Emitter {
               `Type '${displayType(val.type)}' is not assignable to return type '${displayType(this.curReturn)}'`
             );
           }
-          this.body.push(`  ret ${reprOf(this.curReturn)} ${val.v}`);
+          this.body.push(`  return ${val.code};`);
         }
         this.terminated = true;
         return;
       }
       case "exprStmt": {
         // Evaluate for effect; discard any result. (Today only calls reach here.)
-        if (stmt.expr.kind === "call") {
-          this.emitCall(stmt.expr, /*asStatement*/ true);
-        } else {
-          this.emitExpr(stmt.expr);
-        }
+        const code =
+          stmt.expr.kind === "call"
+            ? this.emitCall(stmt.expr, /*asStatement*/ true).code
+            : this.emitExpr(stmt.expr).code;
+        this.body.push(`  ${code};`);
         return;
       }
     }
   }
 
-  // Returns the LLVM operand (an SSA temp, a literal, or a global symbol) plus its type.
+  // --- expressions --------------------------------------------------------
+
+  // Returns a C++ expression string plus the tsn type it represents.
   private emitExpr(e: Expr): Value {
     switch (e.kind) {
       case "num":
-        return { v: String(Math.trunc(e.value)), type: "number" };
+        return { code: `${Math.trunc(e.value)}LL`, type: "number" };
       case "bool":
-        return { v: e.value ? "1" : "0", type: "boolean" };
+        return { code: e.value ? "true" : "false", type: "boolean" };
       case "str":
-        return { v: this.internString(e.value), type: "string" };
+        return { code: cppStringLiteral(e.value), type: "string" };
       case "var": {
-        const slot = this.vars.get(e.name);
-        if (!slot) throw new Error(`Unknown variable: ${e.name}`);
-        // Aggregates are passed around as their buffer pointer — no load.
-        if (isAggregate(slot.type)) {
-          return { v: slot.ptr, type: slot.type, length: slot.length };
-        }
-        const r = reprOf(slot.type);
-        const t = this.fresh();
-        this.body.push(`  ${t} = load ${r}, ptr ${slot.ptr}`);
-        return { v: t, type: slot.type };
+        const type = this.vars.get(e.name);
+        if (!type) throw new Error(`Unknown variable: ${e.name}`);
+        return { code: e.name, type };
       }
       case "binary": {
         const l = this.emitExpr(e.left);
@@ -297,9 +265,7 @@ class Emitter {
         if (isAggregate(l.type) || isAggregate(r.type)) {
           throw new Error("Arithmetic on arrays/objects is not supported");
         }
-        const t = this.fresh();
-        this.body.push(`  ${t} = ${OPCODE[e.op]} i64 ${l.v}, ${r.v}`);
-        return { v: t, type: "number" };
+        return { code: `(${l.code} ${OPCODE[e.op]} ${r.code})`, type: "number" };
       }
       case "array": {
         if (e.elements.length === 0) {
@@ -314,16 +280,9 @@ class Emitter {
             throw new Error("All array elements must have the same type");
           }
         }
-        const er = reprOf(element);
-        const n = vals.length;
-        const arr = this.fresh();
-        this.body.push(`  ${arr} = alloca [${n} x ${er}]`);
-        vals.forEach((val, i) => {
-          const p = this.fresh();
-          this.body.push(`  ${p} = getelementptr ${er}, ptr ${arr}, i64 ${i}`);
-          this.body.push(`  store ${er} ${val.v}, ptr ${p}`);
-        });
-        return { v: arr, type: { kind: "array", element }, length: n };
+        const arrType: ArrayType = { kind: "array", element };
+        const items = vals.map((v) => v.code).join(", ");
+        return { code: `${this.cppType(arrType)}{${items}}`, type: arrType };
       }
       case "object": {
         const props = e.properties.map((p) => ({ name: p.name, value: this.emitExpr(p.value) }));
@@ -339,15 +298,8 @@ class Emitter {
           kind: "object",
           fields: props.map((p) => ({ name: p.name, type: p.value.type })),
         };
-        const st = structType(objType);
-        const obj = this.fresh();
-        this.body.push(`  ${obj} = alloca ${st}`);
-        props.forEach((p, i) => {
-          const gp = this.fresh();
-          this.body.push(`  ${gp} = getelementptr ${st}, ptr ${obj}, i64 0, i32 ${i}`);
-          this.body.push(`  store ${reprOf(p.value.type)} ${p.value.v}, ptr ${gp}`);
-        });
-        return { v: obj, type: objType };
+        const items = props.map((p) => p.value.code).join(", ");
+        return { code: `${this.structName(objType)}{${items}}`, type: objType };
       }
       case "index": {
         const arr = this.emitExpr(e.arr);
@@ -358,51 +310,42 @@ class Emitter {
         if (idx.type !== "number") {
           throw new Error("Array index must be a number");
         }
-        const er = reprOf(arr.type.element);
-        const p = this.fresh();
-        this.body.push(`  ${p} = getelementptr ${er}, ptr ${arr.v}, i64 ${idx.v}`);
-        const t = this.fresh();
-        this.body.push(`  ${t} = load ${er}, ptr ${p}`);
-        return { v: t, type: arr.type.element };
+        return { code: `${arr.code}[${idx.code}]`, type: arr.type.element };
       }
       case "member": {
         const obj = this.emitExpr(e.obj);
-        // `arr.length` — a compile-time constant.
+        // `arr.length` — std::vector::size() (cast unsigned -> long long).
         if (isArray(obj.type)) {
-          if (e.name === "length" && obj.length !== undefined) {
-            return { v: String(obj.length), type: "number" };
+          if (e.name === "length") {
+            return { code: `static_cast<long long>((${obj.code}).size())`, type: "number" };
           }
           throw new Error(`Arrays have no property '${e.name}'`);
         }
         // `obj.field`
         if (isObject(obj.type)) {
-          const idx = obj.type.fields.findIndex((f) => f.name === e.name);
-          if (idx < 0) {
+          const field = obj.type.fields.find((f) => f.name === e.name);
+          if (!field) {
             throw new Error(
               `Property '${e.name}' does not exist on type '${displayType(obj.type)}'`
             );
           }
-          const fieldType = obj.type.fields[idx].type;
-          const st = structType(obj.type);
-          const gp = this.fresh();
-          this.body.push(`  ${gp} = getelementptr ${st}, ptr ${obj.v}, i64 0, i32 ${idx}`);
-          const t = this.fresh();
-          this.body.push(`  ${t} = load ${reprOf(fieldType)}, ptr ${gp}`);
-          return { v: t, type: fieldType };
+          return { code: `(${obj.code}).${e.name}`, type: field.type };
         }
         throw new Error(`Type '${displayType(obj.type)}' has no property '${e.name}'`);
       }
       case "call": {
         const val = this.emitCall(e, /*asStatement*/ false);
-        // emitCall throws for void in value position, so val is non-null here.
-        return val!;
+        return { code: val.code, type: val.type as Type };
       }
     }
   }
 
-  // Emit a function call. In statement position a void call is allowed and its
-  // result (if any) discarded; in value position a void call is an error.
-  private emitCall(e: { callee: string; args: Expr[] }, asStatement: boolean): Value | null {
+  // Emit a function call. In statement position a void call is allowed; in value
+  // position a void call is an error.
+  private emitCall(
+    e: { callee: string; args: Expr[] },
+    asStatement: boolean
+  ): { code: string; type: RetType } {
     const sig = this.sigs.get(e.callee);
     if (!sig) throw new Error(`Unknown function: ${e.callee}`);
     if (e.args.length !== sig.params.length) {
@@ -417,35 +360,29 @@ class Emitter {
           `Argument ${i + 1} of '${e.callee}': type '${displayType(val.type)}' is not assignable to '${displayType(sig.params[i])}'`
         );
       }
-      return `${reprOf(sig.params[i])} ${val.v}`;
+      return val.code;
     });
-    const argList = args.join(", ");
-
-    if (sig.ret === "void") {
-      if (!asStatement) {
-        throw new Error(`'${e.callee}' returns void and cannot be used as a value`);
-      }
-      this.body.push(`  call void @${e.callee}(${argList})`);
-      return null;
+    if (sig.ret === "void" && !asStatement) {
+      throw new Error(`'${e.callee}' returns void and cannot be used as a value`);
     }
-    const t = this.fresh();
-    this.body.push(`  ${t} = call ${reprOf(sig.ret)} @${e.callee}(${argList})`);
-    return { v: t, type: sig.ret };
+    return { code: `${e.callee}(${args.join(", ")})`, type: sig.ret };
   }
 }
 
-// Encode a JS string as the body of an LLVM `c"..."` constant (UTF-8 bytes,
-// non-printable / quote / backslash escaped as \XX), plus the trailing NUL.
-// `length` includes that NUL terminator.
-function encodeCString(s: string): { text: string; length: number } {
+// Encode a JS string as a C++ double-quoted string literal: printable ASCII is
+// kept verbatim (except " and \), common controls use named escapes, and any
+// other byte uses a 3-digit octal escape (\ooo is bounded, unlike \x).
+function cppStringLiteral(s: string): string {
   const bytes = Buffer.from(s, "utf8");
-  let text = "";
+  let out = '"';
   for (const b of bytes) {
-    if (b >= 0x20 && b <= 0x7e && b !== 0x22 /* " */ && b !== 0x5c /* \ */) {
-      text += String.fromCharCode(b);
-    } else {
-      text += "\\" + b.toString(16).toUpperCase().padStart(2, "0");
-    }
+    if (b === 0x22) out += '\\"';
+    else if (b === 0x5c) out += "\\\\";
+    else if (b === 0x0a) out += "\\n";
+    else if (b === 0x09) out += "\\t";
+    else if (b === 0x0d) out += "\\r";
+    else if (b >= 0x20 && b <= 0x7e) out += String.fromCharCode(b);
+    else out += "\\" + b.toString(8).padStart(3, "0");
   }
-  return { text: text + "\\00", length: bytes.length + 1 };
+  return out + '"';
 }

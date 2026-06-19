@@ -1,21 +1,21 @@
-# src/backend/ — assemble + link (stage 4)
+# src/backend/ — compile + link (stage 4)
 
-[clang.ts](clang.ts) takes the generated LLVM IR and produces the native binary.
+[clang.ts](clang.ts) takes the generated C++ and produces the native binary.
 
-- `buildExecutable(llPath, outPath)` shells out: `clang <llPath> -o <outPath>` (via
-  `execFileSync`, inheriting stdio so clang's diagnostics reach the user).
-- **`clang` compiles `.ll` directly** — it runs the LLVM backend + system assembler/linker
-  itself, so there is **no separate `llc` or `opt` step** (and `llc` isn't installed here).
+- `buildExecutable(cppPath, outPath)` shells out: `clang++ -std=c++17 <cppPath> -o <outPath>`
+  (via `execFileSync`, inheriting stdio so clang++'s diagnostics reach the user).
+- `clang++` compiles + links in one step (it drives the C++ frontend, optimizer, assembler,
+  and linker), so there's no separate codegen/assemble/link tooling to manage here.
 
-## Where the `.ll` comes from
+## Where the `.cpp` comes from
 
-[../driver.ts](../driver.ts) writes the IR to disk before calling this:
-- with `--emit-llvm`: `<output>.ll`, kept beside the binary for inspection;
+[../driver.ts](../driver.ts) writes the C++ to disk before calling this:
+- with `--emit-cpp`: `<output>.cpp`, kept beside the binary for inspection;
 - otherwise: a temp file that's deleted after a successful build.
 
 ## Notes
 
-- The emitted IR sets its own `target triple`, so clang needs no extra target flags. (It will
-  warn `-Woverride-module` only if the triple mismatches the host — the emitted triple matches.)
-- This stage is intentionally tiny. Future work (optimization levels, separate assemble vs link,
-  linking a runtime once we have a heap) would live here.
+- We pin `-std=c++17` (the generated code uses `std::vector`, `std::string`, brace/aggregate
+  init, `static_cast`).
+- This stage is intentionally tiny. Future work (optimization flags `-O2`, choosing a compiler,
+  linking extra runtime support) would live here.

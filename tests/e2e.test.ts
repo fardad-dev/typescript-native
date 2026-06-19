@@ -7,7 +7,7 @@ import { compile } from "../src/driver";
 
 // Each `cases/<name>.ts` is compiled to a native binary, run, and its stdout
 // compared against `cases/<name>.expected`. This exercises the whole pipeline:
-// parse -> lower -> emit LLVM IR -> clang -> run.
+// parse -> lower -> emit C++ -> clang++ -> run.
 const casesDir = path.join(__dirname, "cases");
 
 describe("e2e: compile a .ts case to a native binary and run it", () => {
@@ -22,7 +22,7 @@ describe("e2e: compile a .ts case to a native binary and run it", () => {
       const expected = fs.readFileSync(path.join(casesDir, `${name}.expected`), "utf8");
       const out = path.join(os.tmpdir(), `tsn-${name}-${process.pid}`);
 
-      compile({ input, output: out, emitLlvm: false });
+      compile({ input, output: out, emitCpp: false });
       const stdout = execFileSync(out, { encoding: "utf8" });
       fs.rmSync(out, { force: true });
 

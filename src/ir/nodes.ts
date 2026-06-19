@@ -2,7 +2,7 @@
 // Codegen consumes this — never the raw TS AST.
 
 // Arrays carry their element type but not a length — length is a value-level
-// property (our arrays are stack-allocated with a compile-time-known size).
+// property (arrays compile to std::vector; `.length` maps to `.size()`).
 // Objects carry their fields in declaration order — that order is the layout.
 export type Field = { name: string; type: Type };
 
@@ -53,5 +53,5 @@ export interface Func {
 
 export interface Module {
   functions: Func[];
-  main: Stmt[]; // top-level statements -> body of LLVM @main
+  main: Stmt[]; // top-level statements -> body of C++ main()
 }
