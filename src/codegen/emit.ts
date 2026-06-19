@@ -751,11 +751,6 @@ class Emitter {
           if (seen.has(p.name))
             throw new Error(`Duplicate property '${p.name}'`);
           seen.add(p.name);
-          if (typeof p.value.type !== "string") {
-            throw new Error(
-              "Object fields must be number, boolean, or string (v1)",
-            );
-          }
         }
         const objType: ObjectType = {
           kind: "object",

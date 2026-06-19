@@ -81,7 +81,7 @@ npm test            # run the e2e suite once (vitest run)
 npm run test:watch  # re-run on change — the TDD red->green loop
 ```
 
-The suite (currently **34 cases**, all green) auto-discovers every `tests/cases/*.ts`,
+The suite (currently **52 cases**, all green) auto-discovers every `tests/cases/*.ts`,
 compiles it to a real native binary, runs it, and diffs stdout against the matching
 `.expected` file. **Every feature gets a `tests/cases/*.ts` + `.expected` pair**, ideally
 written first (red), then implemented to green. See [tests/CLAUDE.md](tests/CLAUDE.md).
@@ -91,7 +91,9 @@ written first (red), then implemented to green. See [tests/CLAUDE.md](tests/CLAU
 Implemented and tested end-to-end:
 
 - **Types:** `number`, `boolean`, `string`, arrays (`T[]` / `Array<T>`), object literal types
-  (`{ x: number; y: string }`).
+  (`{ x: number; y: string }`). Aggregates **nest** — array elements and object fields may
+  themselves be arrays/objects (`number[][]`, `{ pts: number[] }`, `{ x: number }[]`,
+  `{ inner: { x: number } }`).
 - **Values:** numeric/boolean/string literals, array literals `[...]`, object literals `{...}`.
 - **Operators:** arithmetic `+ - * / %`, unary `-` / `+` (`-x`, `-5`), comparison
   `< <= > >= === !==` (numbers **and** strings — strings compare lexicographically), logical
@@ -151,7 +153,14 @@ tsn types map onto C++ types (see [src/codegen/CLAUDE.md](src/codegen/CLAUDE.md)
   callee: mutating one (`xs.push(v)`, `xs[i] = v`, `xs = …`) is a clean `tsnc:` error, not a silent
   divergence from JS's shared-reference semantics (copy into a local first to mutate). Aggregate
   **returns pass by value**, leaning on C++ RVO/move so the cost lands only where the result is
-  bound or used. **Object *fields* are still scalar-only** (`{ x: number }`, not `{ pts: number[] }`).
+  bound or used.
+- **Aggregates nest:** object fields and array elements may themselves be aggregates —
+  `{ pts: number[] }`, `{ inner: { x: number } }`, `number[][]`, `{ x: number }[]`. These map
+  directly to C++ (`std::vector<std::vector<double>>`, a struct with `vector`/struct members), and
+  `lowerType` / struct generation recurse through the shape. Nested *number* fields and elements
+  always use the f64 rep (`double`). Reading, mutating (`box.inner.x = 9`, `poly.pts[0] = 9`), and
+  pushing onto a nested array (`poly.pts.push(v)`) all work; an empty array as a field
+  (`{ pts: [] }`) still errors (no annotation to infer the element type from).
 
 The compiler **errors cleanly** (a `tsnc:` message) on unsupported constructs rather than
 miscompiling — e.g. `console.log` of an aggregate, void-as-value, type mismatches.
@@ -249,6 +258,18 @@ pair** (red → green).
       a latent aggregate-literal bug: building a `vector`/`struct` from a *non-constant* integer
       number now casts `long long`→`double` (a brace-init narrowing clang rejected; literal
       constants like `3LL` had slipped through). Object *fields* stay scalar-only.
+- [x] **Nested objects and arrays** — aggregates nest: object fields that are arrays or objects
+      (`{ pts: number[] }`, `{ inner: { x: number } }`) and arrays of aggregates (`number[][]`,
+      `{ x: number }[]`). Turned out to be mostly *removing* code: arrays of aggregates and
+      `number[][]` already worked (`lowerType` recurses through array element types, and
+      `f64SlotCode`/struct generation handle aggregate values), so the only blocks were two
+      scalar-field guards — one in `lowerType`, one in the object-literal emitter. Dropping both
+      lit up the whole surface: construction, indexing, field access, mutation (`box.inner.x = 9`,
+      `poly.pts[0] = 9`), `push` onto a nested array, and crossing function boundaries
+      (`{x;y}[]` param by `const&`, `number[][]` return by value). Nested structs generate inner
+      before outer (correct C++ order); nested numbers stay f64. `console.log` of an aggregate is
+      still a clean error (JS-style printing is the separate *Richer `console.log`* item); an empty
+      array field (`{ pts: [] }`) still errors (no element type to infer).
 
 ### Will support — core completeness
 
@@ -262,4 +283,14 @@ pair** (red → green).
 
 ### Later
 
-Classes, closures, modules, generics.
+- [ ] **Classes** — `class C { f: T; constructor(...) {…}; method(...): R {…} }`, `new C(...)`,
+      `this`, field access and method calls. Fields reuse the struct generation that object
+      literals already have, and methods lower to member functions (or free functions taking the
+      receiver). The real design decision is **identity**: JS objects are *reference* types
+      (`new C()` is shared, two variables can alias and see each other's mutations), which clashes
+      with the value semantics used for object literals today — so class instances likely need a
+      reference representation (heap-allocated + ref-counted, like `tsn_str`) rather than by-value
+      structs. `extends` / inheritance, `private`/`public`, and `static` members come after the
+      basic shape works.
+- [ ] **Closures, modules, generics** — first-class function values, `import`/`export`, and
+      type parameters.

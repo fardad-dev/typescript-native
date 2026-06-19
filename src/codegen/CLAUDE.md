@@ -15,6 +15,16 @@ real lowering — no SSA temporaries or pointer bookkeeping here.
 | `T[]`               | `std::vector<T>`     | `.length` → `static_cast<long long>(v.size())` (i64); `.push()` → `push_back`; `.join(sep?)` → `tsn_join` (`string[]`/`number[]` → `tsn_str`); index cast to `std::size_t` |
 | `{ ... }`           | generated `struct`   | `structName()` dedupes by field shape; number fields use the f64 rep |
 
+**Aggregates nest.** `T` (array element) and a field type may themselves be aggregates, so
+`cppType` recurses: `number[][]` → `std::vector<std::vector<double>>`, `{ pts: number[] }` →
+a struct with a `std::vector<double>` member, `{ inner: { x: number } }` → a struct with a struct
+member. `structName` registers its own name *before* building members, then `cppType(field)`
+triggers inner `structName` calls — so a nested struct is pushed to `structDefs` ahead of the
+struct that embeds it (correct C++ declaration order). Element/field values still pass through
+`f64SlotCode` (an aggregate value returns as-is; only `i64`-rep *numbers* get the `double` cast),
+and nested numbers stay f64. The only blocks were two scalar-field guards (one in `lowerType`, one
+in the object-literal emitter) — both removed.
+
 A `Value` is `{ code, type, rep? }` — the C++ expression text, its tsn `Type`, and (for
 `number`) its representation `"i64"`/`"f64"`. No length tracking is needed (arrays are real
 `std::vector`s).

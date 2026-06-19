@@ -32,11 +32,13 @@
 - **Boxed wrappers are primitives here:** `Number`/`Boolean`/`String` annotations lower to
   `number`/`boolean`/`string`. (Strict TS would reject e.g. arithmetic on `Number`; our dialect
   has one of each.)
-- **Aggregate function boundaries:** function params and returns may now lower to **any** supported
-  type — scalars, arrays, or objects (`lowerFunction` no longer rejects aggregates). Only **object
-  fields** stay scalar-only (still enforced in `lowerType`). How aggregates cross the boundary
-  (const& params, by-value returns, the read-only-param rule) is a codegen concern — see
-  [../codegen/CLAUDE.md](../codegen/CLAUDE.md).
+- **Aggregate function boundaries:** function params and returns may lower to **any** supported
+  type — scalars, arrays, or objects (`lowerFunction` no longer rejects aggregates). How aggregates
+  cross the boundary (const& params, by-value returns, the read-only-param rule) is a codegen
+  concern — see [../codegen/CLAUDE.md](../codegen/CLAUDE.md).
+- **Aggregates nest:** object fields and array element types may themselves be aggregates.
+  `lowerType` recurses with no scalar-field check, so `{ pts: number[] }`, `{ inner: { x: number } }`,
+  `number[][]`, and `{ x: number }[]` all lower to the right nested `Type`.
 - **String values come pre-decoded:** use `node.text` for string/template literals (TS already
   resolved escapes); codegen re-encodes them as C++ string literals.
 - **Fail loud:** any unsupported syntax throws `Error("Unsupported ... ")`. Keep messages

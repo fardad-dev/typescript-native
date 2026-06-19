@@ -246,17 +246,16 @@ function lowerType(node: ts.TypeNode): Type {
   if (ts.isArrayTypeNode(node)) {
     return { kind: "array", element: lowerType(node.elementType) };
   }
-  // `{ a: T; b: U }`
+  // `{ a: T; b: U }` — fields may be any supported type now, including arrays and
+  // nested objects (`{ pts: number[] }`, `{ inner: { x: number } }`). `lowerType`
+  // recurses, so the nesting is captured structurally; codegen maps each field to
+  // its C++ type (a `std::vector<...>` member or a nested struct).
   if (ts.isTypeLiteralNode(node)) {
     const fields = node.members.map((m) => {
       if (!ts.isPropertySignature(m) || !m.name || !ts.isIdentifier(m.name) || !m.type) {
         throw new Error("Unsupported object type member (v1)");
       }
-      const t = lowerType(m.type);
-      if (typeof t !== "string") {
-        throw new Error("Object fields must be number, boolean, or string (v1)");
-      }
-      return { name: m.name.text, type: t };
+      return { name: m.name.text, type: lowerType(m.type) };
     });
     return { kind: "object", fields };
   }
