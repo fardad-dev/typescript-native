@@ -58,17 +58,39 @@ Accepted imprecision: integer wraparound past 2^63.
   rep (`slotType`), not `cppType` — so a demoted slot is `double` even with an `i64` initializer
   (the `i64` literal widens in). Aggregates still get their literal's exact `vector`/`struct` shape.
 - `console.log` → `std::cout << <expr> << "\n"`.
-- Object literals become `structName{...}`; arrays become `std::vector<T>{...}`.
+- Object literals become `structName{...}`; arrays become `std::vector<T>{...}`. Element/field
+  values pass through `f64SlotCode`: those slots are always `double`, so an `i64`-rep value is
+  cast (`static_cast<double>(…)`) — a brace-init list narrows a *non-constant* `long long`→`double`
+  and clang rejects it (a literal constant like `3LL` narrows legally, which is why literal-only
+  aggregates never tripped it).
 - `cppStringLiteral` encodes JS strings as C++ literals (escape `"`/`\`/controls; other bytes
   as 3-digit octal `\ooo`, which is bounded — unlike `\x`).
 - `emitCall(e, asStatement)` — a `void` call is valid only in statement position.
 - Helpers: `cppType`/`retType`/`structName`, `sameType` (structural, order-independent for
   objects), `displayType` (error messages), `isArray`/`isObject`/`isAggregate`.
 
+## Function boundaries (params & returns)
+
+Functions take and return aggregates (arrays/objects), not just scalars:
+
+- **Params:** `paramType` passes scalars by value (a `tsn_str` copy is just a refcount bump) and
+  **aggregates by `const&`** — no per-call copy of a whole `vector`/`struct`. The `const` also
+  makes aggregate params **read-only**: `emitFunction` records their names in `readonlyParams`,
+  and `assertMutable` (called from `emitLValue` and the `push` branch) rejects `xs.push(v)` /
+  `xs[i] = v` / `xs.f = v` / `xs = …` with a clean `tsnc:` message. This is deliberate — JS shares
+  arrays/objects by reference, so a callee mutation would be visible to the caller; value
+  semantics can't express that, so we fail loudly rather than silently diverge. To mutate, copy
+  into a local first (`let ys = xs`).
+- **Returns:** `retSlotType` returns aggregates **by value**. `return xs;` (a named local) is
+  NRVO and `return {…}` is RVO, so no extra copy is made; a copy materializes only where the
+  result is bound (`let r = f()` → elision) or consumed — never gratuitously. Returning a `const&`
+  param does copy (you can't move from a const ref), but that's a rare, semantically-needed copy.
+
 ## Guard clauses
 
 Unsupported constructs throw a clear `Error` (→ `tsnc: <message>`) instead of emitting bad
-C++: string concatenation, arithmetic on aggregates, `console.log` of an array/object,
-indexing a non-array, missing/duplicate fields, type-mismatched assignment, wrong arg
-count/type, missing `return`. Several of these (concat, aggregate params) are now trivial to
-*enable* given the C++ target — but they stay guarded until intentionally added.
+C++: string concatenation of incompatible types, arithmetic on aggregates, `console.log` of an
+array/object, indexing a non-array, missing/duplicate fields, type-mismatched assignment, wrong
+arg count/type, missing `return`, and **mutating a `const&` aggregate param** (see Function
+boundaries above). Concat of unsupported types stays trivial to *enable* given the C++ target,
+but is guarded until intentionally added.

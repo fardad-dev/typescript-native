@@ -122,6 +122,10 @@ class Emitter {
   private curReturn: RetType = "void";
   private funcKey: string = MAIN_KEY; // scope key for repr lookups
   private indent = "  ";
+  // Names of aggregate (array/object) params: passed by `const&`, so read-only
+  // inside the function. Consulted to reject mutation-through-param with a clear
+  // tsnc message instead of a cryptic clang const-violation (see assertMutable).
+  private readonlyParams = new Set<string>();
 
   emitModule(mod: Module): string {
     this.reps = analyze(mod); // decide each number slot's representation
@@ -387,8 +391,12 @@ class Emitter {
 
   // --- functions ----------------------------------------------------------
 
-  // C++ type of a function parameter, honoring its inferred number representation.
+  // C++ type of a function parameter. Scalars pass by value (a `tsn_str` copy is
+  // just a refcount bump); aggregates pass by `const&`, so a whole vector/struct
+  // isn't copied into the callee. The `const` also turns JS-incompatible
+  // mutation-through-param into a clean error rather than a silent divergence.
   private paramType(fnName: string, p: { name: string; type: Type }): string {
+    if (isAggregate(p.type)) return `const ${this.cppType(p.type)}&`;
     return this.slotType(p.type, this.reps.varRep(fnName, p.name));
   }
 
@@ -403,11 +411,16 @@ class Emitter {
     this.curReturn = ret;
     this.funcKey = funcKey;
     this.indent = "  ";
+    this.readonlyParams = new Set();
   }
 
   private emitFunction(fn: Func): string {
     this.resetForFunction(fn.returnType, fn.name);
-    for (const p of fn.params) this.vars.set(p.name, p.type);
+    for (const p of fn.params) {
+      this.vars.set(p.name, p.type);
+      // Aggregate params arrive as `const&` — mark them read-only.
+      if (isAggregate(p.type)) this.readonlyParams.add(p.name);
+    }
     for (const s of fn.body) this.emitStmt(s);
 
     const params = fn.params
@@ -495,9 +508,43 @@ class Emitter {
     throw new Error(`Statement '${stmt.kind}' is not valid here`);
   }
 
+  // Code for a value stored in an f64 slot — an array element or object field,
+  // which are always `double`. An i64-rep number needs an explicit cast: a
+  // brace-init list (`std::vector<double>{x}`, `Obj{x}`) narrows a non-constant
+  // `long long`→`double`, which clang rejects (-Wc++11-narrowing). A constant
+  // (`3LL`) narrows legally, so literal-only aggregates never tripped this.
+  private f64SlotCode(v: Value): string {
+    return v.type === "number" && v.rep === "i64"
+      ? `static_cast<double>(${v.code})`
+      : v.code;
+  }
+
+  // The base variable an lvalue ultimately writes through (`a` for `a`, `a[i]`,
+  // `a.f`, `a[i].f`, …), or undefined if it isn't rooted in a variable.
+  private rootVarName(e: Expr): string | undefined {
+    if (e.kind === "var") return e.name;
+    if (e.kind === "index") return this.rootVarName(e.arr);
+    if (e.kind === "member") return this.rootVarName(e.obj);
+    return undefined;
+  }
+
+  // Reject mutating through an aggregate parameter (passed by `const&`). In JS
+  // arrays/objects are shared, so a callee's `xs.push(v)` / `xs[i] = v` would be
+  // visible to the caller; our value semantics can't express that, so rather
+  // than silently diverge we fail with a clear message. Locals stay mutable.
+  private assertMutable(target: Expr): void {
+    const root = this.rootVarName(target);
+    if (root && this.readonlyParams.has(root)) {
+      throw new Error(
+        `Cannot mutate '${root}': array/object parameters are read-only (v1) — copy it into a local first (e.g. 'let local = ${root}')`,
+      );
+    }
+  }
+
   // Emit an assignable lvalue: a variable, an array element, or an object field.
   // (`arr.length` and other non-assignable members are rejected.)
   private emitLValue(target: Expr): Value {
+    this.assertMutable(target);
     switch (target.kind) {
       case "var": {
         const type = this.vars.get(target.name);
@@ -691,7 +738,7 @@ class Emitter {
           }
         }
         const arrType: ArrayType = { kind: "array", element };
-        const items = vals.map((v) => v.code).join(", ");
+        const items = vals.map((v) => this.f64SlotCode(v)).join(", ");
         return { code: `${this.cppType(arrType)}{${items}}`, type: arrType };
       }
       case "object": {
@@ -714,7 +761,7 @@ class Emitter {
           kind: "object",
           fields: props.map((p) => ({ name: p.name, type: p.value.type })),
         };
-        const items = props.map((p) => p.value.code).join(", ");
+        const items = props.map((p) => this.f64SlotCode(p.value)).join(", ");
         return { code: `${this.structName(objType)}{${items}}`, type: objType };
       }
       case "index": {
@@ -929,6 +976,8 @@ class Emitter {
             "'push' result cannot be used as a value yet (call it as a statement)",
           );
         }
+        // push mutates the receiver — forbidden through a const& aggregate param.
+        this.assertMutable(e.receiver);
         return { code: `${recv.code}.push_back(${arg.code})`, type: "void" };
       }
       if (e.method === "join") {

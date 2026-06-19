@@ -38,10 +38,9 @@ function lowerFunction(fn: ts.FunctionDeclaration): Func {
     if (!p.type) {
       throw new Error(`Parameter '${p.name.text}' needs a type annotation`);
     }
+    // Params may be any supported type now — scalars, arrays, or objects.
+    // Codegen passes aggregates by `const&` (see emit.ts paramType).
     const type = lowerType(p.type);
-    if (typeof type !== "string") {
-      throw new Error("Function parameters must be number, boolean, or string (v1)");
-    }
     return { name: p.name.text, type };
   });
 
@@ -52,11 +51,10 @@ function lowerFunction(fn: ts.FunctionDeclaration): Func {
   if (fn.type.kind === ts.SyntaxKind.VoidKeyword) {
     returnType = "void";
   } else {
-    const t = lowerType(fn.type);
-    if (typeof t !== "string") {
-      throw new Error("Function return type must be number, boolean, string, or void (v1)");
-    }
-    returnType = t;
+    // Returns may be any supported type now (scalars, arrays, objects).
+    // Codegen returns aggregates by value, leaning on C++ RVO/move so the cost
+    // is paid only where the result is bound or used (see emit.ts).
+    returnType = lowerType(fn.type);
   }
 
   const body: Stmt[] = [];

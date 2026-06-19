@@ -109,6 +109,8 @@ Implemented and tested end-to-end:
   → `string` (separator defaults to `","`; `string[]` and `number[]`).
 - **Control flow:** `if` / `else`, `while`, `for (init; cond; update)`.
 - **Functions:** top-level, typed params + return type, `return`, calls, `void`; recursion works.
+  Params and returns may be **arrays and objects**, not just scalars — aggregate params pass by
+  `const&` (read-only in the callee), aggregate returns by value (RVO/move).
 
 ### Representation / behavior notes (read these — they bite)
 
@@ -144,9 +146,12 @@ tsn types map onto C++ types (see [src/codegen/CLAUDE.md](src/codegen/CLAUDE.md)
   tradeoff: every string is a heap allocation (no `std::string` small-string optimization), so
   string-creation-heavy code pays an alloc per value. The refcount is a plain (non-atomic) `long`
   — generated programs are single-threaded.
-- **Scalar-only boundaries (v1):** object fields and function params/returns must be
-  `number`/`boolean`/`string`. (C++ value semantics would now make aggregate params/returns
-  safe — this restriction is enforced in the front-end and can be lifted next.)
+- **Aggregate function boundaries:** function params and returns may be arrays/objects (not just
+  scalars). Aggregate **params pass by `const&`** — no per-call copy, and read-only inside the
+  callee: mutating one (`xs.push(v)`, `xs[i] = v`, `xs = …`) is a clean `tsnc:` error, not a silent
+  divergence from JS's shared-reference semantics (copy into a local first to mutate). Aggregate
+  **returns pass by value**, leaning on C++ RVO/move so the cost lands only where the result is
+  bound or used. **Object *fields* are still scalar-only** (`{ x: number }`, not `{ pts: number[] }`).
 
 The compiler **errors cleanly** (a `tsnc:` message) on unsupported constructs rather than
 miscompiling — e.g. `console.log` of an aggregate, void-as-value, type mismatches.
@@ -237,11 +242,16 @@ pair** (red → green).
       Turned out *not* to need the scalar-only boundary lifted: a `methodCall` result already flows
       through `RetType`, and arrays are first-class in `let` / indexing / `.length`, so a method
       returning `string[]` just works. Runtime helpers `tsn_split` / `tsn_join`.
+- [x] **Lift scalar-only boundaries** — function params and returns may be arrays/objects now
+      (front-end checks dropped). Aggregate params pass by `const&` (read-only — mutating one is a
+      clean `tsnc:` error rather than a silent JS-semantics divergence); aggregate returns pass by
+      value via RVO/move, so a copy lands only where the result is bound or used. Exposed and fixed
+      a latent aggregate-literal bug: building a `vector`/`struct` from a *non-constant* integer
+      number now casts `long long`→`double` (a brace-init narrowing clang rejected; literal
+      constants like `3LL` had slipped through). Object *fields* stay scalar-only.
 
 ### Will support — core completeness
 
-- [ ] **Lift scalar-only boundaries** — pass/return arrays and objects to/from functions (C++
-      value semantics make this safe now). Drop the front-end's scalar-only checks.
 - [ ] **More array methods** — `pop`, `indexOf`, `slice`; `push` as a value (returns length).
 - [ ] **Richer `console.log`** — booleans as `true`/`false`; arrays/objects printed JS-style.
 
