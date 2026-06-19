@@ -1,13 +1,14 @@
 // Internal IR: a small, typed representation lowered from the TypeScript AST.
 // Codegen consumes this — never the raw TS AST.
 
-export type Type = "number" | "boolean";
+export type Type = "number" | "boolean" | "string";
 
 export type BinaryOp = "+" | "-" | "*" | "/" | "%";
 
 export type Expr =
   | { kind: "num"; value: number }
   | { kind: "bool"; value: boolean }
+  | { kind: "str"; value: string }
   | { kind: "var"; name: string }
   | { kind: "binary"; op: BinaryOp; left: Expr; right: Expr };
 

@@ -53,12 +53,14 @@ function lowerVarDecl(decl: ts.VariableDeclaration): Stmt {
 function lowerType(node: ts.TypeNode): Type {
   if (node.kind === ts.SyntaxKind.NumberKeyword) return "number";
   if (node.kind === ts.SyntaxKind.BooleanKeyword) return "boolean";
-  // In our `tsn` dialect, the boxed wrappers `Number`/`Boolean` are treated
-  // as their primitives — we only have one numeric and one boolean type.
+  if (node.kind === ts.SyntaxKind.StringKeyword) return "string";
+  // In our `tsn` dialect, the boxed wrappers `Number`/`Boolean`/`String` are
+  // treated as their primitives — we only have one of each.
   if (ts.isTypeReferenceNode(node) && ts.isIdentifier(node.typeName)) {
     const n = node.typeName.text;
     if (n === "Number" || n === "number") return "number";
     if (n === "Boolean" || n === "boolean") return "boolean";
+    if (n === "String" || n === "string") return "string";
   }
   throw new Error(`Unsupported type annotation: ${ts.SyntaxKind[node.kind]}`);
 }
@@ -66,6 +68,10 @@ function lowerType(node: ts.TypeNode): Type {
 function lowerExpr(node: ts.Expression): Expr {
   if (ts.isNumericLiteral(node)) {
     return { kind: "num", value: Number(node.text) };
+  }
+  // `node.text` is the decoded string value (escapes already resolved by TS).
+  if (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) {
+    return { kind: "str", value: node.text };
   }
   if (node.kind === ts.SyntaxKind.TrueKeyword) return { kind: "bool", value: true };
   if (node.kind === ts.SyntaxKind.FalseKeyword) return { kind: "bool", value: false };
