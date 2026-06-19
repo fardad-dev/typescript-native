@@ -1,15 +1,41 @@
 {
-  "name": "typescript-native",
+  "name": "tsn-compiler",
   "version": "0.1.0",
   "description": "AOT compiler: a TypeScript subset -> LLVM IR -> native executable",
+  "license": "MIT",
+  "author": "Fardad Mohammadi",
+  "keywords": [
+    "typescript",
+    "compiler",
+    "llvm",
+    "aot",
+    "native",
+    "codegen"
+  ],
+  "homepage": "https://github.com/fardad-dev/typescript-native#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/fardad-dev/typescript-native.git"
+  },
+  "bugs": {
+    "url": "https://github.com/fardad-dev/typescript-native/issues"
+  },
   "bin": {
     "tsnc": "dist/index.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=22"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "tsnc": "node dist/index.js",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "prepare": "npm run build",
+    "prepublishOnly": "npm test"
   },
   "dependencies": {
     "commander": "^15.0.0",
