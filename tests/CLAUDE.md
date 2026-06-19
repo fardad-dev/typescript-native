@@ -17,12 +17,21 @@ tests/
 ## How the harness works ([e2e.test.ts](e2e.test.ts))
 
 For every `cases/*.ts`, it:
-1. compiles via `driver.compile({ input, output, emitCpp: false })` (the same path the CLI uses),
-2. runs the produced binary with `execFileSync`,
+1. compiles via `driver.compileAsync({ input, output, emitCpp: false })` (the async twin of the
+   CLI's `compile` — clang++ runs as a non-blocking child process),
+2. runs the produced binary with async `execFile`,
 3. asserts stdout `===` the matching `.expected`,
 4. cleans up the temp binary.
 
 Cases are auto-discovered — **adding a pair is adding a test**, no harness edits needed.
+
+### Parallelism
+
+Cases use `it.concurrent`, and because the slow steps (clang++ + running the binary) are async
+child processes, several cases compile at once instead of blocking the event loop one at a time.
+The per-file cap is set in [../vitest.config.ts](../vitest.config.ts) (`maxConcurrency`). Temp
+paths embed the case name, so concurrent runs never collide. (This roughly halved the suite —
+~12s → ~5s.)
 
 ## Adding a case
 
