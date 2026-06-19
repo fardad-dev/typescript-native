@@ -263,14 +263,25 @@ class Emitter {
       // Empty array literal: element type can't be inferred from `[]`, so take
       // it from the declared annotation (e.g. `let xs: number[] = []`).
       if (stmt.init.kind === "array" && stmt.init.elements.length === 0) {
-        if (!isArray(stmt.type)) {
+        if (!stmt.type || !isArray(stmt.type)) {
           throw new Error("Empty array literal needs an array type annotation");
         }
         this.vars.set(stmt.name, stmt.type);
         return `${this.cppType(stmt.type)} ${stmt.name} = {}`;
       }
+      // Unannotated integer literal -> infer C++ `int` from the actual value,
+      // e.g. `const a = 12` -> `int a = 12`. (Annotated `: number` stays double.)
+      if (
+        stmt.type === undefined &&
+        stmt.init.kind === "num" &&
+        Number.isInteger(stmt.init.value)
+      ) {
+        this.vars.set(stmt.name, "number");
+        return `int ${stmt.name} = ${stmt.init.value}`;
+      }
       const init = this.emitExpr(stmt.init);
-      if (!sameType(stmt.type, init.type)) {
+      // With an annotation, check assignability; without one, infer from the init.
+      if (stmt.type !== undefined && !sameType(stmt.type, init.type)) {
         throw new Error(
           `Type '${displayType(init.type)}' is not assignable to '${displayType(stmt.type)}'`,
         );

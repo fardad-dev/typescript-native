@@ -77,7 +77,8 @@ The goal is a small but complete pipeline. These features compile and run today:
 - **Arithmetic:** `+ - * / %` (`number` is IEEE double, so `5 / 2 === 2.5`)
 - **Comparisons & logic:** `< <= > >= === !==`, `&& || !`
 - **Strings:** literals and concatenation (`"a" + b`; numbers coerce, e.g. `"n=" + 5`)
-- **Variables:** `let` / `const`, assignment (`x = e`, `a[i] = e`, `obj.f = e`, `+=`, `i++`)
+- **Variables:** `let` / `const` (the type is inferred when you omit the annotation; `var` is
+  not supported), assignment (`x = e`, `a[i] = e`, `obj.f = e`, `+=`, `i++`)
 - **Control flow:** `if` / `else`, `while`, `for`
 - **Functions:** top-level, typed params + return type, `return`, and calls (recursion works)
 - **Arrays:** literals (incl. empty `[]`), indexing (`xs[i]`, computed indices), `.length`, `.push(v)`
@@ -100,14 +101,16 @@ let p: { x: number; y: number } = { x: 3, y: 4 };
 console.log(p.x + p.y); // 7
 ```
 
-> `console.log` currently takes **exactly one argument**, and `let`/`const` declarations whose
-> initializer isn't a `number` need an explicit type annotation.
+> `console.log` currently takes **exactly one argument**. A `let`/`const` without a type
+> annotation infers its type from the initializer — an integer literal like `const a = 12`
+> compiles to `int a = 12`, a decimal to `double`, and so on.
 
 ### Notes & limitations
 
 - **`number` is an IEEE `double`** (printed JS-style, shortest round-trip) — e.g. `20 / 6`
   prints `3.3333333333333335`. Functions and object fields still accept **scalars only**
   (`number`/`boolean`/`string`) — arrays/objects can't be passed or returned yet.
+- **`var` is not supported** (and never will be) — use `let` or `const`.
 - **Out of scope for now:** `null`/`undefined`, classes, closures, exceptions, `async`,
   modules, generics, union/`any` types, and garbage collection.
 - **Target is macOS arm64 only.** Other platforms aren't supported yet.

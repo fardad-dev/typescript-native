@@ -49,7 +49,8 @@ export type Expr =
   | { kind: "methodCall"; receiver: Expr; method: string; args: Expr[] };
 
 export type Stmt =
-  | { kind: "let"; name: string; type: Type; init: Expr }
+  // `type` is the annotation; absent means infer from the initializer.
+  | { kind: "let"; name: string; type?: Type; init: Expr }
   | { kind: "log"; arg: Expr }
   | { kind: "return"; value?: Expr }
   // a bare expression evaluated for effect (e.g. a function call), result discarded

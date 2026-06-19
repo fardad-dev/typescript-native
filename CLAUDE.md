@@ -97,8 +97,9 @@ Implemented and tested end-to-end:
   string concatenation (`"a" + b`, numbers coerce), array indexing `a[i]`, member access
   `obj.field`, array `.length`.
 - **`console.log(x)`** for numbers/booleans and strings.
-- **Variables:** `let`/`const` with annotations (initializer required); assignment `x = e`,
-  `a[i] = e`, `obj.f = e`, compound `+= -= *= /= %=`, and `i++` / `i--`.
+- **Variables:** `let` / `const` (initializer required); a type annotation is optional — without
+  one the type is **inferred from the initializer**. `var` is **not supported** (errors). Assignment
+  `x = e`, `a[i] = e`, `obj.f = e`, compound `+= -= *= /= %=`, and `i++` / `i--`.
 - **Arrays:** literals (incl. empty `[]` with an annotation) and `xs.push(v)`.
 - **Control flow:** `if` / `else`, `while`, `for (init; cond; update)`.
 - **Functions:** top-level, typed params + return type, `return`, calls, `void`; recursion works.
@@ -115,7 +116,10 @@ tsn types map onto C++ types (see [src/codegen/CLAUDE.md](src/codegen/CLAUDE.md)
 | `T[]`    | `std::vector<T>`   | heap-backed; `.length` → `.size()`; `.push()` → `push_back` |
 | `{ ... }`| generated `struct` | one struct per distinct field shape                         |
 
-- **`number` is `double`.** `%` compiles to `std::fmod`; array indices are cast to an integer.
+- **`number` is `double`.** `%` compiles to an fmod-based modulo; array indices are cast to an integer.
+- **Inference picks the concrete C++ type.** An unannotated declaration takes its type from the
+  initializer; an integer literal becomes `int` (`const a = 12` → `int a = 12`), a decimal becomes
+  `double`, etc. An annotated `: number` is always `double`. `var` is rejected during lowering.
 - **Scalar-only boundaries (v1):** object fields and function params/returns must be
   `number`/`boolean`/`string`. (C++ value semantics would now make aggregate params/returns
   safe — this restriction is enforced in the front-end and can be lifted next.)

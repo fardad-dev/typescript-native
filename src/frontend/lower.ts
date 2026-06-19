@@ -66,6 +66,11 @@ function lowerFunction(fn: ts.FunctionDeclaration): Func {
 
 function lowerStatement(node: ts.Statement, out: Stmt[]): void {
   if (ts.isVariableStatement(node)) {
+    // Only `let` / `const` — `var` is intentionally unsupported.
+    const flags = node.declarationList.flags;
+    if (!(flags & (ts.NodeFlags.Let | ts.NodeFlags.Const))) {
+      throw new Error("'var' is not supported — use 'let' or 'const'");
+    }
     for (const decl of node.declarationList.declarations) {
       out.push(lowerVarDecl(decl));
     }
@@ -230,7 +235,8 @@ function lowerVarDecl(decl: ts.VariableDeclaration): Stmt {
   if (!decl.initializer) {
     throw new Error(`'${decl.name.text}' must be initialized (v1)`);
   }
-  const type: Type = decl.type ? lowerType(decl.type) : "number";
+  // No annotation -> leave type undefined; codegen infers it from the initializer.
+  const type = decl.type ? lowerType(decl.type) : undefined;
   return { kind: "let", name: decl.name.text, type, init: lowerExpr(decl.initializer) };
 }
 
