@@ -3,6 +3,7 @@
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
+import { typeCheck } from "./frontend/check";
 import { lower } from "./frontend/lower";
 import { emit } from "./codegen/emit";
 import { buildExecutable, buildExecutableAsync } from "./backend/clang";
@@ -17,6 +18,7 @@ export interface Options {
 // Returns the path of the C++ file the backend should compile.
 function emitCppFile(opts: Options): string {
   const source = fs.readFileSync(opts.input, "utf8");
+  typeCheck(opts.input, source); // stage 0: abort on TypeScript type errors
   const mod = lower(opts.input, source); // stages 1 + 2: parse + lower to IR
   const cpp = emit(mod); // stage 3: IR -> C++ source
 

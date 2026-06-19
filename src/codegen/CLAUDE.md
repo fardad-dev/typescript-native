@@ -10,25 +10,30 @@ real lowering — no SSA temporaries or pointer bookkeeping here.
 | tsn type            | C++ type             | notes                                                  |
 | ------------------- | -------------------- | ------------------------------------------------------ |
 | `number`            | `double` or `long long` | f64 by default; integer-valued slots use the `i64` rep (`long long`) — see below. `cppType` returns `double` (the rep used for nested aggregates); `slotType` honors the slot's rep |
-| `boolean`           | `bool`               | `std::cout` prints `1`/`0`                             |
-| `string`            | `tsn_str`            | ref-counted immutable string (prelude struct); copy = pointer + refcount bump, so array shuffles don't copy chars. Every string expr is a `tsn_str` (literals too: `tsn_str("…")`); operators (`<` `==` `+` `<<`) and `.str()`/`.size()` are defined on it; methods → `tsn_*` helpers (take `const std::string&` via its conversion; mostly return `tsn_str`, but `split` returns `std::vector<tsn_str>`) |
-| `T[]`               | `std::vector<T>`     | `.length` → `static_cast<long long>(v.size())` (i64); index cast to `std::size_t`; methods → `tsn_*` **template** helpers over `T`: `push`→`tsn_push` (returns the new length as f64), `pop`→`tsn_pop` (element; empty → `T()`), `slice`→`tsn_array_slice` (new vector), `indexOf`→`tsn_array_index_of` (f64, `==` on `T`); `join`→`tsn_join` (`string[]`/`number[]` → `tsn_str`) |
-| `{ ... }`           | generated `struct`   | `structName()` dedupes by field shape; number fields use the f64 rep |
-| class `C`           | `std::shared_ptr<C>` | **reference** type (not an `isAggregate`): `struct C { fields; ctor; methods; }`, instance is a shared_ptr — `new` → `make_shared`, `.field`/`.method()` via `->`. See *Classes* below |
+| `boolean`           | `bool`               | `console.log` prints `true`/`false` via `tsn_inspect` (see *Printing* below) |
+| `string`            | `tsn_str`            | ref-counted immutable string (prelude struct); copy = pointer + refcount bump, so array shuffles don't copy chars. Every string expr is a `tsn_str` (literals too: `tsn_str("…")`); operators (`<` `==` `+` `<<`) and `.str()`/`.size()` are defined on it; methods → `tsn_*` helpers (take `const std::string&` via its conversion; mostly return `tsn_str`, but `split` returns a `std::shared_ptr<std::vector<tsn_str>>`) |
+| `T[]`               | `std::shared_ptr<std::vector<T>>` | **reference** type (`vecType` = the pointee `std::vector<T>`): literals `make_shared`, `let b = a` aliases, `===` is identity. `.length` → `(a)->size()` (i64); index derefs: `(*(a))[i]` (cast to `std::size_t`); methods run on `*recv`: `push`→`tsn_push` (new length, f64), `pop`→`tsn_pop` (element; empty → `T()`), `slice`→`make_shared(tsn_array_slice(...))` (new array), `indexOf`→`tsn_array_index_of` (f64, `==` on `T`), `join`→`tsn_join` (`string[]`/`number[]` → `tsn_str`) |
+| `{ ... }`           | `std::shared_ptr<struct>` | **reference** type: `structName()` dedupes the pointee struct by field shape; literals `make_shared<struct>(struct{...})`, field access `obj->f`, number fields use the f64 rep |
+| class `C`           | `std::shared_ptr<C>` | **reference** type: `struct C { fields; ctor; methods; }`, instance is a shared_ptr — `new` → `make_shared`, `.field`/`.method()` via `->`. See *Classes* below |
+
+Arrays, objects and class instances are now **all reference types** (`std::shared_ptr<…>`), so JS
+semantics hold uniformly: copy/assign aliases, mutation through one alias is visible through the
+others, params are mutable (a `shared_ptr` copy aliases the caller's value), and `===`/`!==` is
+pointer identity. `isAggregate` (array||object) still distinguishes object/array *literals* from
+class instances where lowering/printing differs, but no longer implies a value type.
 
 **Aggregates nest.** `T` (array element) and a field type may themselves be aggregates, so
-`cppType` recurses: `number[][]` → `std::vector<std::vector<double>>`, `{ pts: number[] }` →
-a struct with a `std::vector<double>` member, `{ inner: { x: number } }` → a struct with a struct
-member. `structName` registers its own name *before* building members, then `cppType(field)`
-triggers inner `structName` calls — so a nested struct is pushed to `structDefs` ahead of the
-struct that embeds it (correct C++ declaration order). Element/field values still pass through
-`f64SlotCode` (an aggregate value returns as-is; only `i64`-rep *numbers* get the `double` cast),
-and nested numbers stay f64. The only blocks were two scalar-field guards (one in `lowerType`, one
-in the object-literal emitter) — both removed.
+`cppType` recurses: `number[][]` → `std::shared_ptr<std::vector<std::shared_ptr<std::vector<double>>>>`,
+`{ pts: number[] }` → a struct with a `std::shared_ptr<std::vector<double>>` member,
+`{ inner: { x: number } }` → a struct whose member is a `shared_ptr` to another struct. Because
+struct *members* are now `shared_ptr`s (pointers to incomplete types are fine), struct order no
+longer needs inner-before-outer — every struct is forward-declared (`struct tsn_ObjN;`) up front.
+Element/field values still pass through `f64SlotCode` (an aggregate value returns as-is; only
+`i64`-rep *numbers* get the `double` cast), and nested numbers stay f64.
 
 A `Value` is `{ code, type, rep? }` — the C++ expression text, its tsn `Type`, and (for
 `number`) its representation `"i64"`/`"f64"`. No length tracking is needed (arrays are real
-`std::vector`s).
+`std::vector`s behind a `shared_ptr`).
 
 ## Number representation (`repr.ts`, run before emission)
 
@@ -52,12 +57,14 @@ Accepted imprecision: integer wraparound past 2^63.
 ## The `Emitter` class
 
 - **Module-level:** `sigs` (function signatures, collected first so calls can reference
-  any function), `structDefs` + `structNames` (generated structs, deduped by field shape).
+  any function), `classes`, `structDefs` + `structNames` (generated structs, deduped by field
+  shape) + `structFields` (struct name → fields, for `tsn_inspect`).
 - **Per-function scratch (reset by `resetForFunction`):** `body` (emitted statement lines),
-  `vars` (name → `Type`), `curReturn`, `terminated` (set on `return`; stops emitting after it,
-  since there's no control flow yet).
-- Output shape: `#include`s → struct defs → function prototypes (so order/recursion is fine)
-  → function definitions → `int main()` (top-level statements + `return 0`).
+  `vars` (name → `Type`), `curReturn`, `funcKey` (rep-lookup scope), `currentClass`, `indent`.
+- Output shape: `#include`s → `tsn_str` + runtime helpers → inspect prelude (scalars + array-
+  template fwd decl) → class/struct forward decls → per-type inspect fwd decls → object struct defs
+  → class struct defs → array-template + per-type inspect defs → out-of-line class method/ctor defs
+  → function prototypes → function definitions → `int main()` (top-level statements + `return 0`).
 
 ## Conventions (match these)
 
@@ -68,12 +75,14 @@ Accepted imprecision: integer wraparound past 2^63.
 - `let` declares with the **initializer's** type, but a `number` slot's C++ type comes from its
   rep (`slotType`), not `cppType` — so a demoted slot is `double` even with an `i64` initializer
   (the `i64` literal widens in). Aggregates still get their literal's exact `vector`/`struct` shape.
-- `console.log` → `std::cout << <expr> << "\n"`.
-- Object literals become `structName{...}`; arrays become `std::vector<T>{...}`. Element/field
-  values pass through `f64SlotCode`: those slots are always `double`, so an `i64`-rep value is
-  cast (`static_cast<double>(…)`) — a brace-init list narrows a *non-constant* `long long`→`double`
-  and clang rejects it (a literal constant like `3LL` narrows legally, which is why literal-only
-  aggregates never tripped it).
+- `console.log` → `std::cout << <out> << "\n"`, where `<out>` is the bare expr for a top-level
+  string, `tsn_num_to_string(...)`/bare for an f64/i64 number, and `tsn_inspect(...)` for everything
+  else (boolean / array / object / instance) — see *Printing* below.
+- Object literals become `make_shared<struct>(struct{...})`; arrays become
+  `make_shared<vector<T>>(vector<T>{...})` (empty: `make_shared<vector<T>>()`). The inner brace-init
+  values pass through `f64SlotCode`: element/field slots are always `double`, so an `i64`-rep value
+  is cast (`static_cast<double>(…)`) — a brace-init list narrows a *non-constant* `long long`→`double`
+  and clang rejects it (a literal constant like `3LL` narrows legally).
 - `cppStringLiteral` encodes JS strings as C++ literals (escape `"`/`\`/controls; other bytes
   as 3-digit octal `\ooo`, which is bounded — unlike `\x`).
 - `emitCall(e, asStatement)` — a `void` call is valid only in statement position.
@@ -82,20 +91,17 @@ Accepted imprecision: integer wraparound past 2^63.
 
 ## Function boundaries (params & returns)
 
-Functions take and return aggregates (arrays/objects), not just scalars:
+Functions take and return aggregates (arrays/objects), not just scalars. Because arrays/objects/
+instances are all reference types now, the boundary is uniform and simple:
 
-- **Params:** `paramType` passes scalars by value (a `tsn_str` copy is just a refcount bump) and
-  **aggregates by `const&`** — no per-call copy of a whole `vector`/`struct`. The `const` also
-  makes aggregate params **read-only**: `emitFunction` records their names in `readonlyParams`,
-  and `assertMutable` (called from `emitLValue` and the `push` branch) rejects `xs.push(v)` /
-  `xs[i] = v` / `xs.f = v` / `xs = …` with a clean `tsnc:` message. This is deliberate — JS shares
-  arrays/objects by reference, so a callee mutation would be visible to the caller; value
-  semantics can't express that, so we fail loudly rather than silently diverge. To mutate, copy
-  into a local first (`let ys = xs`).
-- **Returns:** `retSlotType` returns aggregates **by value**. `return xs;` (a named local) is
-  NRVO and `return {…}` is RVO, so no extra copy is made; a copy materializes only where the
-  result is bound (`let r = f()` → elision) or consumed — never gratuitously. Returning a `const&`
-  param does copy (you can't move from a const ref), but that's a rare, semantically-needed copy.
+- **Params: by value, mutable.** `paramType` collapsed to one rule — `slotType` for every param
+  (a `number` honors its i64/f64 rep; everything else is `cppType`). For a reference type that's a
+  `shared_ptr` copy: a refcount bump that **aliases** the caller's value, so a callee mutation
+  (`xs.push(v)`, `xs[i] = e`, `obj.f = e`) is visible to the caller — correct JS semantics. The old
+  read-only-param apparatus (`readonlyParams` / `assertMutable` / `rootVarName`) is **gone**; there
+  is no longer any mutation-through-param to reject.
+- **Returns:** `retSlotType` returns a reference type by value — a `shared_ptr`, i.e. the shared
+  reference, not a deep copy. `return xs;` hands back the same array the caller can then alias.
 
 ## Classes
 
@@ -104,12 +110,13 @@ A class compiles to `struct C { fields; C(ctor); methods; };` and an **instance*
 reference semantics fall out for free: copy/assign shares the pointee (aliases see each other's
 mutations), `===` is `shared_ptr::operator==` (identity), and the refcount frees the instance.
 
-- **Emission order** (`emitModule`): forward-declare every class (`struct C;`) → object structs
-  (`structDefs`) → class struct definitions (`emitClassStruct`: field members + ctor/method
+- **Emission order** (`emitModule`): forward-declare every class and object struct → object struct
+  defs (`structDefs`) → class struct definitions (`emitClassStruct`: field members + ctor/method
   **declarations**) → out-of-line **definitions** (`emitClassDefs` → `emitCtorDef`/`emitMethodDef`)
-  → functions → main. Forward decls let a field reference a later/self class via `shared_ptr`; the
-  out-of-line bodies see every class complete. Building a class struct calls `cppType` on field
-  types, which lazily generates any object structs they need (placed earlier, so the order holds).
+  → functions → main (with the inspect fwd-decls/defs interleaved — see *Printing*). Forward decls
+  let any type reference any later/self type via `shared_ptr`; the out-of-line bodies see every type
+  complete. Building a class struct calls `cppType` on field types, which lazily generates any
+  object structs they need.
 - **Methods/ctor are analyzed scopes.** They use scope keys `C#method` / `C#$ctor`
   (`methodKey`/`ctorKey`), matching `repr.ts` (`methodSlotKey`/`ctorSlotKey`), so their number
   params/locals/returns get the same i64/f64 reps as free functions via `slotType`/`retSlotType`/
@@ -120,18 +127,39 @@ mutations), `===` is `shared_ptr::operator==` (identity), and the refcount frees
   shortcuts a `this` receiver to that (else `emitExpr`). Member access / method call are uniformly
   `(code)->name` because both `shared_ptr<C>` and the raw `this` pointer use `->`. Bare `this` as a
   value is rejected (the `emitExpr` `case "this"` throws) — only `this.field` / `this.method()`.
-- **Params: by value, mutable.** An instance is **not** an `isAggregate`, so `paramType` passes it
-  by value (`std::shared_ptr<C>` — a refcount bump, not marked `readonly`). Mutation through the
-  param (`p.x = …`) is allowed and visible to the caller — correct JS reference semantics, the
-  opposite of the read-only `const&` array/object params above. `new`/method args are type-checked
-  by the shared `checkArgs` (no per-arg `f64SlotCode` cast — reps are reconciled by `repr.ts`).
+- **Params: by value, mutable** — like every parameter now (see *Function boundaries*). An instance
+  passes as a `std::shared_ptr<C>` copy (a refcount bump); mutation through the param (`p.x = …`) is
+  visible to the caller — correct JS reference semantics, now shared by array/object params too.
+  `new`/method args are type-checked by the shared `checkArgs` (no per-arg `f64SlotCode` cast — reps
+  are reconciled by `repr.ts`).
+
+## Printing (`console.log` → `tsn_inspect`)
+
+`console.log` matches Node's `console.log` (`util.inspect`) JS-style format on the subset. The
+`log` statement keeps numbers/top-level strings bare and routes everything else through a
+`tsn_inspect` family generated into the prelude:
+
+- **Fixed scalar overloads** (`inspectPrelude`): `tsn_inspect(double|long long|bool|const tsn_str&)`
+  + a `tsn_quote` (single-quotes a string for *nested* contexts). Quote/escape chars are built from
+  their byte values (`(char)39`, `(char)92`) so the generated C++ has **no backslashes**.
+- **Array template** (`arrayInspectDef`): `tsn_inspect(const shared_ptr<vector<T>>&)` → `[ e0, e1 ]`,
+  recursing on each element.
+- **Per-struct / per-class overloads** (`aggregateInspectDefs` / `inspectBody`): one function per
+  generated object struct (`{ k: v, ... }`) and per class (`Name { k: v, ... }`), knowing the field
+  names (struct fields recorded in `structFields` during `structName`).
+
+Ordering in `emitModule`: the scalar prelude + the array template's *forward declaration* come
+first; then class/struct forward decls; then the per-type inspect forward decls; then the full
+struct/class defs; then the array-template + per-type inspect *definitions* (every type complete by
+now). Caveat: always single-line (no Node `breakLength` wrapping) — matches Node for small values.
 
 ## Guard clauses
 
-Unsupported constructs throw a clear `Error` (→ `tsnc: <message>`) instead of emitting bad
-C++: string concatenation of incompatible types, arithmetic on aggregates, `console.log` of an
-array/object/**class instance**, indexing a non-array, missing/duplicate fields, type-mismatched
-assignment, wrong arg count/type, missing `return`, **mutating a `const&` aggregate param** (see
-Function boundaries above), an **unknown class** (`new X` / a `: X` annotation with no class `X`),
-an **unknown method/field** on a class, and **bare `this`** used as a value. Concat of unsupported
-types stays trivial to *enable* given the C++ target, but is guarded until intentionally added.
+Type errors (wrong assignment/argument/return types, undeclared names, bad property access) are
+caught earlier by the stage-0 `ts.Program` type checker ([../frontend/check.ts](../frontend/check.ts))
+and never reach codegen. The emitter still throws a clear `Error` (→ `tsnc: <message>`) for
+constructs the subset doesn't lower: string concatenation of incompatible types, arithmetic on
+aggregates, indexing a non-array, an empty array literal with no annotation, void-as-value, an
+**unknown class** (`new X` / a `: X` annotation with no class `X`), an **unknown method/field** on a
+class, and **bare `this`** used as a value. (`console.log` of an array/object/instance is now
+supported — see *Printing* — and `===`/`!==` on arrays/objects is reference identity, not an error.)

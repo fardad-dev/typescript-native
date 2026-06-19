@@ -10,3 +10,11 @@ let words: string[] = ["a", "b", "c"];
 let w = words.pop();
 console.log(w); // c
 console.log(words.length); // 2
+
+const obj = { name: "1" };
+
+const arr: { name: string }[] = [{ name: "3" }, { name: "2" }, obj];
+let lastObj = arr.pop();
+console.log(lastObj === obj);
+let middleObj = arr.pop();
+console.log(middleObj === obj);

@@ -1,12 +1,19 @@
-# src/frontend/ — parse + lower (stages 1 & 2)
+# src/frontend/ — type-check + parse + lower (stages 0, 1 & 2)
 
-[lower.ts](lower.ts) turns TypeScript source text into our internal IR
-([../ir/nodes.ts](../ir/nodes.ts)).
+This folder owns the front of the pipeline: [check.ts](check.ts) type-checks (stage 0), then
+[lower.ts](lower.ts) turns the source into our internal IR ([../ir/nodes.ts](../ir/nodes.ts)).
 
+- **Type-check (stage 0):** [check.ts](check.ts)'s `typeCheck(fileName, source)` builds a real
+  `ts.Program` + `TypeChecker` (over an in-memory copy of the source + an ambient `console`, ES2020
+  lib only, `strict: true`) and **throws** formatted TypeScript diagnostics on any type error,
+  before we lower or emit. This is a *gate*: it rejects type-erroneous programs but does not (yet)
+  feed inferred types into lowering.
 - **Parse:** `ts.createSourceFile(...)` from the official `typescript` package gives a full
-  AST (with parent links). We do **not** build a `ts.Program` or run the `TypeChecker` yet —
-  that's a roadmap item.
+  AST (with parent links) — a second, lightweight parse that lowering walks.
 - **Lower:** walk the AST and emit IR nodes.
+
+Subset-specific rejections (e.g. `var`, parameter properties) still happen during lowering, *after*
+the type check — stage 0 only enforces TypeScript's own semantics, not our subset's restrictions.
 
 ## Entry point & shape
 

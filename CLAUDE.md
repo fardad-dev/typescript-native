@@ -11,6 +11,9 @@ feature breadth or premature optimization.
 
 ```
 .ts source
+   │  (0) type-check                src/frontend/check.ts  (ts.Program + TypeChecker)
+   ▼  (abort on type errors)
+.ts source
    │  (1) parse                     src/frontend/lower.ts  (ts.createSourceFile)
    ▼
 TypeScript AST
@@ -24,6 +27,11 @@ C++ source (.cpp)
    ▼
 native executable
 ```
+
+Stage 0 runs a real `ts.Program` + `TypeChecker` over the source and aborts with
+TypeScript-quality diagnostics on any type error, before we lower or emit — so wrong
+assignment types, undeclared names, bad argument counts/types, and bad property access are
+caught up front rather than miscompiled (see [src/frontend/check.ts](src/frontend/check.ts)).
 
 C++ is our intermediate language: codegen emits readable C++, and `clang++` does the real
 lowering to machine code. (The compiler used to emit LLVM IR directly; it now targets C++,
@@ -45,8 +53,9 @@ which makes heap-backed values like strings and arrays straightforward.)
 ```
 src/
   index.ts          # CLI entry (tsnc): parse args via commander, call compile()
-  driver.ts         # orchestrates the 4 pipeline stages
+  driver.ts         # orchestrates the pipeline stages (0 -> 4)
   frontend/
+    check.ts        # (0) type-check with ts.Program + TypeChecker; abort on errors
     lower.ts        # (1)(2) parse with `typescript`, lower AST -> internal IR
   ir/
     nodes.ts        # internal IR node definitions (typed)
@@ -56,6 +65,7 @@ src/
     clang.ts        # (4) shell out to clang++ to compile + link the .cpp
 tests/
   e2e.test.ts       # harness: compile each case, run binary, diff stdout
+  typecheck.test.ts # stage-0 checker: asserts bad programs are rejected
   cases/            # *.ts inputs + *.expected stdout (one pair per feature)
 ```
 
@@ -81,10 +91,12 @@ npm test            # run the e2e suite once (vitest run)
 npm run test:watch  # re-run on change — the TDD red->green loop
 ```
 
-The suite (currently **59 cases**, all green) auto-discovers every `tests/cases/*.ts`,
-compiles it to a real native binary, runs it, and diffs stdout against the matching
-`.expected` file. **Every feature gets a `tests/cases/*.ts` + `.expected` pair**, ideally
-written first (red), then implemented to green. See [tests/CLAUDE.md](tests/CLAUDE.md).
+The suite (currently **68 e2e cases** + a stage-0 type-checker test file, all green)
+auto-discovers every `tests/cases/*.ts`, compiles it to a real native binary, runs it, and
+diffs stdout against the matching `.expected` file. **Every feature gets a `tests/cases/*.ts`
++ `.expected` pair**, ideally written first (red), then implemented to green. Programs that
+must be *rejected* (type errors) can't be expressed as a case pair, so they live in
+[tests/typecheck.test.ts](tests/typecheck.test.ts). See [tests/CLAUDE.md](tests/CLAUDE.md).
 
 ## Current language support
 
@@ -95,35 +107,48 @@ Implemented and tested end-to-end:
   themselves be arrays/objects (`number[][]`, `{ pts: number[] }`, `{ x: number }[]`,
   `{ inner: { x: number } }`).
 - **Values:** numeric/boolean/string literals, array literals `[...]`, object literals `{...}`.
+- **Type checking:** a real `ts.Program` + `TypeChecker` runs **before** lowering and aborts on
+  any TypeScript type error with full diagnostics (wrong assignment types, undeclared names, bad
+  argument counts/types, bad property access). See [src/frontend/check.ts](src/frontend/check.ts).
 - **Operators:** arithmetic `+ - * / %`, unary `-` / `+` (`-x`, `-5`), comparison
-  `< <= > >= === !==` (numbers **and** strings — strings compare lexicographically), logical
+  `< <= > >= === !==` (numbers **and** strings — strings compare lexicographically; `===`/`!==`
+  also on arrays/objects/instances, comparing **reference identity** — see below), logical
   `&& || !`, string concatenation (`"a" + b`, numbers coerce), array indexing `a[i]`, member
   access `obj.field`, array `.length`.
 - **Strings:** literals, concatenation, lexicographic comparison, `s.length`, character access
   `s[i]` (→ a one-char string), and methods `substring` / `slice` / `indexOf` / `charAt` /
   `charCodeAt` / `toUpperCase` / `toLowerCase` / `split` (`s.split(sep[, limit])` → `string[]`;
   string separators only — regex is out of subset) (JS `String.prototype` semantics, ASCII).
-- **`console.log(x)`** for numbers/booleans and strings.
+- **`console.log(x)`** for any value, JS-style (matches Node's `console.log`): numbers shortest-
+  round-trip, booleans `true`/`false`, top-level strings bare; arrays `[ 1, 2 ]`, objects
+  `{ k: v }`, class instances `Name { k: v }`, with nested strings quoted (`'x'`) and aggregates
+  printed recursively (single-line; see _Richer console.log_ in the roadmap for the size caveat).
 - **Variables:** `let` / `const` (initializer required); a type annotation is optional — without
   one the type is **inferred from the initializer**. `var` is **not supported** (errors). Assignment
   `x = e`, `a[i] = e`, `obj.f = e`, compound `+= -= *= /= %=`, and `i++` / `i--`.
+- **Arrays & objects are reference types** (like classes, and like JS): `let b = a` aliases the
+  same value, a mutation through one alias is visible through the other, a callee can mutate an
+  array/object **parameter** (visible to the caller), and `===`/`!==` compare **identity** (two
+  distinct literals with equal contents are `!==`). They compile to `std::shared_ptr<…>`.
 - **Arrays:** literals (incl. empty `[]` with an annotation); `xs.push(v)` (returns the new
   `length`, usable as a value); `xs.pop()` → the removed last element (empty array → the element
-  type's default, since the subset has no `undefined`); `xs.slice(start?, end?)` → a new array
+  type's default, since the subset has no `undefined`); `xs.slice(start?, end?)` → a *new* array
   (negatives count from the end); `xs.indexOf(v[, from])` → `number` (`-1` if absent; element
   `===`, so object/array-element arrays are rejected; class elements compare by identity); and
   `xs.join(sep?)` → `string` (separator defaults to `","`; `string[]` and `number[]`).
 - **Control flow:** `if` / `else`, `while`, `for (init; cond; update)`.
 - **Functions:** top-level, typed params + return type, `return`, calls, `void`; recursion works.
-  Params and returns may be **arrays and objects**, not just scalars — aggregate params pass by
-  `const&` (read-only in the callee), aggregate returns by value (RVO/move).
+  Params and returns may be **arrays and objects**, not just scalars. Every parameter passes **by
+  value** — for arrays/objects/instances that's a `shared_ptr` copy (a refcount bump) that aliases
+  the caller's value, so a callee mutation is visible to the caller (JS reference semantics);
+  returns likewise hand back the shared reference.
 - **Classes:** `class C { f: T; constructor(...) {…}; method(...): R {…} }`, `new C(...)`,
   `this.field` / `this.method()` (read + write), instances in variables / params / returns / arrays.
   Instances are **reference types** (`new` is shared; `let b = a` aliases, so a mutation through one
-  is visible through the other; `a === b` is identity), unlike value-typed object literals. Access
-  modifiers (`public`/`private`/…) are accepted and ignored. **Deferred** (clean `tsnc:` errors):
-  `extends`/`implements`, `static`, get/set accessors, parameter properties, field initializers,
-  no-constructor classes, and bare `this` as a value.
+  is visible through the other; `a === b` is identity) — the same representation arrays and objects
+  now use. Access modifiers (`public`/`private`/…) are accepted and ignored. **Deferred** (clean
+  `tsnc:` errors): `extends`/`implements`, `static`, get/set accessors, parameter properties, field
+  initializers, no-constructor classes, and bare `this` as a value.
 
 ### Representation / behavior notes (read these — they bite)
 
@@ -132,10 +157,10 @@ tsn types map onto C++ types (see [src/codegen/CLAUDE.md](src/codegen/CLAUDE.md)
 | tsn type  | C++ type                | notes                                                                                                                                                |
 | --------- | ----------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
 | number    | `double` or `long long` | IEEE f64 by default; **integer-valued numbers use a 64-bit int rep** (see below). Printed JS-style                                                   |
-| boolean   | `bool`                  | `std::cout` prints `1` / `0`                                                                                                                         |
+| boolean   | `bool`                  | `console.log` prints `true` / `false` (via `tsn_inspect`)                                                                                            |
 | string    | `tsn_str`               | ref-counted immutable string; copy = pointer + refcount bump (no char copy); methods → `tsn_*` helpers                                               |
-| `T[]`     | `std::vector<T>`        | heap-backed; `.length` → `.size()`; `.push()` → `push_back`                                                                                          |
-| `{ ... }` | generated `struct`      | one struct per distinct field shape                                                                                                                  |
+| `T[]`     | `std::shared_ptr<std::vector<T>>` | **reference** type: heap vector, shared on copy/assign (aliasing, shared mutation, identity `===`); `.length` → `->size()`, index `(*a)[i]`, methods → `tsn_*` helpers on `*a` |
+| `{ ... }` | `std::shared_ptr<struct>` | **reference** type: heap struct (one per distinct field shape), shared on copy/assign; field access `obj->f`                                       |
 | class `C` | `std::shared_ptr<C>`    | **reference** type: `new C()` is heap + ref-counted; copy/assign aliases (shared mutation, identity via `==`); `struct C { fields; ctor; methods; }` |
 
 - **`number` is f64, but integer-valued numbers use a 64-bit integer representation.** A
@@ -160,22 +185,31 @@ tsn types map onto C++ types (see [src/codegen/CLAUDE.md](src/codegen/CLAUDE.md)
   tradeoff: every string is a heap allocation (no `std::string` small-string optimization), so
   string-creation-heavy code pays an alloc per value. The refcount is a plain (non-atomic) `long`
   — generated programs are single-threaded.
-- **Aggregate function boundaries:** function params and returns may be arrays/objects (not just
-  scalars). Aggregate **params pass by `const&`** — no per-call copy, and read-only inside the
-  callee: mutating one (`xs.push(v)`, `xs[i] = v`, `xs = …`) is a clean `tsnc:` error, not a silent
-  divergence from JS's shared-reference semantics (copy into a local first to mutate). Aggregate
-  **returns pass by value**, leaning on C++ RVO/move so the cost lands only where the result is
-  bound or used.
+- **Arrays/objects are reference types (`shared_ptr`), matching JS.** `let b = a` aliases the
+  same heap value, so `b.push(v)` / `b[i] = e` / `b.f = e` is visible through `a`; `===`/`!==`
+  compare pointer identity (two distinct literals with equal contents are `!==`); and a function
+  can mutate an array/object parameter — the mutation is visible to the caller. The cost is one
+  `shared_ptr` indirection per element/field access (`(*a)[i]`, `obj->f`); `clang -O3` hoists the
+  invariant pointer out of hot loops, so the integer benchmark (no arrays) is unaffected and the
+  array-heavy word-sort pays only ~3% at the largest JIT-warm sizes (see the roadmap). This
+  replaces the earlier value-typed model (`std::vector`/`struct` by value, `const&` read-only
+  params) — that was a deliberate, documented divergence from JS that reference-typing removes.
+- **Function boundaries:** params and returns may be arrays/objects. Every parameter passes **by
+  value**; for a reference type (array/object/instance) that's a `shared_ptr` copy — a refcount
+  bump that aliases the caller's value, so callee mutations are visible to the caller (JS
+  semantics). Returns hand back the shared reference the same way (a `shared_ptr`, not a deep copy).
 - **Aggregates nest:** object fields and array elements may themselves be aggregates —
-  `{ pts: number[] }`, `{ inner: { x: number } }`, `number[][]`, `{ x: number }[]`. These map
-  directly to C++ (`std::vector<std::vector<double>>`, a struct with `vector`/struct members), and
-  `lowerType` / struct generation recurse through the shape. Nested _number_ fields and elements
-  always use the f64 rep (`double`). Reading, mutating (`box.inner.x = 9`, `poly.pts[0] = 9`), and
-  pushing onto a nested array (`poly.pts.push(v)`) all work; an empty array as a field
-  (`{ pts: [] }`) still errors (no annotation to infer the element type from).
+  `{ pts: number[] }`, `{ inner: { x: number } }`, `number[][]`, `{ x: number }[]`. These map to
+  C++ as nested reference types (`std::shared_ptr<std::vector<std::shared_ptr<std::vector<double>>>>`,
+  a struct whose members are `shared_ptr`s), and `lowerType` / struct generation recurse through the
+  shape. Nested _number_ fields and elements always use the f64 rep (`double`). Reading, mutating
+  (`box.inner.x = 9`, `poly.pts[0] = 9`), and pushing onto a nested array (`poly.pts.push(v)`) all
+  work; an empty array as a field (`{ pts: [] }`) still errors (no annotation to infer the element
+  type from).
 
-The compiler **errors cleanly** (a `tsnc:` message) on unsupported constructs rather than
-miscompiling — e.g. `console.log` of an aggregate, void-as-value, type mismatches.
+The compiler **errors cleanly** — TypeScript-quality diagnostics from the stage-0 type checker for
+type errors (caught before codegen), and a `tsnc:` message for constructs the subset doesn't lower
+(void-as-value, an empty array literal with no annotation, etc.) — never a silent miscompile.
 
 ### Unsupported types (rejected at lowering)
 
@@ -311,14 +345,49 @@ pair** (red → green).
       methods' return types (e.g. array `slice` is an array, not a string) so number-rep slots stay
       sound; all number method-returns remain f64, so the emitter's rep-tagging was untouched.
 
-### Will support — core completeness
-
-- [ ] **Richer `console.log`** — booleans as `true`/`false`; arrays/objects printed JS-style.
-
-### Will support — correctness & performance
-
-- [ ] **Full `ts.Program` + TypeChecker** — real semantic diagnostics; abort before codegen on
-      type errors instead of reading AST annotations.
+- [x] **Arrays & objects as reference types (+ reference equality)** — arrays and object literals
+      now compile to `std::shared_ptr<std::vector<T>>` / `std::shared_ptr<struct>`, the same
+      reference treatment classes already had, so JS semantics fall out: `let b = a` aliases, a
+      mutation through one alias (`b.push(v)`, `b[i] = e`, `b.f = e`) is visible through the other,
+      a callee can mutate an array/object **parameter** (visible to the caller), and `===`/`!==`
+      compare **pointer identity** (`shared_ptr::operator==`) — two distinct literals with equal
+      contents are `!==`. This subsumes the old "Object/array reference equality" roadmap item (the
+      equality guard in `emitBinary` is just dropped — identity comparison is free once values are
+      `shared_ptr`s). The change was concentrated in codegen: `cppType` wraps aggregates in
+      `shared_ptr`, literals `make_shared`, indexing derefs (`(*a)[i]`), members use `->`, the array
+      helpers run on `*recv`, and `slice`/`split` re-wrap their results. It also _deleted_ machinery:
+      the whole read-only-param apparatus (`readonlyParams` / `assertMutable` / `rootVarName`) is
+      gone, since arrays/objects are now freely mutable references, and `paramType` collapsed to a
+      single by-value rule (a `shared_ptr` copy is a refcount bump). **Cost:** one `shared_ptr`
+      indirection per element/field access; `clang -O3` hoists the invariant pointer out of hot
+      loops, so the integer benchmark (no arrays) is byte-identical/unaffected and the array-heavy
+      word-sort pays only ~3% at the largest JIT-warm sizes (0.90× → 0.88× vs V8; a worktree A/B
+      against the prior by-value build).
+- [x] **Richer `console.log`** — `console.log` now prints any value JS-style, matching Node's
+      `console.log` (`util.inspect`) byte-for-byte on the subset: booleans `true`/`false`, top-level
+      strings bare, numbers shortest-round-trip; arrays `[ 1, 2 ]`, objects `{ k: v }`, class
+      instances `Name { k: v }`, with nested strings quoted (`'x'`) and aggregates printed
+      recursively. Implemented as a `tsn_inspect` family in the prelude — fixed scalar overloads + a
+      `tsn_quote`, an array-inspect **template** (over the element type), and one generated overload
+      per object struct / class (knowing its field names). The `log` statement routes booleans and
+      reference types through `tsn_inspect` (numbers/top-level strings keep their bare form). The
+      quote/escape characters are built from their byte values so the generated C++ contains no
+      backslashes. This also removed the three `console.log`-of-aggregate/instance errors. The one
+      caveat: the formatter is always single-line (no `breakLength` wrapping), so it matches Node
+      for small values — keep logged aggregates small in test cases.
+- [x] **Full `ts.Program` + TypeChecker** — a real `ts.Program` + `TypeChecker`
+      ([src/frontend/check.ts](src/frontend/check.ts)) runs as **stage 0**, before lowering, and
+      aborts on any TypeScript type error with full colorized, code-framed diagnostics (surfaced
+      through the CLI's `tsnc:` prefix). It catches what the emitter's local checks missed — wrong
+      assignment types, undeclared names, bad argument counts/types, bad property access — at the
+      source level instead of as a late `tsnc:` message or a miscompile. Built over an in-memory copy
+      of the source plus a tiny ambient `console` declaration, loading only the **ES2020 lib** (not
+      DOM, so its hundreds of globals can't shadow user names) under `strict: true`. All 68 e2e cases
+      type-check clean under these options (verified empirically); rejection behavior — which can't
+      be a case pair — is covered by [tests/typecheck.test.ts](tests/typecheck.test.ts). Subset-
+      specific rejections (e.g. `var`) still happen later in lowering; this stage only enforces
+      TypeScript's semantics. Note: lowering still reads annotations directly (it does not yet thread
+      the `TypeChecker`'s inferred types through), so the checker is a gate, not yet the type source.
 
 ### Later
 

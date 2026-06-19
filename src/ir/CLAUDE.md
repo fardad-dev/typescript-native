@@ -10,8 +10,9 @@ is added or changed.
 - **`Type`** — `"number" | "boolean" | "string"` plus two aggregate shapes and a class instance:
   - `{ kind: "array"; element: Type }`
   - `{ kind: "object"; fields: Field[] }` where `Field = { name; type }`
-  - `{ kind: "class"; name: string }` — a named class instance (a *reference* type; codegen
-    compiles it to `std::shared_ptr<C>`, distinct from the value-typed aggregates above)
+  - `{ kind: "class"; name: string }` — a named class instance. Codegen now compiles **all three**
+    composite shapes (array, object, class) to `std::shared_ptr<…>` reference types — the `Type`
+    union doesn't encode value-vs-reference; that's a codegen decision.
 - **`BinaryOp`** — `"+" | "-" | "*" | "/" | "%"`.
 - **`Expr`** (discriminated union) — `num`, `bool`, `str`, `var`, `binary`, `array`, `index`,
   `object`, `member` (covers `obj.field` and `arr.length`), `call`, `methodCall`, `new`
@@ -27,16 +28,18 @@ is added or changed.
 ## Design notes
 
 - **Arrays carry only their element type**, not a length. Length is *value-level* — arrays
-  compile to `std::vector`, so `.length` is `.size()` at runtime, not encoded in the `Type`.
+  compile to `std::vector` (behind a `shared_ptr`), so `.length` is `.size()` at runtime.
 - **Objects carry their fields in declaration order**, and that order **is** the struct layout
   used by codegen. Type *equality* is structural and order-independent, but the stored layout
   follows the object literal.
 - `member` is intentionally generic (`{ obj, name }`); codegen resolves it to an array/string
   `length`, an object field load, or a class field load based on the value's type. Likewise
   `methodCall` dispatches on the receiver type (string/array helper vs instance method).
-- **Class instances are *reference* types**, the one non-value `Type`. `this` is only valid as
-  `this.field` / `this.method()` (bare `this` as a value isn't modeled yet). The `class` `Type`
-  carries just the name; the layout/methods live in the `ClassDecl` (looked up by name in codegen).
+- **Arrays, objects and class instances are all *reference* types** in codegen (each a
+  `std::shared_ptr<…>`): aliasing, shared mutation, mutable params, and identity `===`/`!==`. `this`
+  is only valid as `this.field` / `this.method()` (bare `this` as a value isn't modeled yet). The
+  `class` `Type` carries just the name; the layout/methods live in the `ClassDecl` (looked up by
+  name in codegen).
 
 ## When adding a feature
 

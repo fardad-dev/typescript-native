@@ -126,6 +126,9 @@ class Emitter {
   private classes = new Map<string, ClassDecl>(); // class name -> declaration
   private structDefs: string[] = []; // generated `struct ... { ... };` lines
   private structNames = new Map<string, string>(); // field-shape key -> struct name
+  // Struct name -> its fields, in declaration order. Used to generate the
+  // per-struct `tsn_inspect` (JS-style printing) once every struct is known.
+  private structFields = new Map<string, Field[]>();
 
   // Representation table (number i64/f64), inferred up front by repr.ts.
   private reps!: RepTable;
@@ -139,10 +142,6 @@ class Emitter {
   // undefined inside free functions and main.
   private currentClass?: ClassDecl;
   private indent = "  ";
-  // Names of aggregate (array/object) params: passed by `const&`, so read-only
-  // inside the function. Consulted to reject mutation-through-param with a clear
-  // tsnc message instead of a cryptic clang const-violation (see assertMutable).
-  private readonlyParams = new Set<string>();
 
   emitModule(mod: Module): string {
     this.reps = analyze(mod); // decide each number slot's representation
@@ -171,10 +170,16 @@ class Emitter {
     const protos = mod.functions.map((fn) => this.prototype(fn));
     const defs = mod.functions.map((fn) => this.emitFunction(fn));
     const mainDef = this.emitMain(mod.main);
-    // Forward-declare every class so fields/params can reference a class defined
-    // later (or itself) through `std::shared_ptr<C>` (a pointer to an incomplete
-    // type is fine), and object structs can hold instances.
+    // Forward-declare every class and object struct so any type can reference any
+    // other (or itself) through `std::shared_ptr<…>` (a pointer to an incomplete
+    // type is fine). With reference-typed aggregates, struct *members* are also
+    // shared_ptrs, so struct order no longer needs inner-before-outer.
     const classFwd = mod.classes.map((c) => `struct ${c.name};`);
+    const structFwd = [...this.structNames.values()].map((n) => `struct ${n};`);
+    // Per-type `tsn_inspect` overloads (computed after all structs are known, so
+    // every aggregate/instance type is covered) — see the JS-style printing block.
+    const inspectFwd = this.inspectFwdDecls();
+    const inspectDefs = this.aggregateInspectDefs();
 
     return [
       `#include <array>`,
@@ -425,13 +430,25 @@ class Emitter {
       `  return -1.0;`,
       `}`,
       ``,
-      // Ordering matters for C++: forward class decls, then object structs (may
-      // hold instances via shared_ptr), then full class struct definitions (their
-      // fields may use object structs by value), then out-of-line class method/
-      // ctor bodies (all types complete), then functions, then main.
-      ...(classFwd.length ? [...classFwd, ``] : []),
+      // JS-style printing for console.log: scalar tsn_inspect overloads + the
+      // array-inspect template's forward declaration (see the JS-style value
+      // printing block). These reference no user types, so they come first.
+      ...this.inspectPrelude(),
+      ``,
+      // Ordering matters for C++: forward-declare every class and object struct,
+      // then the per-type tsn_inspect overloads (a shared_ptr to an incomplete
+      // type is fine in a declaration), then the full struct/class definitions,
+      // then the array-template + per-type inspect definitions (now every type is
+      // complete), then out-of-line class method/ctor bodies, functions, and main.
+      ...(classFwd.length || structFwd.length
+        ? [...classFwd, ...structFwd, ``]
+        : []),
+      ...(inspectFwd.length ? [...inspectFwd, ``] : []),
       ...(this.structDefs.length ? [...this.structDefs, ``] : []),
       ...(classStructs.length ? [classStructs.join("\n\n"), ``] : []),
+      ...this.arrayInspectDef(),
+      ``,
+      ...(inspectDefs.length ? [inspectDefs.join("\n\n"), ``] : []),
       ...(classDefs.length ? [classDefs.join("\n\n"), ``] : []),
       ...(protos.length ? [...protos, ``] : []),
       defs.join("\n\n"),
@@ -443,13 +460,24 @@ class Emitter {
 
   // --- type mapping -------------------------------------------------------
 
+  // The *value* representation of a tsn type. Arrays, objects and class instances
+  // are all *reference* types — a `std::shared_ptr` to a heap value — so copy/assign
+  // aliases the same value (JS reference semantics) and `===` is pointer identity.
+  // The pointee (the `std::vector<T>` / generated `struct`) is what `vecType` /
+  // `structName` return.
   private cppType(t: Type): string {
-    if (isArray(t)) return `std::vector<${this.cppType(t.element)}>`;
-    if (isObject(t)) return this.structName(t);
+    if (isArray(t)) return `std::shared_ptr<${this.vecType(t)}>`;
+    if (isObject(t)) return `std::shared_ptr<${this.structName(t)}>`;
     if (isClass(t)) return `std::shared_ptr<${t.name}>`; // reference-typed instance
     if (t === "number") return "double"; // f64 rep — the default for nested aggregates
     if (t === "boolean") return "bool";
     return "tsn_str"; // string — a ref-counted immutable string (see prelude)
+  }
+
+  // The pointee vector type for an array reference (`std::vector<T>`), e.g. for
+  // `make_shared` and slice results. `cppType` wraps this in a `shared_ptr`.
+  private vecType(t: ArrayType): string {
+    return `std::vector<${this.cppType(t.element)}>`;
   }
 
   // C++ type for a number with a known representation.
@@ -478,6 +506,7 @@ class Emitter {
     if (existing) return existing;
     const name = `tsn_Obj${this.structNames.size}`;
     this.structNames.set(key, name);
+    this.structFields.set(name, o.fields);
     const members = o.fields
       .map((f) => `${this.cppType(f.type)} ${f.name};`)
       .join(" ");
@@ -485,17 +514,125 @@ class Emitter {
     return name;
   }
 
+  // --- JS-style value printing (console.log) ------------------------------
+  //
+  // console.log routes booleans, arrays, objects and class instances through
+  // `tsn_inspect`, which mirrors Node's `util.inspect` single-line format:
+  // booleans `true`/`false`, arrays `[ e0, e1 ]`, objects `{ k: v, ... }`, class
+  // instances `Name { k: v, ... }`, and strings *quoted* (`'x'`) when nested
+  // (top-level strings/numbers keep their bare form — see the `log` statement).
+  //
+  // The scalar overloads + the array template's forward declaration. Emitted
+  // once, always (unused overloads are dead-code-eliminated). The quote and
+  // escape characters are built from their byte values (39 = `'`, 92 = `\`), so
+  // this C++ contains no backslashes — nothing fragile to re-escape here.
+  private inspectPrelude(): string[] {
+    return [
+      `static std::string tsn_quote(const std::string& s) {`,
+      `  std::string out;`,
+      `  char q = (char)39, bs = (char)92;`,
+      `  out += q;`,
+      `  for (unsigned char c : s) {`,
+      `    if (c == 92 || c == 39) { out += bs; out += (char)c; }`,
+      `    else if (c == 10) { out += bs; out += 'n'; }`,
+      `    else if (c == 9) { out += bs; out += 't'; }`,
+      `    else if (c == 13) { out += bs; out += 'r'; }`,
+      `    else out += (char)c;`,
+      `  }`,
+      `  out += q;`,
+      `  return out;`,
+      `}`,
+      `static std::string tsn_inspect(double v) { return tsn_num_to_string(v); }`,
+      `static std::string tsn_inspect(long long v) { return std::to_string(v); }`,
+      `static std::string tsn_inspect(bool b) { return b ? "true" : "false"; }`,
+      `static std::string tsn_inspect(const tsn_str& s) { return tsn_quote(s.str()); }`,
+      // Forward declaration so the per-struct/class inspects below can print
+      // array fields; the definition (below) needs every overload visible first.
+      `template <class T>`,
+      `static std::string tsn_inspect(const std::shared_ptr<std::vector<T>>& a);`,
+    ];
+  }
+
+  // The array-inspect template's definition. Placed after all type definitions
+  // and inspect forward declarations, so its element call resolves to any of the
+  // scalar/struct/class overloads.
+  private arrayInspectDef(): string[] {
+    return [
+      `template <class T>`,
+      `static std::string tsn_inspect(const std::shared_ptr<std::vector<T>>& a) {`,
+      `  if (!a || a->empty()) return "[]";`,
+      `  std::string out = "[ ";`,
+      `  for (std::size_t i = 0; i < a->size(); ++i) {`,
+      `    if (i) out += ", ";`,
+      `    out += tsn_inspect((*a)[i]);`,
+      `  }`,
+      `  out += " ]";`,
+      `  return out;`,
+      `}`,
+    ];
+  }
+
+  // `tsn_inspect(const std::shared_ptr<NAME>&)` forward declarations, one per
+  // generated object struct and per class (a shared_ptr to an incomplete type is
+  // fine in a declaration, so these can precede the full type definitions).
+  private inspectFwdDecls(): string[] {
+    const names = [...this.structFields.keys(), ...this.classes.keys()];
+    return names.map(
+      (n) => `static std::string tsn_inspect(const std::shared_ptr<${n}>& v);`,
+    );
+  }
+
+  // The `tsn_inspect` definitions for every object struct and class instance.
+  // Object literals print `{ k: v, ... }`; class instances print `Name { k: v }`.
+  private aggregateInspectDefs(): string[] {
+    const defs: string[] = [];
+    for (const [name, fields] of this.structFields) {
+      defs.push(this.inspectBody(name, fields, ""));
+    }
+    for (const cls of this.classes.values()) {
+      defs.push(this.inspectBody(cls.name, cls.fields, `${cls.name} `));
+    }
+    return defs;
+  }
+
+  // One `tsn_inspect` body. `prefix` is the class name + space for an instance,
+  // empty for an object literal. Each field value recurses through `tsn_inspect`
+  // (so nested strings are quoted, nested aggregates bracketed).
+  private inspectBody(name: string, fields: Field[], prefix: string): string {
+    if (fields.length === 0) {
+      return [
+        `static std::string tsn_inspect(const std::shared_ptr<${name}>& v) {`,
+        `  if (!v) return "null";`,
+        `  return "${prefix}{}";`,
+        `}`,
+      ].join("\n");
+    }
+    const lines = [
+      `static std::string tsn_inspect(const std::shared_ptr<${name}>& v) {`,
+      `  if (!v) return "null";`,
+      `  std::string out = "${prefix}{ ";`,
+    ];
+    fields.forEach((f, i) => {
+      const sep = i === 0 ? "" : ", ";
+      lines.push(
+        `  out += "${sep}${f.name}: "; out += tsn_inspect(v->${f.name});`,
+      );
+    });
+    lines.push(`  out += " }";`);
+    lines.push(`  return out;`);
+    lines.push(`}`);
+    return lines.join("\n");
+  }
+
   // --- functions ----------------------------------------------------------
 
-  // C++ type of a parameter. Scalars pass by value (a `tsn_str` copy is just a
-  // refcount bump); aggregates pass by `const&`, so a whole vector/struct isn't
-  // copied into the callee (the `const` also turns JS-incompatible mutation-
-  // through-param into a clean error). A class instance is a *reference* type, so
-  // it passes by value (a `shared_ptr` copy = a refcount bump) and stays mutable
-  // — mutating it through the param is visible to the caller, matching JS.
+  // C++ type of a parameter. Every parameter passes **by value**: scalars are
+  // cheap copies (a `tsn_str` copy is just a refcount bump), and arrays/objects/
+  // class instances are reference types — a `shared_ptr` copy (another refcount
+  // bump) that aliases the caller's value, so mutating through the param is
+  // visible to the caller, matching JS reference semantics. (Only `number` needs
+  // the rep table to pick `long long` vs `double`.)
   private paramType(fnName: string, p: { name: string; type: Type }): string {
-    if (isClass(p.type)) return this.cppType(p.type);
-    if (isAggregate(p.type)) return `const ${this.cppType(p.type)}&`;
     return this.slotType(p.type, this.reps.varRep(fnName, p.name));
   }
 
@@ -504,13 +641,11 @@ class Emitter {
     return params.map((p) => `${this.paramType(funcKey, p)} ${p.name}`).join(", ");
   }
 
-  // Register parameters as local variables; aggregate params are `const&`, hence
-  // read-only (class-instance params are mutable, so they are not marked).
+  // Register parameters as local variables. Every parameter is mutable now —
+  // arrays/objects are reference types (a `shared_ptr` alias), so a callee
+  // mutation is visible to the caller, exactly like JS.
   private bindParams(params: Param[]): void {
-    for (const p of params) {
-      this.vars.set(p.name, p.type);
-      if (isAggregate(p.type)) this.readonlyParams.add(p.name);
-    }
+    for (const p of params) this.vars.set(p.name, p.type);
   }
 
   private prototype(fn: Func): string {
@@ -524,7 +659,6 @@ class Emitter {
     this.funcKey = funcKey;
     this.currentClass = undefined;
     this.indent = "  ";
-    this.readonlyParams = new Set();
   }
 
   private emitFunction(fn: Func): string {
@@ -655,7 +789,8 @@ class Emitter {
           throw new Error("Empty array literal needs an array type annotation");
         }
         this.vars.set(stmt.name, stmt.type);
-        return `${this.cppType(stmt.type)} ${stmt.name} = {}`;
+        // A reference-typed array is a heap-allocated empty vector.
+        return `${this.cppType(stmt.type)} ${stmt.name} = std::make_shared<${this.vecType(stmt.type)}>()`;
       }
       const init = this.emitExpr(stmt.init);
       // With an annotation, check assignability; without one, infer from the init.
@@ -696,32 +831,9 @@ class Emitter {
       : v.code;
   }
 
-  // The base variable an lvalue ultimately writes through (`a` for `a`, `a[i]`,
-  // `a.f`, `a[i].f`, …), or undefined if it isn't rooted in a variable.
-  private rootVarName(e: Expr): string | undefined {
-    if (e.kind === "var") return e.name;
-    if (e.kind === "index") return this.rootVarName(e.arr);
-    if (e.kind === "member") return this.rootVarName(e.obj);
-    return undefined;
-  }
-
-  // Reject mutating through an aggregate parameter (passed by `const&`). In JS
-  // arrays/objects are shared, so a callee's `xs.push(v)` / `xs[i] = v` would be
-  // visible to the caller; our value semantics can't express that, so rather
-  // than silently diverge we fail with a clear message. Locals stay mutable.
-  private assertMutable(target: Expr): void {
-    const root = this.rootVarName(target);
-    if (root && this.readonlyParams.has(root)) {
-      throw new Error(
-        `Cannot mutate '${root}': array/object parameters are read-only (v1) — copy it into a local first (e.g. 'let local = ${root}')`,
-      );
-    }
-  }
-
   // Emit an assignable lvalue: a variable, an array element, or an object field.
   // (`arr.length` and other non-assignable members are rejected.)
   private emitLValue(target: Expr): Value {
-    this.assertMutable(target);
     switch (target.kind) {
       case "var": {
         const type = this.vars.get(target.name);
@@ -741,8 +853,9 @@ class Emitter {
         const idx = this.emitExpr(target.index);
         if (idx.type !== "number")
           throw new Error("Array index must be a number");
+        // Dereference the shared_ptr to reach the vector, then index it.
         return {
-          code: `${arr.code}[static_cast<std::size_t>(${idx.code})]`,
+          code: `(*(${arr.code}))[static_cast<std::size_t>(${idx.code})]`,
           type: arr.type.element,
         };
       }
@@ -764,7 +877,8 @@ class Emitter {
             `Property '${target.name}' does not exist on type '${displayType(obj.type)}'`,
           );
         }
-        return { code: `(${obj.code}).${target.name}`, type: field.type };
+        // Write through the shared_ptr (aliases see the mutation — JS semantics).
+        return { code: `(${obj.code})->${target.name}`, type: field.type };
       }
       default:
         throw new Error("Invalid assignment target");
@@ -780,28 +894,18 @@ class Emitter {
       }
       case "log": {
         const val = this.emitExpr(stmt.arg);
-        if (isArray(val.type)) {
-          throw new Error(
-            "console.log of an array is not supported yet (log elements individually)",
-          );
+        // Top-level strings print bare (no surrounding quotes) and numbers print
+        // JS-style (f64 via to_chars; i64 streams directly). Everything else —
+        // booleans (`true`/`false`) and arrays/objects/class instances (JS-style)
+        // — goes through `tsn_inspect`, matching Node's `console.log`.
+        let out: string;
+        if (val.type === "string") {
+          out = val.code;
+        } else if (val.type === "number") {
+          out = val.rep === "i64" ? val.code : `tsn_num_to_string(${val.code})`;
+        } else {
+          out = `tsn_inspect(${val.code})`;
         }
-        if (isObject(val.type)) {
-          throw new Error(
-            "console.log of an object is not supported yet (log fields individually)",
-          );
-        }
-        if (isClass(val.type)) {
-          throw new Error(
-            "console.log of a class instance is not supported yet (log fields individually)",
-          );
-        }
-        // f64 numbers print JS-style via to_chars; an i64 number is already an
-        // integer that streams correctly (no trailing ".0"). Strings/booleans
-        // stream directly.
-        const out =
-          val.type === "number" && val.rep !== "i64"
-            ? `tsn_num_to_string(${val.code})`
-            : val.code;
         this.push(`std::cout << ${out} << "\\n";`);
         return;
       }
@@ -926,7 +1030,10 @@ class Emitter {
         }
         const arrType: ArrayType = { kind: "array", element };
         const items = vals.map((v) => this.f64SlotCode(v)).join(", ");
-        return { code: `${this.cppType(arrType)}{${items}}`, type: arrType };
+        // A reference-typed array: a shared_ptr to a heap vector (so `let b = a`
+        // aliases, mutations are shared, and `===` is identity — JS semantics).
+        const vec = this.vecType(arrType);
+        return { code: `std::make_shared<${vec}>(${vec}{${items}})`, type: arrType };
       }
       case "object": {
         const props = e.properties.map((p) => ({
@@ -944,7 +1051,13 @@ class Emitter {
           fields: props.map((p) => ({ name: p.name, type: p.value.type })),
         };
         const items = props.map((p) => this.f64SlotCode(p.value)).join(", ");
-        return { code: `${this.structName(objType)}{${items}}`, type: objType };
+        // A reference-typed object: a shared_ptr to a heap struct (JS objects are
+        // reference types — alias, shared mutation, identity `===`).
+        const struct = this.structName(objType);
+        return {
+          code: `std::make_shared<${struct}>(${struct}{${items}})`,
+          type: objType,
+        };
       }
       case "index": {
         const arr = this.emitExpr(e.arr);
@@ -966,20 +1079,25 @@ class Emitter {
             type: "string",
           };
         }
-        // Array elements use the f64 rep (vector<double> for number[]).
+        // Array elements use the f64 rep (vector<double> for number[]). The array
+        // is a shared_ptr, so dereference to reach the vector before indexing.
         return {
-          code: `${arr.code}[${i}]`,
+          code: `(*(${arr.code}))[${i}]`,
           type: arr.type.element,
           rep: arr.type.element === "number" ? "f64" : undefined,
         };
       }
       case "member": {
         const obj = this.emitReceiver(e.obj);
-        // `arr.length` / `str.length` — size() is a non-negative integer (i64).
+        // `arr.length` / `str.length` — size() is a non-negative integer (i64). An
+        // array is a shared_ptr (`->size()`); a string is a value (`.size()`).
         if (isArray(obj.type) || obj.type === "string") {
           if (e.name === "length") {
+            const size = isArray(obj.type)
+              ? `(${obj.code})->size()`
+              : `(${obj.code}).size()`;
             return {
-              code: `static_cast<long long>((${obj.code}).size())`,
+              code: `static_cast<long long>(${size})`,
               type: "number",
               rep: "i64",
             };
@@ -987,7 +1105,8 @@ class Emitter {
           const kind = isArray(obj.type) ? "Arrays" : "Strings";
           throw new Error(`${kind} have no property '${e.name}'`);
         }
-        // `obj.field` — object fields use the f64 rep.
+        // `obj.field` — object fields use the f64 rep. The object is a shared_ptr,
+        // so access through `->`.
         if (isObject(obj.type)) {
           const field = obj.type.fields.find((f) => f.name === e.name);
           if (!field) {
@@ -996,7 +1115,7 @@ class Emitter {
             );
           }
           return {
-            code: `(${obj.code}).${e.name}`,
+            code: `(${obj.code})->${e.name}`,
             type: field.type,
             rep: field.type === "number" ? "f64" : undefined,
           };
@@ -1143,16 +1262,15 @@ class Emitter {
       return { code, type: "boolean" };
     }
     if (EQUALITY.has(e.op)) {
-      if (
-        isAggregate(l.type) ||
-        isAggregate(r.type) ||
-        !sameType(l.type, r.type)
-      ) {
+      if (!sameType(l.type, r.type)) {
         throw new Error(
           `Cannot compare '${displayType(l.type)}' and '${displayType(r.type)}' with '${e.op}'`,
         );
       }
-      // Value comparison for strings (tsn_str's operator==/!=).
+      // number/boolean: value comparison; string: tsn_str's value `==`/`!=`;
+      // arrays/objects/class instances: shared_ptr **identity** (`==` on the
+      // pointer) — JS reference equality, so two distinct literals with the same
+      // contents are `!==`, and an alias (`let b = a`) is `===`.
       return { code, type: "boolean" };
     }
     // logical && ||
@@ -1208,6 +1326,9 @@ class Emitter {
     }
     if (isArray(recv.type)) {
       const elem = recv.type.element;
+      // The array is a shared_ptr; the tsn_* helpers take the vector, so the
+      // receiver is dereferenced (`*ptr`) at each call site.
+      const vecRecv = `*(${recv.code})`;
       switch (e.method) {
         case "push": {
           if (e.args.length !== 1) {
@@ -1219,23 +1340,20 @@ class Emitter {
               `Cannot push '${displayType(arg.type)}' onto '${displayType(recv.type)}'`,
             );
           }
-          // push mutates the receiver — forbidden through a const& aggregate param.
-          this.assertMutable(e.receiver);
+          // Mutating through the shared vector is visible to every alias (JS).
           // Returns the new length (a number); usable as a value or a statement.
-          return { code: `tsn_push(${recv.code}, ${arg.code})`, type: "number" };
+          return { code: `tsn_push(${vecRecv}, ${arg.code})`, type: "number" };
         }
         case "pop": {
           if (e.args.length !== 0) {
             throw new Error(`'pop' expects 0 arguments, got ${e.args.length}`);
           }
-          // pop mutates the receiver — forbidden through a const& aggregate param.
-          this.assertMutable(e.receiver);
           // Returns the removed last element (the array's element type).
-          return { code: `tsn_pop(${recv.code})`, type: elem };
+          return { code: `tsn_pop(${vecRecv})`, type: elem };
         }
         case "slice": {
           // `slice(start?, end?)` — both optional numbers; an omitted one is NaN
-          // ("default") in the helper. Returns a new array of the same type.
+          // ("default") in the helper. Returns a *new* array (a fresh shared_ptr).
           if (e.args.length > 2) {
             throw new Error(`'slice' expects 0-2 argument(s), got ${e.args.length}`);
           }
@@ -1247,8 +1365,9 @@ class Emitter {
           }
           const start = nums[0]?.code ?? "NAN";
           const end = nums[1]?.code ?? "NAN";
+          const vec = this.vecType(recv.type);
           return {
-            code: `tsn_array_slice(${recv.code}, ${start}, ${end})`,
+            code: `std::make_shared<${vec}>(tsn_array_slice(${vecRecv}, ${start}, ${end}))`,
             type: recv.type,
           };
         }
@@ -1282,7 +1401,7 @@ class Emitter {
           // f64SlotCode casts an i64-literal search value to the element's double
           // rep (a no-op for string/boolean/class), so the template deduces one T.
           return {
-            code: `tsn_array_index_of(${recv.code}, ${this.f64SlotCode(search)}, ${from})`,
+            code: `tsn_array_index_of(${vecRecv}, ${this.f64SlotCode(search)}, ${from})`,
             type: "number",
           };
         }
@@ -1304,7 +1423,7 @@ class Emitter {
             }
             sep = arg.code;
           }
-          return { code: `tsn_join(${recv.code}, ${sep})`, type: "string" };
+          return { code: `tsn_join(${vecRecv}, ${sep})`, type: "string" };
         }
         default:
           throw new Error(`Unsupported array method '${e.method}'`);
@@ -1408,8 +1527,9 @@ class Emitter {
           throw new Error("'split' limit must be a number");
         }
         const limit = argv.length === 2 ? argv[1].code : "NAN";
+        // Returns a reference-typed string[] (a shared_ptr to the result vector).
         return {
-          code: `tsn_split(${s}, ${argv[0].code}, ${limit})`,
+          code: `std::make_shared<std::vector<tsn_str>>(tsn_split(${s}, ${argv[0].code}, ${limit}))`,
           type: { kind: "array", element: "string" },
         };
       }
