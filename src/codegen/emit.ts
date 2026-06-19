@@ -4,12 +4,14 @@
 //   number, boolean -> i64 (booleans are 0/1)
 //   string          -> ptr to a private global byte array (a NUL-terminated C string)
 //   T[]             -> ptr to a stack buffer (`alloca [N x repr(T)]`), compile-time-sized
+//   { ... }         -> ptr to a stack struct (`alloca { repr(f0), repr(f1), ... }`)
 //
-// Every emitted value carries its IR type (and, for arrays, a compile-time
-// length) so we know its LLVM representation, which store/load width to use,
-// which printf format to pick, and how to index it.
+// Arrays and objects are "aggregates": their value IS the pointer to their
+// stack buffer, so referencing them needs no load. Every emitted value carries
+// its IR type (and, for arrays, a compile-time length) so we know its LLVM
+// representation, store/load width, printf format, and how to index/project it.
 
-import { Module, Expr, Stmt, BinaryOp, Type } from "../ir/nodes";
+import { Module, Expr, Stmt, BinaryOp, Type, Field } from "../ir/nodes";
 
 const TARGET_TRIPLE = "arm64-apple-macosx15.0.0";
 
@@ -22,23 +24,48 @@ const OPCODE: Record<BinaryOp, string> = {
 };
 
 type ArrayType = { kind: "array"; element: Type };
+type ObjectType = { kind: "object"; fields: Field[] };
 
 function isArray(t: Type): t is ArrayType {
   return typeof t === "object" && t.kind === "array";
 }
+function isObject(t: Type): t is ObjectType {
+  return typeof t === "object" && t.kind === "object";
+}
+function isAggregate(t: Type): boolean {
+  return isArray(t) || isObject(t);
+}
 
-// The LLVM type used to represent a tsn value. Arrays and strings are pointers.
+// The LLVM type used to represent a tsn value. Aggregates and strings are pointers.
 function reprOf(t: Type): "i64" | "ptr" {
   return typeof t === "object" || t === "string" ? "ptr" : "i64";
 }
 
+// The LLVM struct type literal for an object, e.g. `{ i64, ptr }`.
+function structType(o: ObjectType): string {
+  if (o.fields.length === 0) return "{}";
+  return `{ ${o.fields.map((f) => reprOf(f.type)).join(", ")} }`;
+}
+
 function displayType(t: Type): string {
-  return isArray(t) ? `${displayType(t.element)}[]` : t;
+  if (isArray(t)) return `${displayType(t.element)}[]`;
+  if (isObject(t)) {
+    return `{ ${t.fields.map((f) => `${f.name}: ${displayType(f.type)}`).join("; ")} }`;
+  }
+  return t;
 }
 
 function sameType(a: Type, b: Type): boolean {
   if (isArray(a) && isArray(b)) return sameType(a.element, b.element);
-  if (isArray(a) || isArray(b)) return false;
+  if (isObject(a) && isObject(b)) {
+    if (a.fields.length !== b.fields.length) return false;
+    // Structural, order-independent: match fields by name.
+    return a.fields.every((fa) => {
+      const fb = b.fields.find((f) => f.name === fa.name);
+      return fb !== undefined && sameType(fa.type, fb.type);
+    });
+  }
+  if (isAggregate(a) || isAggregate(b)) return false;
   return a === b;
 }
 
@@ -105,10 +132,10 @@ class Emitter {
             `Type '${displayType(init.type)}' is not assignable to '${displayType(stmt.type)}'`
           );
         }
-        // An array binding reuses the buffer the literal already allocated —
-        // no separate pointer slot, and references need no load.
-        if (isArray(stmt.type)) {
-          this.vars.set(stmt.name, { ptr: init.v, type: stmt.type, length: init.length });
+        // Aggregates reuse the buffer their literal already allocated. We bind
+        // the *literal's* type, whose field/element order matches the layout.
+        if (isAggregate(stmt.type)) {
+          this.vars.set(stmt.name, { ptr: init.v, type: init.type, length: init.length });
           return;
         }
         const r = reprOf(stmt.type);
@@ -123,6 +150,11 @@ class Emitter {
         if (isArray(val.type)) {
           throw new Error(
             "console.log of an array is not supported yet (log elements individually)"
+          );
+        }
+        if (isObject(val.type)) {
+          throw new Error(
+            "console.log of an object is not supported yet (log fields individually)"
           );
         }
         const t = this.fresh();
@@ -152,8 +184,8 @@ class Emitter {
       case "var": {
         const slot = this.vars.get(e.name);
         if (!slot) throw new Error(`Unknown variable: ${e.name}`);
-        // Arrays are passed around as the buffer pointer itself — no load.
-        if (isArray(slot.type)) {
+        // Aggregates are passed around as their buffer pointer — no load.
+        if (isAggregate(slot.type)) {
           return { v: slot.ptr, type: slot.type, length: slot.length };
         }
         const r = reprOf(slot.type);
@@ -169,8 +201,8 @@ class Emitter {
             "String concatenation is not supported yet (needs a heap/runtime)"
           );
         }
-        if (isArray(l.type) || isArray(r.type)) {
-          throw new Error("Arithmetic on arrays is not supported");
+        if (isAggregate(l.type) || isAggregate(r.type)) {
+          throw new Error("Arithmetic on arrays/objects is not supported");
         }
         const t = this.fresh();
         this.body.push(`  ${t} = ${OPCODE[e.op]} i64 ${l.v}, ${r.v}`);
@@ -200,6 +232,30 @@ class Emitter {
         });
         return { v: arr, type: { kind: "array", element }, length: n };
       }
+      case "object": {
+        const props = e.properties.map((p) => ({ name: p.name, value: this.emitExpr(p.value) }));
+        const seen = new Set<string>();
+        for (const p of props) {
+          if (seen.has(p.name)) throw new Error(`Duplicate property '${p.name}'`);
+          seen.add(p.name);
+          if (typeof p.value.type !== "string") {
+            throw new Error("Object fields must be number, boolean, or string (v1)");
+          }
+        }
+        const objType: ObjectType = {
+          kind: "object",
+          fields: props.map((p) => ({ name: p.name, type: p.value.type })),
+        };
+        const st = structType(objType);
+        const obj = this.fresh();
+        this.body.push(`  ${obj} = alloca ${st}`);
+        props.forEach((p, i) => {
+          const gp = this.fresh();
+          this.body.push(`  ${gp} = getelementptr ${st}, ptr ${obj}, i64 0, i32 ${i}`);
+          this.body.push(`  store ${reprOf(p.value.type)} ${p.value.v}, ptr ${gp}`);
+        });
+        return { v: obj, type: objType };
+      }
       case "index": {
         const arr = this.emitExpr(e.arr);
         if (!isArray(arr.type)) {
@@ -216,12 +272,32 @@ class Emitter {
         this.body.push(`  ${t} = load ${er}, ptr ${p}`);
         return { v: t, type: arr.type.element };
       }
-      case "length": {
-        const arr = this.emitExpr(e.arg);
-        if (!isArray(arr.type) || arr.length === undefined) {
-          throw new Error("'.length' is only supported on arrays");
+      case "member": {
+        const obj = this.emitExpr(e.obj);
+        // `arr.length` — a compile-time constant.
+        if (isArray(obj.type)) {
+          if (e.name === "length" && obj.length !== undefined) {
+            return { v: String(obj.length), type: "number" };
+          }
+          throw new Error(`Arrays have no property '${e.name}'`);
         }
-        return { v: String(arr.length), type: "number" };
+        // `obj.field`
+        if (isObject(obj.type)) {
+          const idx = obj.type.fields.findIndex((f) => f.name === e.name);
+          if (idx < 0) {
+            throw new Error(
+              `Property '${e.name}' does not exist on type '${displayType(obj.type)}'`
+            );
+          }
+          const fieldType = obj.type.fields[idx].type;
+          const st = structType(obj.type);
+          const gp = this.fresh();
+          this.body.push(`  ${gp} = getelementptr ${st}, ptr ${obj.v}, i64 0, i32 ${idx}`);
+          const t = this.fresh();
+          this.body.push(`  ${t} = load ${reprOf(fieldType)}, ptr ${gp}`);
+          return { v: t, type: fieldType };
+        }
+        throw new Error(`Type '${displayType(obj.type)}' has no property '${e.name}'`);
       }
     }
   }

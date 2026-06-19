@@ -58,6 +58,20 @@ function lowerType(node: ts.TypeNode): Type {
   if (ts.isArrayTypeNode(node)) {
     return { kind: "array", element: lowerType(node.elementType) };
   }
+  // `{ a: T; b: U }`
+  if (ts.isTypeLiteralNode(node)) {
+    const fields = node.members.map((m) => {
+      if (!ts.isPropertySignature(m) || !m.name || !ts.isIdentifier(m.name) || !m.type) {
+        throw new Error("Unsupported object type member (v1)");
+      }
+      const t = lowerType(m.type);
+      if (typeof t !== "string") {
+        throw new Error("Object fields must be number, boolean, or string (v1)");
+      }
+      return { name: m.name.text, type: t };
+    });
+    return { kind: "object", fields };
+  }
   if (ts.isTypeReferenceNode(node) && ts.isIdentifier(node.typeName)) {
     const n = node.typeName.text;
     // In our `tsn` dialect, the boxed wrappers `Number`/`Boolean`/`String` are
@@ -96,6 +110,17 @@ function lowerExpr(node: ts.Expression): Expr {
       }),
     };
   }
+  if (ts.isObjectLiteralExpression(node)) {
+    return {
+      kind: "object",
+      properties: node.properties.map((p) => {
+        if (!ts.isPropertyAssignment(p) || !ts.isIdentifier(p.name)) {
+          throw new Error("Only simple { name: value } object properties are supported (v1)");
+        }
+        return { name: p.name.text, value: lowerExpr(p.initializer) };
+      }),
+    };
+  }
   if (ts.isElementAccessExpression(node)) {
     return {
       kind: "index",
@@ -103,11 +128,9 @@ function lowerExpr(node: ts.Expression): Expr {
       index: lowerExpr(node.argumentExpression),
     };
   }
+  // Both `obj.field` and `arr.length`; resolved by type during codegen.
   if (ts.isPropertyAccessExpression(node)) {
-    if (node.name.text === "length") {
-      return { kind: "length", arg: lowerExpr(node.expression) };
-    }
-    throw new Error(`Unsupported property access: .${node.name.text}`);
+    return { kind: "member", obj: lowerExpr(node.expression), name: node.name.text };
   }
   if (ts.isBinaryExpression(node)) {
     return {
