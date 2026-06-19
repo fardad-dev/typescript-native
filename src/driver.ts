@@ -20,7 +20,10 @@ export function compile(opts: Options): void {
 
   const cppPath = opts.emitCpp
     ? `${opts.output}.cpp`
-    : path.join(os.tmpdir(), `${path.basename(opts.output)}.${process.pid}.cpp`);
+    : path.join(
+        os.tmpdir(),
+        `${path.basename(opts.output)}.${process.pid}.cpp`,
+      );
 
   fs.writeFileSync(cppPath, cpp);
   buildExecutable(cppPath, opts.output); // stage 4: clang++ -> executable

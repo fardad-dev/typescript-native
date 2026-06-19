@@ -3,7 +3,8 @@
 // C++ is a high-level target, so codegen is expression-based: emitExpr returns a
 // C++ expression string (e.g. "(a + b)", "xs[i]", "p.x", "add(2, 3)") rather than
 // breaking everything into temporaries. The C++ compiler (clang++) then does the
-// real lowering to machine code.
+// real lowering to machine code, and enforces that non-void functions return
+// (we pass -Werror=return-type in the backend).
 //
 // Type mapping (chosen to preserve the previous backend's observable behavior):
 //   number  -> long long      (64-bit integer; integer division, as before)
@@ -14,13 +15,17 @@
 
 import { Module, Expr, Stmt, BinaryOp, Type, Field, Func, RetType } from "../ir/nodes";
 
-const OPCODE: Record<BinaryOp, string> = {
-  "+": "+",
-  "-": "-",
-  "*": "*",
-  "/": "/",
-  "%": "%",
+// C++ operator text for each IR binary op (=== / !== map to == / !=).
+const CPP_OP: Record<BinaryOp, string> = {
+  "+": "+", "-": "-", "*": "*", "/": "/", "%": "%",
+  "<": "<", "<=": "<=", ">": ">", ">=": ">=",
+  "===": "==", "!==": "!=",
+  "&&": "&&", "||": "||",
 };
+
+const ARITH = new Set<BinaryOp>(["+", "-", "*", "/", "%"]);
+const RELATIONAL = new Set<BinaryOp>(["<", "<=", ">", ">="]);
+const EQUALITY = new Set<BinaryOp>(["===", "!=="]);
 
 type ArrayType = { kind: "array"; element: Type };
 type ObjectType = { kind: "object"; fields: Field[] };
@@ -83,7 +88,7 @@ class Emitter {
   private body: string[] = [];
   private vars = new Map<string, Type>();
   private curReturn: RetType = "void";
-  private terminated = false;
+  private indent = "  ";
 
   emitModule(mod: Module): string {
     // First pass: collect signatures so calls can reference any function.
@@ -149,20 +154,13 @@ class Emitter {
     this.body = [];
     this.vars = new Map();
     this.curReturn = ret;
-    this.terminated = false;
+    this.indent = "  ";
   }
 
   private emitFunction(fn: Func): string {
     this.resetForFunction(fn.returnType);
     for (const p of fn.params) this.vars.set(p.name, p.type);
-
-    for (const s of fn.body) {
-      if (this.terminated) break; // ignore code after a `return` (no control flow yet)
-      this.emitStmt(s);
-    }
-    if (!this.terminated && fn.returnType !== "void") {
-      throw new Error(`Function '${fn.name}' must return a value`);
-    }
+    for (const s of fn.body) this.emitStmt(s);
 
     const params = fn.params.map((p) => `${this.cppType(p.type)} ${p.name}`).join(", ");
     return [
@@ -178,20 +176,64 @@ class Emitter {
     return [`int main() {`, ...this.body, `  return 0;`, `}`].join("\n");
   }
 
+  // --- emission helpers ---------------------------------------------------
+
+  private push(line: string): void {
+    this.body.push(this.indent + line);
+  }
+
+  // Emit a nested `{ ... }` block of statements at one deeper indent level.
+  private emitBlock(stmts: Stmt[]): void {
+    const saved = this.indent;
+    this.indent += "  ";
+    for (const s of stmts) this.emitStmt(s);
+    this.indent = saved;
+  }
+
+  // Emit a condition expression; it must be usable as a C++ condition.
+  private condition(e: Expr): string {
+    const v = this.emitExpr(e);
+    if (v.type !== "number" && v.type !== "boolean") {
+      throw new Error(`Condition must be a number or boolean, got '${displayType(v.type)}'`);
+    }
+    return v.code;
+  }
+
   // --- statements ---------------------------------------------------------
+
+  // A `let`/`assign` rendered as a C++ fragment without trailing `;` (also used
+  // inline inside a `for (...)` header). `let` registers the variable.
+  private inlineStmt(stmt: Stmt): string {
+    if (stmt.kind === "let") {
+      const init = this.emitExpr(stmt.init);
+      if (!sameType(stmt.type, init.type)) {
+        throw new Error(
+          `Type '${displayType(init.type)}' is not assignable to '${displayType(stmt.type)}'`
+        );
+      }
+      // Bind the initializer's type (for aggregates, its field/element shape).
+      this.vars.set(stmt.name, init.type);
+      return `${this.cppType(init.type)} ${stmt.name} = ${init.code}`;
+    }
+    if (stmt.kind === "assign") {
+      const cur = this.vars.get(stmt.name);
+      if (!cur) throw new Error(`Cannot assign to undeclared variable '${stmt.name}'`);
+      const val = this.emitExpr(stmt.value);
+      if (!sameType(cur, val.type)) {
+        throw new Error(
+          `Type '${displayType(val.type)}' is not assignable to '${displayType(cur)}'`
+        );
+      }
+      return `${stmt.name} = ${val.code}`;
+    }
+    throw new Error(`Statement '${stmt.kind}' is not valid here`);
+  }
 
   private emitStmt(stmt: Stmt): void {
     switch (stmt.kind) {
-      case "let": {
-        const init = this.emitExpr(stmt.init);
-        if (!sameType(stmt.type, init.type)) {
-          throw new Error(
-            `Type '${displayType(init.type)}' is not assignable to '${displayType(stmt.type)}'`
-          );
-        }
-        // Bind the initializer's type (for aggregates, its field/element shape).
-        this.body.push(`  ${this.cppType(init.type)} ${stmt.name} = ${init.code};`);
-        this.vars.set(stmt.name, init.type);
+      case "let":
+      case "assign": {
+        this.push(`${this.inlineStmt(stmt)};`);
         return;
       }
       case "log": {
@@ -206,13 +248,13 @@ class Emitter {
             "console.log of an object is not supported yet (log fields individually)"
           );
         }
-        this.body.push(`  std::cout << ${val.code} << "\\n";`);
+        this.push(`std::cout << ${val.code} << "\\n";`);
         return;
       }
       case "return": {
         if (this.curReturn === "void") {
           if (stmt.value) throw new Error("Cannot return a value from a void function");
-          this.body.push(`  return;`);
+          this.push(`return;`);
         } else {
           if (!stmt.value) throw new Error("Missing return value");
           const val = this.emitExpr(stmt.value);
@@ -221,9 +263,8 @@ class Emitter {
               `Type '${displayType(val.type)}' is not assignable to return type '${displayType(this.curReturn)}'`
             );
           }
-          this.body.push(`  return ${val.code};`);
+          this.push(`return ${val.code};`);
         }
-        this.terminated = true;
         return;
       }
       case "exprStmt": {
@@ -232,7 +273,36 @@ class Emitter {
           stmt.expr.kind === "call"
             ? this.emitCall(stmt.expr, /*asStatement*/ true).code
             : this.emitExpr(stmt.expr).code;
-        this.body.push(`  ${code};`);
+        this.push(`${code};`);
+        return;
+      }
+      case "if": {
+        this.push(`if (${this.condition(stmt.cond)}) {`);
+        this.emitBlock(stmt.then);
+        if (stmt.else) {
+          this.push(`} else {`);
+          this.emitBlock(stmt.else);
+        }
+        this.push(`}`);
+        return;
+      }
+      case "while": {
+        this.push(`while (${this.condition(stmt.cond)}) {`);
+        this.emitBlock(stmt.body);
+        this.push(`}`);
+        return;
+      }
+      case "for": {
+        // init/cond/update are emitted inline into the C++ for-header; init
+        // (when a `let`) registers the loop variable before cond/update/body.
+        const init = stmt.init ? this.inlineStmt(stmt.init) : "";
+        const cond = stmt.cond ? this.condition(stmt.cond) : "";
+        const update = stmt.update ? this.inlineStmt(stmt.update) : "";
+        this.push(`for (${init}; ${cond}; ${update}) {`);
+        this.emitBlock(stmt.body);
+        this.push(`}`);
+        // A `let`-introduced loop variable is scoped to the loop in C++; drop it.
+        if (stmt.init && stmt.init.kind === "let") this.vars.delete(stmt.init.name);
         return;
       }
     }
@@ -254,18 +324,12 @@ class Emitter {
         if (!type) throw new Error(`Unknown variable: ${e.name}`);
         return { code: e.name, type };
       }
-      case "binary": {
-        const l = this.emitExpr(e.left);
-        const r = this.emitExpr(e.right);
-        if (l.type === "string" || r.type === "string") {
-          throw new Error(
-            "String concatenation is not supported yet (needs a heap/runtime)"
-          );
-        }
-        if (isAggregate(l.type) || isAggregate(r.type)) {
-          throw new Error("Arithmetic on arrays/objects is not supported");
-        }
-        return { code: `(${l.code} ${OPCODE[e.op]} ${r.code})`, type: "number" };
+      case "binary":
+        return this.emitBinary(e);
+      case "unary": {
+        const v = this.emitExpr(e.operand);
+        if (v.type !== "boolean") throw new Error("Operator '!' expects a boolean");
+        return { code: `(!${v.code})`, type: "boolean" };
       }
       case "array": {
         if (e.elements.length === 0) {
@@ -338,6 +402,44 @@ class Emitter {
         return { code: val.code, type: val.type as Type };
       }
     }
+  }
+
+  private emitBinary(e: { op: BinaryOp; left: Expr; right: Expr }): Value {
+    const l = this.emitExpr(e.left);
+    const r = this.emitExpr(e.right);
+    const code = `(${l.code} ${CPP_OP[e.op]} ${r.code})`;
+
+    if (ARITH.has(e.op)) {
+      if (l.type === "string" || r.type === "string") {
+        if (e.op === "+") {
+          throw new Error("String concatenation is not supported yet (needs a heap/runtime)");
+        }
+        throw new Error(`Operator '${e.op}' expects numbers`);
+      }
+      if (l.type !== "number" || r.type !== "number") {
+        throw new Error(`Operator '${e.op}' expects numbers`);
+      }
+      return { code, type: "number" };
+    }
+    if (RELATIONAL.has(e.op)) {
+      if (l.type !== "number" || r.type !== "number") {
+        throw new Error(`Operator '${e.op}' expects numbers`);
+      }
+      return { code, type: "boolean" };
+    }
+    if (EQUALITY.has(e.op)) {
+      if (isAggregate(l.type) || isAggregate(r.type) || !sameType(l.type, r.type)) {
+        throw new Error(
+          `Cannot compare '${displayType(l.type)}' and '${displayType(r.type)}' with '${e.op}'`
+        );
+      }
+      return { code, type: "boolean" };
+    }
+    // logical && ||
+    if (l.type !== "boolean" || r.type !== "boolean") {
+      throw new Error(`Operator '${e.op}' expects booleans`);
+    }
+    return { code, type: "boolean" };
   }
 
   // Emit a function call. In statement position a void call is allowed; in value

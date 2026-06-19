@@ -78,6 +78,33 @@ function lowerStatement(node: ts.Statement, out: Stmt[]): void {
     });
     return;
   }
+  if (ts.isIfStatement(node)) {
+    out.push({
+      kind: "if",
+      cond: lowerExpr(node.expression),
+      then: lowerBlock(node.thenStatement),
+      else: node.elseStatement ? lowerBlock(node.elseStatement) : undefined,
+    });
+    return;
+  }
+  if (ts.isWhileStatement(node)) {
+    out.push({
+      kind: "while",
+      cond: lowerExpr(node.expression),
+      body: lowerBlock(node.statement),
+    });
+    return;
+  }
+  if (ts.isForStatement(node)) {
+    out.push({
+      kind: "for",
+      init: node.initializer ? lowerForInit(node.initializer) : undefined,
+      cond: node.condition ? lowerExpr(node.condition) : undefined,
+      update: node.incrementor ? lowerAssignLike(node.incrementor) : undefined,
+      body: lowerBlock(node.statement),
+    });
+    return;
+  }
   if (ts.isExpressionStatement(node)) {
     const expr = node.expression;
     if (ts.isCallExpression(expr) && isConsoleLog(expr.expression)) {
@@ -87,12 +114,106 @@ function lowerStatement(node: ts.Statement, out: Stmt[]): void {
       out.push({ kind: "log", arg: lowerExpr(expr.arguments[0]) });
       return;
     }
+    if (isAssignmentLike(expr)) {
+      out.push(lowerAssignLike(expr));
+      return;
+    }
     if (ts.isCallExpression(expr)) {
       out.push({ kind: "exprStmt", expr: lowerExpr(expr) });
       return;
     }
   }
   throw new Error(`Unsupported statement: ${ts.SyntaxKind[node.kind]}`);
+}
+
+// Maps a compound-assignment token (`+=` etc.) to its arithmetic op, or null.
+function compoundOp(kind: ts.SyntaxKind): BinaryOp | null {
+  switch (kind) {
+    case ts.SyntaxKind.PlusEqualsToken:
+      return "+";
+    case ts.SyntaxKind.MinusEqualsToken:
+      return "-";
+    case ts.SyntaxKind.AsteriskEqualsToken:
+      return "*";
+    case ts.SyntaxKind.SlashEqualsToken:
+      return "/";
+    case ts.SyntaxKind.PercentEqualsToken:
+      return "%";
+    default:
+      return null;
+  }
+}
+
+// `x = e`, `x += e`, `x++`/`++x`, `x--`/`--x` — all targeting a simple variable.
+function isAssignmentLike(expr: ts.Expression): boolean {
+  if (ts.isBinaryExpression(expr)) {
+    const k = expr.operatorToken.kind;
+    return k === ts.SyntaxKind.EqualsToken || compoundOp(k) !== null;
+  }
+  if (ts.isPostfixUnaryExpression(expr) || ts.isPrefixUnaryExpression(expr)) {
+    return (
+      expr.operator === ts.SyntaxKind.PlusPlusToken ||
+      expr.operator === ts.SyntaxKind.MinusMinusToken
+    );
+  }
+  return false;
+}
+
+// Lower an assignment-like expression to an `assign` statement, desugaring
+// compound assignment and `++`/`--` into `name = name <op> rhs`.
+function lowerAssignLike(expr: ts.Expression): Stmt {
+  if (ts.isBinaryExpression(expr)) {
+    if (!ts.isIdentifier(expr.left)) {
+      throw new Error("Assignment target must be a simple variable (v1)");
+    }
+    const name = expr.left.text;
+    if (expr.operatorToken.kind === ts.SyntaxKind.EqualsToken) {
+      return { kind: "assign", name, value: lowerExpr(expr.right) };
+    }
+    const op = compoundOp(expr.operatorToken.kind);
+    if (op) {
+      return {
+        kind: "assign",
+        name,
+        value: { kind: "binary", op, left: { kind: "var", name }, right: lowerExpr(expr.right) },
+      };
+    }
+  }
+  if (ts.isPostfixUnaryExpression(expr) || ts.isPrefixUnaryExpression(expr)) {
+    if (!ts.isIdentifier(expr.operand)) {
+      throw new Error("'++'/'--' target must be a simple variable (v1)");
+    }
+    const name = expr.operand.text;
+    const op: BinaryOp = expr.operator === ts.SyntaxKind.PlusPlusToken ? "+" : "-";
+    return {
+      kind: "assign",
+      name,
+      value: { kind: "binary", op, left: { kind: "var", name }, right: { kind: "num", value: 1 } },
+    };
+  }
+  throw new Error("Unsupported assignment expression");
+}
+
+// A `for` initializer: a single `let`/`const` declaration, or an assignment expr.
+function lowerForInit(init: ts.ForInitializer): Stmt {
+  if (ts.isVariableDeclarationList(init)) {
+    if (init.declarations.length !== 1) {
+      throw new Error("for-loop init must declare exactly one variable (v1)");
+    }
+    return lowerVarDecl(init.declarations[0]);
+  }
+  return lowerAssignLike(init);
+}
+
+// A block (`{ ... }`) or a single bare statement (`if (c) stmt;`) -> Stmt[].
+function lowerBlock(node: ts.Statement): Stmt[] {
+  const out: Stmt[] = [];
+  if (ts.isBlock(node)) {
+    for (const s of node.statements) lowerStatement(s, out);
+  } else {
+    lowerStatement(node, out);
+  }
+  return out;
 }
 
 function lowerVarDecl(decl: ts.VariableDeclaration): Stmt {
@@ -198,6 +319,9 @@ function lowerExpr(node: ts.Expression): Expr {
       args: node.arguments.map(lowerExpr),
     };
   }
+  if (ts.isPrefixUnaryExpression(node) && node.operator === ts.SyntaxKind.ExclamationToken) {
+    return { kind: "unary", op: "!", operand: lowerExpr(node.operand) };
+  }
   if (ts.isBinaryExpression(node)) {
     return {
       kind: "binary",
@@ -221,6 +345,25 @@ function lowerBinaryOp(kind: ts.SyntaxKind): BinaryOp {
       return "/";
     case ts.SyntaxKind.PercentToken:
       return "%";
+    case ts.SyntaxKind.LessThanToken:
+      return "<";
+    case ts.SyntaxKind.LessThanEqualsToken:
+      return "<=";
+    case ts.SyntaxKind.GreaterThanToken:
+      return ">";
+    case ts.SyntaxKind.GreaterThanEqualsToken:
+      return ">=";
+    // Loose `==`/`!=` are treated as strict in our dialect.
+    case ts.SyntaxKind.EqualsEqualsToken:
+    case ts.SyntaxKind.EqualsEqualsEqualsToken:
+      return "===";
+    case ts.SyntaxKind.ExclamationEqualsToken:
+    case ts.SyntaxKind.ExclamationEqualsEqualsToken:
+      return "!==";
+    case ts.SyntaxKind.AmpersandAmpersandToken:
+      return "&&";
+    case ts.SyntaxKind.BarBarToken:
+      return "||";
     default:
       throw new Error(`Unsupported binary operator: ${ts.SyntaxKind[kind]}`);
   }

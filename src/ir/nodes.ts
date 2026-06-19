@@ -13,7 +13,24 @@ export type Type =
   | { kind: "array"; element: Type }
   | { kind: "object"; fields: Field[] };
 
-export type BinaryOp = "+" | "-" | "*" | "/" | "%";
+export type BinaryOp =
+  // arithmetic (number -> number)
+  | "+"
+  | "-"
+  | "*"
+  | "/"
+  | "%"
+  // relational (number -> boolean)
+  | "<"
+  | "<="
+  | ">"
+  | ">="
+  // equality (scalar -> boolean)
+  | "==="
+  | "!=="
+  // logical (boolean -> boolean)
+  | "&&"
+  | "||";
 
 export type Expr =
   | { kind: "num"; value: number }
@@ -21,6 +38,7 @@ export type Expr =
   | { kind: "str"; value: string }
   | { kind: "var"; name: string }
   | { kind: "binary"; op: BinaryOp; left: Expr; right: Expr }
+  | { kind: "unary"; op: "!"; operand: Expr }
   | { kind: "array"; elements: Expr[] }
   | { kind: "index"; arr: Expr; index: Expr }
   | { kind: "object"; properties: { name: string; value: Expr }[] }
@@ -33,7 +51,12 @@ export type Stmt =
   | { kind: "log"; arg: Expr }
   | { kind: "return"; value?: Expr }
   // a bare expression evaluated for effect (e.g. a function call), result discarded
-  | { kind: "exprStmt"; expr: Expr };
+  | { kind: "exprStmt"; expr: Expr }
+  | { kind: "assign"; name: string; value: Expr }
+  | { kind: "if"; cond: Expr; then: Stmt[]; else?: Stmt[] }
+  | { kind: "while"; cond: Expr; body: Stmt[] }
+  // `for (init; cond; update) { body }` — `++`/compound-assign desugar into `update`
+  | { kind: "for"; init?: Stmt; cond?: Expr; update?: Stmt; body: Stmt[] };
 
 // A function's return type, which may be `void` (no value) — distinct from the
 // value types in `Type`.

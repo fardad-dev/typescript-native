@@ -3,5 +3,9 @@
 import { execFileSync } from "child_process";
 
 export function buildExecutable(cppPath: string, outPath: string): void {
-  execFileSync("clang++", ["-std=c++17", cppPath, "-o", outPath], { stdio: "inherit" });
+  // -Werror=return-type turns "non-void function may not return a value" into a
+  // hard error, so control-flow paths that forget to return fail the build.
+  execFileSync("clang++", ["-std=c++17", "-Werror=return-type", cppPath, "-o", outPath], {
+    stdio: "inherit",
+  });
 }
