@@ -3,7 +3,7 @@
 // ts.Program + TypeChecker comes later (see CLAUDE.md roadmap).
 
 import * as ts from "typescript";
-import { Module, Stmt, Expr, BinaryOp, Type } from "../ir/nodes";
+import { Module, Stmt, Expr, BinaryOp, Type, Func, RetType } from "../ir/nodes";
 
 export function lower(fileName: string, source: string): Module {
   const sf = ts.createSourceFile(
@@ -12,11 +12,56 @@ export function lower(fileName: string, source: string): Module {
     ts.ScriptTarget.Latest,
     /*setParentNodes*/ true
   );
-  const stmts: Stmt[] = [];
+  const functions: Func[] = [];
+  const main: Stmt[] = [];
   for (const stmt of sf.statements) {
-    lowerStatement(stmt, stmts);
+    if (ts.isFunctionDeclaration(stmt)) {
+      functions.push(lowerFunction(stmt));
+      continue;
+    }
+    if (ts.isReturnStatement(stmt)) {
+      throw new Error("'return' is only allowed inside a function");
+    }
+    lowerStatement(stmt, main);
   }
-  return { stmts };
+  return { functions, main };
+}
+
+function lowerFunction(fn: ts.FunctionDeclaration): Func {
+  if (!fn.name) throw new Error("Function declarations must be named (v1)");
+  if (!fn.body) throw new Error(`Function '${fn.name.text}' must have a body`);
+
+  const params = fn.parameters.map((p) => {
+    if (!ts.isIdentifier(p.name)) {
+      throw new Error("Only simple parameter names are supported (v1)");
+    }
+    if (!p.type) {
+      throw new Error(`Parameter '${p.name.text}' needs a type annotation`);
+    }
+    const type = lowerType(p.type);
+    if (typeof type !== "string") {
+      throw new Error("Function parameters must be number, boolean, or string (v1)");
+    }
+    return { name: p.name.text, type };
+  });
+
+  if (!fn.type) {
+    throw new Error(`Function '${fn.name.text}' needs a return type annotation`);
+  }
+  let returnType: RetType;
+  if (fn.type.kind === ts.SyntaxKind.VoidKeyword) {
+    returnType = "void";
+  } else {
+    const t = lowerType(fn.type);
+    if (typeof t !== "string") {
+      throw new Error("Function return type must be number, boolean, string, or void (v1)");
+    }
+    returnType = t;
+  }
+
+  const body: Stmt[] = [];
+  for (const s of fn.body.statements) lowerStatement(s, body);
+  return { name: fn.name.text, params, returnType, body };
 }
 
 function lowerStatement(node: ts.Statement, out: Stmt[]): void {
@@ -26,13 +71,24 @@ function lowerStatement(node: ts.Statement, out: Stmt[]): void {
     }
     return;
   }
+  if (ts.isReturnStatement(node)) {
+    out.push({
+      kind: "return",
+      value: node.expression ? lowerExpr(node.expression) : undefined,
+    });
+    return;
+  }
   if (ts.isExpressionStatement(node)) {
-    const call = node.expression;
-    if (ts.isCallExpression(call) && isConsoleLog(call.expression)) {
-      if (call.arguments.length !== 1) {
+    const expr = node.expression;
+    if (ts.isCallExpression(expr) && isConsoleLog(expr.expression)) {
+      if (expr.arguments.length !== 1) {
         throw new Error("console.log expects exactly one argument (v1)");
       }
-      out.push({ kind: "log", arg: lowerExpr(call.arguments[0]) });
+      out.push({ kind: "log", arg: lowerExpr(expr.arguments[0]) });
+      return;
+    }
+    if (ts.isCallExpression(expr)) {
+      out.push({ kind: "exprStmt", expr: lowerExpr(expr) });
       return;
     }
   }
@@ -131,6 +187,16 @@ function lowerExpr(node: ts.Expression): Expr {
   // Both `obj.field` and `arr.length`; resolved by type during codegen.
   if (ts.isPropertyAccessExpression(node)) {
     return { kind: "member", obj: lowerExpr(node.expression), name: node.name.text };
+  }
+  if (ts.isCallExpression(node)) {
+    if (!ts.isIdentifier(node.expression)) {
+      throw new Error("Only direct calls to named functions are supported (v1)");
+    }
+    return {
+      kind: "call",
+      callee: node.expression.text,
+      args: node.arguments.map(lowerExpr),
+    };
   }
   if (ts.isBinaryExpression(node)) {
     return {

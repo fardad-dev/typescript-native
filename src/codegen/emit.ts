@@ -6,12 +6,13 @@
 //   T[]             -> ptr to a stack buffer (`alloca [N x repr(T)]`), compile-time-sized
 //   { ... }         -> ptr to a stack struct (`alloca { repr(f0), repr(f1), ... }`)
 //
-// Arrays and objects are "aggregates": their value IS the pointer to their
-// stack buffer, so referencing them needs no load. Every emitted value carries
-// its IR type (and, for arrays, a compile-time length) so we know its LLVM
-// representation, store/load width, printf format, and how to index/project it.
+// Each tsn function becomes one LLVM `define`; top-level statements become @main.
+// Params and locals both live in stack slots (alloca + load/store) for a uniform
+// variable model. Every emitted value carries its IR type (and, for arrays, a
+// compile-time length) so we know its representation, store/load width, printf
+// format, and how to index/project/return it.
 
-import { Module, Expr, Stmt, BinaryOp, Type, Field } from "../ir/nodes";
+import { Module, Expr, Stmt, BinaryOp, Type, Field, Func, RetType } from "../ir/nodes";
 
 const TARGET_TRIPLE = "arm64-apple-macosx15.0.0";
 
@@ -40,6 +41,9 @@ function isAggregate(t: Type): boolean {
 function reprOf(t: Type): "i64" | "ptr" {
   return typeof t === "object" || t === "string" ? "ptr" : "i64";
 }
+function retRepr(t: RetType): string {
+  return t === "void" ? "void" : reprOf(t);
+}
 
 // The LLVM struct type literal for an object, e.g. `{ i64, ptr }`.
 function structType(o: ObjectType): string {
@@ -47,7 +51,8 @@ function structType(o: ObjectType): string {
   return `{ ${o.fields.map((f) => reprOf(f.type)).join(", ")} }`;
 }
 
-function displayType(t: Type): string {
+function displayType(t: RetType): string {
+  if (t === "void") return "void";
   if (isArray(t)) return `${displayType(t.element)}[]`;
   if (isObject(t)) {
     return `{ ${t.fields.map((f) => `${f.name}: ${displayType(f.type)}`).join("; ")} }`;
@@ -77,19 +82,39 @@ interface Value {
   length?: number;
 }
 
+interface Sig {
+  params: Type[];
+  ret: RetType;
+}
+
 export function emit(mod: Module): string {
   return new Emitter().emitModule(mod);
 }
 
 class Emitter {
-  private body: string[] = [];
+  // Module-level state, shared across functions.
   private globals: string[] = []; // string-literal constants
-  private temp = 0;
   private strCount = 0;
+  private sigs = new Map<string, Sig>();
+
+  // Per-function scratch, reset by emitBody().
+  private body: string[] = [];
+  private temp = 0;
   private vars = new Map<string, { ptr: string; type: Type; length?: number }>();
+  private curReturn: RetType = "void";
+  private terminated = false;
 
   emitModule(mod: Module): string {
-    for (const stmt of mod.stmts) this.emitStmt(stmt);
+    // First pass: collect signatures so calls can reference any function
+    // (including ones declared later, and recursion).
+    for (const fn of mod.functions) {
+      if (this.sigs.has(fn.name)) throw new Error(`Duplicate function '${fn.name}'`);
+      this.sigs.set(fn.name, { params: fn.params.map((p) => p.type), ret: fn.returnType });
+    }
+
+    // Emit bodies first — this populates `globals` with any string constants.
+    const defs = mod.functions.map((fn) => this.emitFunction(fn));
+    defs.push(this.emitMain(mod.main));
 
     return [
       `target triple = "${TARGET_TRIPLE}"`,
@@ -100,12 +125,58 @@ class Emitter {
       ``,
       `declare i32 @printf(ptr, ...)`,
       ``,
+      defs.join("\n\n"),
+      ``,
+    ].join("\n");
+  }
+
+  private resetForFunction(ret: RetType): void {
+    this.body = [];
+    this.temp = 0;
+    this.vars = new Map();
+    this.curReturn = ret;
+    this.terminated = false;
+  }
+
+  private emitFunction(fn: Func): string {
+    this.resetForFunction(fn.returnType);
+
+    const paramList = fn.params.map((p) => `${reprOf(p.type)} %${p.name}`).join(", ");
+    // Spill each param into a stack slot so it behaves like any other local.
+    for (const p of fn.params) {
+      const r = reprOf(p.type);
+      const ptr = `%${p.name}.addr`;
+      this.body.push(`  ${ptr} = alloca ${r}`);
+      this.body.push(`  store ${r} %${p.name}, ptr ${ptr}`);
+      this.vars.set(p.name, { ptr, type: p.type });
+    }
+
+    for (const s of fn.body) {
+      if (this.terminated) break; // ignore code after a `return` (no control flow yet)
+      this.emitStmt(s);
+    }
+    if (!this.terminated) {
+      if (fn.returnType === "void") this.body.push("  ret void");
+      else throw new Error(`Function '${fn.name}' must return a value`);
+    }
+
+    return [
+      `define ${retRepr(fn.returnType)} @${fn.name}(${paramList}) {`,
+      `entry:`,
+      ...this.body,
+      `}`,
+    ].join("\n");
+  }
+
+  private emitMain(stmts: Stmt[]): string {
+    this.resetForFunction("void"); // top-level `return` is rejected during lowering
+    for (const s of stmts) this.emitStmt(s);
+    return [
       `define i32 @main() {`,
       `entry:`,
       ...this.body,
       `  ret i32 0`,
       `}`,
-      ``,
     ].join("\n");
   }
 
@@ -159,13 +230,35 @@ class Emitter {
         }
         const t = this.fresh();
         if (reprOf(val.type) === "ptr") {
-          this.body.push(
-            `  ${t} = call i32 (ptr, ...) @printf(ptr @.fmt.str, ptr ${val.v})`
-          );
+          this.body.push(`  ${t} = call i32 (ptr, ...) @printf(ptr @.fmt.str, ptr ${val.v})`);
         } else {
-          this.body.push(
-            `  ${t} = call i32 (ptr, ...) @printf(ptr @.fmt.int, i64 ${val.v})`
-          );
+          this.body.push(`  ${t} = call i32 (ptr, ...) @printf(ptr @.fmt.int, i64 ${val.v})`);
+        }
+        return;
+      }
+      case "return": {
+        if (this.curReturn === "void") {
+          if (stmt.value) throw new Error("Cannot return a value from a void function");
+          this.body.push(`  ret void`);
+        } else {
+          if (!stmt.value) throw new Error("Missing return value");
+          const val = this.emitExpr(stmt.value);
+          if (!sameType(val.type, this.curReturn)) {
+            throw new Error(
+              `Type '${displayType(val.type)}' is not assignable to return type '${displayType(this.curReturn)}'`
+            );
+          }
+          this.body.push(`  ret ${reprOf(this.curReturn)} ${val.v}`);
+        }
+        this.terminated = true;
+        return;
+      }
+      case "exprStmt": {
+        // Evaluate for effect; discard any result. (Today only calls reach here.)
+        if (stmt.expr.kind === "call") {
+          this.emitCall(stmt.expr, /*asStatement*/ true);
+        } else {
+          this.emitExpr(stmt.expr);
         }
         return;
       }
@@ -299,7 +392,45 @@ class Emitter {
         }
         throw new Error(`Type '${displayType(obj.type)}' has no property '${e.name}'`);
       }
+      case "call": {
+        const val = this.emitCall(e, /*asStatement*/ false);
+        // emitCall throws for void in value position, so val is non-null here.
+        return val!;
+      }
     }
+  }
+
+  // Emit a function call. In statement position a void call is allowed and its
+  // result (if any) discarded; in value position a void call is an error.
+  private emitCall(e: { callee: string; args: Expr[] }, asStatement: boolean): Value | null {
+    const sig = this.sigs.get(e.callee);
+    if (!sig) throw new Error(`Unknown function: ${e.callee}`);
+    if (e.args.length !== sig.params.length) {
+      throw new Error(
+        `Function '${e.callee}' expects ${sig.params.length} argument(s), got ${e.args.length}`
+      );
+    }
+    const args = e.args.map((a, i) => {
+      const val = this.emitExpr(a);
+      if (!sameType(val.type, sig.params[i])) {
+        throw new Error(
+          `Argument ${i + 1} of '${e.callee}': type '${displayType(val.type)}' is not assignable to '${displayType(sig.params[i])}'`
+        );
+      }
+      return `${reprOf(sig.params[i])} ${val.v}`;
+    });
+    const argList = args.join(", ");
+
+    if (sig.ret === "void") {
+      if (!asStatement) {
+        throw new Error(`'${e.callee}' returns void and cannot be used as a value`);
+      }
+      this.body.push(`  call void @${e.callee}(${argList})`);
+      return null;
+    }
+    const t = this.fresh();
+    this.body.push(`  ${t} = call ${reprOf(sig.ret)} @${e.callee}(${argList})`);
+    return { v: t, type: sig.ret };
   }
 }
 

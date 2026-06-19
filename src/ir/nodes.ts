@@ -25,12 +25,33 @@ export type Expr =
   | { kind: "index"; arr: Expr; index: Expr }
   | { kind: "object"; properties: { name: string; value: Expr }[] }
   // member covers both `obj.field` and `arr.length` — the emitter resolves it by type.
-  | { kind: "member"; obj: Expr; name: string };
+  | { kind: "member"; obj: Expr; name: string }
+  | { kind: "call"; callee: string; args: Expr[] };
 
 export type Stmt =
   | { kind: "let"; name: string; type: Type; init: Expr }
-  | { kind: "log"; arg: Expr };
+  | { kind: "log"; arg: Expr }
+  | { kind: "return"; value?: Expr }
+  // a bare expression evaluated for effect (e.g. a function call), result discarded
+  | { kind: "exprStmt"; expr: Expr };
+
+// A function's return type, which may be `void` (no value) — distinct from the
+// value types in `Type`.
+export type RetType = Type | "void";
+
+export interface Param {
+  name: string;
+  type: Type;
+}
+
+export interface Func {
+  name: string;
+  params: Param[];
+  returnType: RetType;
+  body: Stmt[];
+}
 
 export interface Module {
-  stmts: Stmt[];
+  functions: Func[];
+  main: Stmt[]; // top-level statements -> body of LLVM @main
 }
