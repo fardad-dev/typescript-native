@@ -11,6 +11,7 @@
 ## Entry point & shape
 
 `lower(fileName, source): Module` splits top-level statements:
+- `class` declarations → `lowerClass` → `Module.classes`
 - `function` declarations → `lowerFunction` → `Module.functions`
 - everything else → `lowerStatement` → `Module.main` (the body of `@main`)
 - a top-level `return` is rejected (only valid inside a function).
@@ -18,12 +19,18 @@
 ## Internal helpers (one concern each)
 
 - `lowerFunction(fn)` — name, typed params, return type (incl. `void`), body statements.
+- `lowerClass(cls)` — fields (typed, no initializers), one constructor, methods. Rejects
+  inheritance, `static`, accessors, parameter properties, field initializers, and a missing
+  constructor; **ignores** access modifiers (public/private/…). Bodies lower via `lowerStatement`.
+- `lowerParams(params)` — shared typed-parameter lowering (functions, methods, constructors);
+  also rejects parameter-properties (`constructor(private x: ...)`).
 - `lowerStatement(node, out)` — `let`/`const`, `return`, `console.log(...)` (special-cased to a
   `log` stmt), and bare call expressions (`exprStmt`).
 - `lowerVarDecl(decl)` — a single `let`/`const` binding; initializer is required.
-- `lowerType(node)` — TS `TypeNode` → IR `Type` (keywords, `T[]`, `Array<T>`, object type literals).
+- `lowerType(node)` — TS `TypeNode` → IR `Type` (keywords, `T[]`, `Array<T>`, object type literals;
+  a **bare identifier** that isn't a known primitive/`Array` → a `class` instance type).
 - `lowerExpr(node)` — TS `Expression` → IR `Expr` (literals, identifiers, binary, array/object
-  literals, indexing, member access, calls).
+  literals, indexing, member access, calls, `new C(...)`, `this`).
 - `lowerBinaryOp(kind)` — operator token → `BinaryOp`.
 - `isConsoleLog(expr)` — recognizes the `console.log` callee.
 
@@ -39,6 +46,10 @@
 - **Aggregates nest:** object fields and array element types may themselves be aggregates.
   `lowerType` recurses with no scalar-field check, so `{ pts: number[] }`, `{ inner: { x: number } }`,
   `number[][]`, and `{ x: number }[]` all lower to the right nested `Type`.
+- **Class type-refs are open:** `lowerType` maps any bare identifier that isn't a known
+  primitive/`Array` to `{ kind: "class", name }` *without* checking the class exists — the emitter
+  validates that (and reports `Unknown class: X`). Generic refs (with type arguments) still fall
+  through to the "Unsupported type annotation" throw, so e.g. `Map<K, V>` keeps its clear error.
 - **String values come pre-decoded:** use `node.text` for string/template literals (TS already
   resolved escapes); codegen re-encodes them as C++ string literals.
 - **Fail loud:** any unsupported syntax throws `Error("Unsupported ... ")`. Keep messages

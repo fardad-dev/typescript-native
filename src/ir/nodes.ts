@@ -11,7 +11,10 @@ export type Type =
   | "boolean"
   | "string"
   | { kind: "array"; element: Type }
-  | { kind: "object"; fields: Field[] };
+  | { kind: "object"; fields: Field[] }
+  // An instance of a named class. Unlike arrays/objects (value types), a class
+  // instance is a *reference* type — see codegen (compiles to std::shared_ptr<C>).
+  | { kind: "class"; name: string };
 
 export type BinaryOp =
   // arithmetic (number -> number)
@@ -47,7 +50,11 @@ export type Expr =
   | { kind: "member"; obj: Expr; name: string }
   | { kind: "call"; callee: string; args: Expr[] }
   // a method call like `xs.push(v)` — resolved by receiver type during codegen
-  | { kind: "methodCall"; receiver: Expr; method: string; args: Expr[] };
+  | { kind: "methodCall"; receiver: Expr; method: string; args: Expr[] }
+  // `new C(args)` — construct a class instance
+  | { kind: "new"; className: string; args: Expr[] }
+  // `this` inside a method/constructor (only valid as `this.field`/`this.method()`)
+  | { kind: "this" };
 
 export type Stmt =
   // `type` is the annotation; absent means infer from the initializer.
@@ -79,7 +86,26 @@ export interface Func {
   body: Stmt[];
 }
 
+// An instance method. Same shape as a Func minus the (implicit `this`) receiver,
+// which codegen supplies; `this.field`/`this.method()` resolve against the class.
+export interface Method {
+  name: string;
+  params: Param[];
+  returnType: RetType;
+  body: Stmt[];
+}
+
+// A class: fields (declaration order = struct layout), exactly one constructor,
+// and instance methods. Inheritance / static / accessors are not modeled yet.
+export interface ClassDecl {
+  name: string;
+  fields: Field[];
+  ctor: { params: Param[]; body: Stmt[] };
+  methods: Method[];
+}
+
 export interface Module {
+  classes: ClassDecl[];
   functions: Func[];
   main: Stmt[]; // top-level statements -> body of C++ main()
 }

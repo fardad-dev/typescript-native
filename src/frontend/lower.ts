@@ -3,7 +3,18 @@
 // ts.Program + TypeChecker comes later (see CLAUDE.md roadmap).
 
 import * as ts from "typescript";
-import { Module, Stmt, Expr, BinaryOp, Type, Func, RetType } from "../ir/nodes";
+import {
+  Module,
+  Stmt,
+  Expr,
+  BinaryOp,
+  Type,
+  Func,
+  RetType,
+  Param,
+  ClassDecl,
+  Method,
+} from "../ir/nodes";
 
 export function lower(fileName: string, source: string): Module {
   const sf = ts.createSourceFile(
@@ -12,9 +23,14 @@ export function lower(fileName: string, source: string): Module {
     ts.ScriptTarget.Latest,
     /*setParentNodes*/ true
   );
+  const classes: ClassDecl[] = [];
   const functions: Func[] = [];
   const main: Stmt[] = [];
   for (const stmt of sf.statements) {
+    if (ts.isClassDeclaration(stmt)) {
+      classes.push(lowerClass(stmt));
+      continue;
+    }
     if (ts.isFunctionDeclaration(stmt)) {
       functions.push(lowerFunction(stmt));
       continue;
@@ -24,25 +40,121 @@ export function lower(fileName: string, source: string): Module {
     }
     lowerStatement(stmt, main);
   }
-  return { functions, main };
+  return { classes, functions, main };
+}
+
+// Lower a typed parameter list (function, method, or constructor). Each param
+// needs a simple name and an explicit type annotation.
+function lowerParams(params: ts.NodeArray<ts.ParameterDeclaration>): Param[] {
+  return params.map((p) => {
+    if (!ts.isIdentifier(p.name)) {
+      throw new Error("Only simple parameter names are supported (v1)");
+    }
+    // A parameter-property (`constructor(private x: number)`) implicitly declares
+    // and assigns a field — out of subset; declare the field explicitly instead.
+    if (p.modifiers && p.modifiers.length > 0) {
+      throw new Error(
+        "Constructor parameter properties are not supported (v1) — declare the field explicitly",
+      );
+    }
+    if (!p.type) {
+      throw new Error(`Parameter '${p.name.text}' needs a type annotation`);
+    }
+    return { name: p.name.text, type: lowerType(p.type) };
+  });
+}
+
+// `static` is the one modifier that changes semantics (no `this`); reject it.
+// Access modifiers (public/private/protected/readonly) are accepted and ignored
+// — we don't enforce visibility yet, and they don't affect generated code.
+function hasStatic(node: ts.HasModifiers): boolean {
+  return (
+    ts.getModifiers(node)?.some((m) => m.kind === ts.SyntaxKind.StaticKeyword) ??
+    false
+  );
+}
+
+function lowerClass(cls: ts.ClassDeclaration): ClassDecl {
+  if (!cls.name) throw new Error("Class declarations must be named (v1)");
+  const name = cls.name.text;
+  if (cls.heritageClauses && cls.heritageClauses.length > 0) {
+    throw new Error(
+      `Class inheritance (extends/implements) is not supported yet (v1)`,
+    );
+  }
+
+  const fields: ClassDecl["fields"] = [];
+  const methods: Method[] = [];
+  let ctor: ClassDecl["ctor"] | undefined;
+
+  for (const m of cls.members) {
+    if (ts.isPropertyDeclaration(m)) {
+      if (!ts.isIdentifier(m.name)) {
+        throw new Error("Only simple field names are supported (v1)");
+      }
+      if (hasStatic(m)) {
+        throw new Error(`Static members are not supported yet (v1)`);
+      }
+      if (m.initializer) {
+        throw new Error(
+          `Field initializers are not supported yet (v1) — set '${m.name.text}' in the constructor`,
+        );
+      }
+      if (!m.type) {
+        throw new Error(`Field '${m.name.text}' needs a type annotation`);
+      }
+      fields.push({ name: m.name.text, type: lowerType(m.type) });
+      continue;
+    }
+    if (ts.isConstructorDeclaration(m)) {
+      if (ctor) throw new Error(`Class '${name}' has more than one constructor`);
+      if (!m.body) throw new Error(`Constructor of '${name}' must have a body`);
+      const body: Stmt[] = [];
+      for (const s of m.body.statements) lowerStatement(s, body);
+      ctor = { params: lowerParams(m.parameters), body };
+      continue;
+    }
+    if (ts.isMethodDeclaration(m)) {
+      if (!ts.isIdentifier(m.name)) {
+        throw new Error("Only simple method names are supported (v1)");
+      }
+      if (hasStatic(m)) {
+        throw new Error(`Static members are not supported yet (v1)`);
+      }
+      if (!m.body) throw new Error(`Method '${m.name.text}' must have a body`);
+      if (!m.type) {
+        throw new Error(`Method '${m.name.text}' needs a return type annotation`);
+      }
+      const returnType: RetType =
+        m.type.kind === ts.SyntaxKind.VoidKeyword ? "void" : lowerType(m.type);
+      const body: Stmt[] = [];
+      for (const s of m.body.statements) lowerStatement(s, body);
+      methods.push({ name: m.name.text, params: lowerParams(m.parameters), returnType, body });
+      continue;
+    }
+    if (ts.isGetAccessor(m) || ts.isSetAccessor(m)) {
+      throw new Error(`Getters/setters are not supported yet (v1)`);
+    }
+    throw new Error(
+      `Unsupported class member: ${ts.SyntaxKind[m.kind]}`,
+    );
+  }
+
+  if (!ctor) {
+    throw new Error(
+      `Class '${name}' must declare a constructor (v1) — implicit constructors are not supported`,
+    );
+  }
+  return { name, fields, ctor, methods };
 }
 
 function lowerFunction(fn: ts.FunctionDeclaration): Func {
   if (!fn.name) throw new Error("Function declarations must be named (v1)");
   if (!fn.body) throw new Error(`Function '${fn.name.text}' must have a body`);
 
-  const params = fn.parameters.map((p) => {
-    if (!ts.isIdentifier(p.name)) {
-      throw new Error("Only simple parameter names are supported (v1)");
-    }
-    if (!p.type) {
-      throw new Error(`Parameter '${p.name.text}' needs a type annotation`);
-    }
-    // Params may be any supported type now — scalars, arrays, or objects.
-    // Codegen passes aggregates by `const&` (see emit.ts paramType).
-    const type = lowerType(p.type);
-    return { name: p.name.text, type };
-  });
+  // Params may be any supported type — scalars, arrays, objects, or class
+  // instances. Codegen passes aggregates by `const&` and instances by value.
+  const params = lowerParams(fn.parameters);
 
   if (!fn.type) {
     throw new Error(`Function '${fn.name.text}' needs a return type annotation`);
@@ -270,6 +382,13 @@ function lowerType(node: ts.TypeNode): Type {
     if (n === "Array" && node.typeArguments?.length === 1) {
       return { kind: "array", element: lowerType(node.typeArguments[0]) };
     }
+    // A bare identifier that isn't a known primitive/built-in is treated as a
+    // class instance type (`let p: Point`). The emitter validates the class
+    // exists. Generic refs (with type arguments) still fall through as
+    // unsupported, so e.g. `Map<K, V>` keeps its clear "Unsupported type" error.
+    if (!node.typeArguments) {
+      return { kind: "class", name: n };
+    }
   }
   throw new Error(`Unsupported type annotation: ${ts.SyntaxKind[node.kind]}`);
 }
@@ -284,7 +403,18 @@ function lowerExpr(node: ts.Expression): Expr {
   }
   if (node.kind === ts.SyntaxKind.TrueKeyword) return { kind: "bool", value: true };
   if (node.kind === ts.SyntaxKind.FalseKeyword) return { kind: "bool", value: false };
+  if (node.kind === ts.SyntaxKind.ThisKeyword) return { kind: "this" };
   if (ts.isIdentifier(node)) return { kind: "var", name: node.text };
+  if (ts.isNewExpression(node)) {
+    if (!ts.isIdentifier(node.expression)) {
+      throw new Error("'new' requires a class name (v1)");
+    }
+    return {
+      kind: "new",
+      className: node.expression.text,
+      args: node.arguments ? node.arguments.map(lowerExpr) : [],
+    };
+  }
   if (ts.isParenthesizedExpression(node)) return lowerExpr(node.expression);
   if (ts.isArrayLiteralExpression(node)) {
     return {

@@ -22,7 +22,7 @@
 // imprecision — shared with every native-int compilation strategy — is wraparound
 // past 2^63 for integer-valued numbers; `number` is otherwise f64.
 
-import { Module, Expr, Stmt, Type, RetType, Param } from "../ir/nodes";
+import { Module, Expr, Stmt, Type, RetType, Param, ClassDecl } from "../ir/nodes";
 
 export type Rep = "i64" | "f64";
 
@@ -57,6 +57,9 @@ interface Sig {
 
 class RepAnalyzer {
   private sigs = new Map<string, Sig>();
+  private classes = new Map<string, ClassDecl>();
+  // The class whose method/ctor body is being walked (so `this` resolves).
+  private currentClass?: ClassDecl;
   // Only stores demotions (-> "f64"); an absent number slot is optimistically "i64".
   private repOf = new Map<string, Rep>();
   private changed = false;
@@ -65,6 +68,7 @@ class RepAnalyzer {
     for (const fn of mod.functions) {
       this.sigs.set(fn.name, { params: fn.params, ret: fn.returnType });
     }
+    for (const cls of mod.classes) this.classes.set(cls.name, cls);
   }
 
   run(): RepTable {
@@ -78,6 +82,22 @@ class RepAnalyzer {
         const scope = new Map<string, Type>();
         for (const p of fn.params) scope.set(p.name, p.type);
         this.walkAll(fn.body, scope, fn.name, fn.returnType);
+      }
+      // Class constructors and methods are analyzed as their own scopes (keys
+      // `C#$ctor` / `C#method`, matching the emitter), so method-local number
+      // params/locals/returns get the same i64/f64 treatment as free functions,
+      // and a float arg passed from a method demotes the callee's param.
+      for (const cls of this.mod.classes) {
+        this.currentClass = cls;
+        const ctorScope = new Map<string, Type>();
+        for (const p of cls.ctor.params) ctorScope.set(p.name, p.type);
+        this.walkAll(cls.ctor.body, ctorScope, ctorSlotKey(cls.name), "void");
+        for (const m of cls.methods) {
+          const scope = new Map<string, Type>();
+          for (const p of m.params) scope.set(p.name, p.type);
+          this.walkAll(m.body, scope, methodSlotKey(cls.name, m.name), m.returnType);
+        }
+        this.currentClass = undefined;
       }
       this.walkAll(this.mod.main, new Map(), MAIN_KEY, "void");
     } while (this.changed && ++guard < 100000);
@@ -199,6 +219,25 @@ class RepAnalyzer {
         return { type: "string", rep: "f64" };
       case "bool":
         return { type: "boolean", rep: "f64" };
+      case "this":
+        return {
+          type: this.currentClass
+            ? { kind: "class", name: this.currentClass.name }
+            : "number",
+          rep: "f64",
+        };
+      case "new": {
+        const cls = this.classes.get(e.className);
+        e.args.forEach((arg, i) => {
+          const av = this.visit(arg, scope, fk);
+          const p = cls?.ctor.params[i];
+          // A float ctor argument forces the matching ctor param to f64.
+          if (p && p.type === "number" && av.rep === "f64") {
+            this.demote(varSlot(ctorSlotKey(e.className), p.name));
+          }
+        });
+        return { type: { kind: "class", name: e.className }, rep: "f64" };
+      }
       case "var": {
         const t = scope.get(e.name) ?? "number";
         return {
@@ -259,6 +298,12 @@ class RepAnalyzer {
           const field = obj.type.fields.find((f) => f.name === e.name);
           if (field) return { type: field.type, rep: "f64" };
         }
+        if (typeof obj.type === "object" && obj.type.kind === "class") {
+          const field = this.classes
+            .get(obj.type.name)
+            ?.fields.find((f) => f.name === e.name);
+          if (field) return { type: field.type, rep: "f64" };
+        }
         return { type: "number", rep: "f64" };
       }
       case "call": {
@@ -278,7 +323,24 @@ class RepAnalyzer {
         };
       }
       case "methodCall": {
-        this.visit(e.receiver, scope, fk);
+        const recv = this.visit(e.receiver, scope, fk);
+        // Instance method: demote its number params from float args (like a
+        // call), and report its return type. Number returns are treated as f64
+        // (matching the emitter), so no method retRep is queried.
+        if (typeof recv.type === "object" && recv.type.kind === "class") {
+          const className = recv.type.name;
+          const method = this.classes
+            .get(className)
+            ?.methods.find((m) => m.name === e.method);
+          e.args.forEach((arg, i) => {
+            const av = this.visit(arg, scope, fk);
+            const p = method?.params[i];
+            if (p && p.type === "number" && av.rep === "f64") {
+              this.demote(varSlot(methodSlotKey(className, e.method), p.name));
+            }
+          });
+          return { type: method ? method.returnType : "number", rep: "f64" };
+        }
         e.args.forEach((a) => this.visit(a, scope, fk));
         switch (e.method) {
           case "toUpperCase":
@@ -304,4 +366,12 @@ function varSlot(funcKey: string, name: string): string {
 }
 function retSlot(funcName: string): string {
   return `${funcName}::$ret`;
+}
+// Scope keys for a class's methods / constructor — must match the emitter's
+// methodKey / ctorKey so both sides look up the same number-rep slots.
+function methodSlotKey(className: string, method: string): string {
+  return `${className}#${method}`;
+}
+function ctorSlotKey(className: string): string {
+  return `${className}#$ctor`;
 }

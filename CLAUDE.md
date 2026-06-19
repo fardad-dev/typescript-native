@@ -81,7 +81,7 @@ npm test            # run the e2e suite once (vitest run)
 npm run test:watch  # re-run on change — the TDD red->green loop
 ```
 
-The suite (currently **52 cases**, all green) auto-discovers every `tests/cases/*.ts`,
+The suite (currently **59 cases**, all green) auto-discovers every `tests/cases/*.ts`,
 compiles it to a real native binary, runs it, and diffs stdout against the matching
 `.expected` file. **Every feature gets a `tests/cases/*.ts` + `.expected` pair**, ideally
 written first (red), then implemented to green. See [tests/CLAUDE.md](tests/CLAUDE.md).
@@ -113,6 +113,13 @@ Implemented and tested end-to-end:
 - **Functions:** top-level, typed params + return type, `return`, calls, `void`; recursion works.
   Params and returns may be **arrays and objects**, not just scalars — aggregate params pass by
   `const&` (read-only in the callee), aggregate returns by value (RVO/move).
+- **Classes:** `class C { f: T; constructor(...) {…}; method(...): R {…} }`, `new C(...)`,
+  `this.field` / `this.method()` (read + write), instances in variables / params / returns / arrays.
+  Instances are **reference types** (`new` is shared; `let b = a` aliases, so a mutation through one
+  is visible through the other; `a === b` is identity), unlike value-typed object literals. Access
+  modifiers (`public`/`private`/…) are accepted and ignored. **Deferred** (clean `tsnc:` errors):
+  `extends`/`implements`, `static`, get/set accessors, parameter properties, field initializers,
+  no-constructor classes, and bare `this` as a value.
 
 ### Representation / behavior notes (read these — they bite)
 
@@ -125,6 +132,7 @@ tsn types map onto C++ types (see [src/codegen/CLAUDE.md](src/codegen/CLAUDE.md)
 | string   | `tsn_str`          | ref-counted immutable string; copy = pointer + refcount bump (no char copy); methods → `tsn_*` helpers |
 | `T[]`    | `std::vector<T>`   | heap-backed; `.length` → `.size()`; `.push()` → `push_back` |
 | `{ ... }`| generated `struct` | one struct per distinct field shape                         |
+| class `C`| `std::shared_ptr<C>` | **reference** type: `new C()` is heap + ref-counted; copy/assign aliases (shared mutation, identity via `==`); `struct C { fields; ctor; methods; }` |
 
 - **`number` is f64, but integer-valued numbers use a 64-bit integer representation.** A
   pre-pass ([src/codegen/repr.ts](src/codegen/repr.ts)) infers, per variable / parameter / return,
@@ -270,6 +278,21 @@ pair** (red → green).
       before outer (correct C++ order); nested numbers stay f64. `console.log` of an aggregate is
       still a clean error (JS-style printing is the separate *Richer `console.log`* item); an empty
       array field (`{ pts: [] }`) still errors (no element type to infer).
+- [x] **Classes (basic shape)** — fields, one constructor, instance methods, `new C(...)`,
+      `this.field` / `this.method()` (read + write), instances in variables / params / returns /
+      arrays. The design decision the roadmap flagged was **identity**: instances are *reference*
+      types, solved by compiling a class to `struct C { fields; ctor; methods; }` and an instance to
+      `std::shared_ptr<C>` — exactly the "heap + ref-counted, like `tsn_str`" the roadmap called for,
+      and reference semantics (aliasing, shared mutation, `===` identity) fall out for free. Methods
+      and the constructor are first-class analyzed scopes (keys `C#method` / `C#$ctor`), so `repr.ts`
+      gives method-local numbers the same i64/f64 treatment *and* keeps cross-calls sound; fields are
+      always f64. Instances are deliberately **not** `isAggregate` — they pass **by value** (a
+      `shared_ptr` copy = a refcount bump) and stay **mutable**, so a callee's `p.x = …` is visible to
+      the caller (JS reference semantics), whereas value-typed array/object params are `const&`/
+      read-only. Classes are forward-declared so fields can reference a later/self class; method/ctor
+      bodies are emitted out-of-line. Deferred (clean `tsnc:` errors): `extends`/`implements`,
+      `static`, accessors, parameter properties, field initializers, no-constructor classes, and bare
+      `this` as a value. `console.log` of an instance is a clean error (see *Richer `console.log`*).
 
 ### Will support — core completeness
 
@@ -283,14 +306,10 @@ pair** (red → green).
 
 ### Later
 
-- [ ] **Classes** — `class C { f: T; constructor(...) {…}; method(...): R {…} }`, `new C(...)`,
-      `this`, field access and method calls. Fields reuse the struct generation that object
-      literals already have, and methods lower to member functions (or free functions taking the
-      receiver). The real design decision is **identity**: JS objects are *reference* types
-      (`new C()` is shared, two variables can alias and see each other's mutations), which clashes
-      with the value semantics used for object literals today — so class instances likely need a
-      reference representation (heap-allocated + ref-counted, like `tsn_str`) rather than by-value
-      structs. `extends` / inheritance, `private`/`public`, and `static` members come after the
-      basic shape works.
+- [ ] **Classes — beyond the basic shape** — the basic shape is done (see above). Still to come:
+      `extends` / inheritance (base-struct layout + virtual dispatch + `super(...)`), enforcing
+      `private`/`public`/`protected`/`readonly` visibility, `static` members, get/set accessors,
+      parameter properties, field initializers (default member init), and bare `this` as a value
+      (via `std::enable_shared_from_this`, so `let b = this` / passing `this` around works).
 - [ ] **Closures, modules, generics** — first-class function values, `import`/`export`, and
       type parameters.

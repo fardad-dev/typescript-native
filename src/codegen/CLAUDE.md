@@ -14,6 +14,7 @@ real lowering — no SSA temporaries or pointer bookkeeping here.
 | `string`            | `tsn_str`            | ref-counted immutable string (prelude struct); copy = pointer + refcount bump, so array shuffles don't copy chars. Every string expr is a `tsn_str` (literals too: `tsn_str("…")`); operators (`<` `==` `+` `<<`) and `.str()`/`.size()` are defined on it; methods → `tsn_*` helpers (take `const std::string&` via its conversion; mostly return `tsn_str`, but `split` returns `std::vector<tsn_str>`) |
 | `T[]`               | `std::vector<T>`     | `.length` → `static_cast<long long>(v.size())` (i64); `.push()` → `push_back`; `.join(sep?)` → `tsn_join` (`string[]`/`number[]` → `tsn_str`); index cast to `std::size_t` |
 | `{ ... }`           | generated `struct`   | `structName()` dedupes by field shape; number fields use the f64 rep |
+| class `C`           | `std::shared_ptr<C>` | **reference** type (not an `isAggregate`): `struct C { fields; ctor; methods; }`, instance is a shared_ptr — `new` → `make_shared`, `.field`/`.method()` via `->`. See *Classes* below |
 
 **Aggregates nest.** `T` (array element) and a field type may themselves be aggregates, so
 `cppType` recurses: `number[][]` → `std::vector<std::vector<double>>`, `{ pts: number[] }` →
@@ -96,11 +97,41 @@ Functions take and return aggregates (arrays/objects), not just scalars:
   result is bound (`let r = f()` → elision) or consumed — never gratuitously. Returning a `const&`
   param does copy (you can't move from a const ref), but that's a rare, semantically-needed copy.
 
+## Classes
+
+A class compiles to `struct C { fields; C(ctor); methods; };` and an **instance** to
+`std::shared_ptr<C>` (`cppType`). This is the roadmap's "heap + ref-counted" representation, and JS
+reference semantics fall out for free: copy/assign shares the pointee (aliases see each other's
+mutations), `===` is `shared_ptr::operator==` (identity), and the refcount frees the instance.
+
+- **Emission order** (`emitModule`): forward-declare every class (`struct C;`) → object structs
+  (`structDefs`) → class struct definitions (`emitClassStruct`: field members + ctor/method
+  **declarations**) → out-of-line **definitions** (`emitClassDefs` → `emitCtorDef`/`emitMethodDef`)
+  → functions → main. Forward decls let a field reference a later/self class via `shared_ptr`; the
+  out-of-line bodies see every class complete. Building a class struct calls `cppType` on field
+  types, which lazily generates any object structs they need (placed earlier, so the order holds).
+- **Methods/ctor are analyzed scopes.** They use scope keys `C#method` / `C#$ctor`
+  (`methodKey`/`ctorKey`), matching `repr.ts` (`methodSlotKey`/`ctorSlotKey`), so their number
+  params/locals/returns get the same i64/f64 reps as free functions via `slotType`/`retSlotType`/
+  `paramType`. **Fields are always f64** (`cppType(number)` = `double`), like object fields. Class-
+  method *number returns* are treated as f64 (sound; matches the string-method path) — no method
+  retRep is queried. `emitCtorDef`/`emitMethodDef` set `currentClass` + bind params, then emit.
+- **`this` and receivers.** `thisValue()` yields `{code:"this", type: class}`; `emitReceiver(e)`
+  shortcuts a `this` receiver to that (else `emitExpr`). Member access / method call are uniformly
+  `(code)->name` because both `shared_ptr<C>` and the raw `this` pointer use `->`. Bare `this` as a
+  value is rejected (the `emitExpr` `case "this"` throws) — only `this.field` / `this.method()`.
+- **Params: by value, mutable.** An instance is **not** an `isAggregate`, so `paramType` passes it
+  by value (`std::shared_ptr<C>` — a refcount bump, not marked `readonly`). Mutation through the
+  param (`p.x = …`) is allowed and visible to the caller — correct JS reference semantics, the
+  opposite of the read-only `const&` array/object params above. `new`/method args are type-checked
+  by the shared `checkArgs` (no per-arg `f64SlotCode` cast — reps are reconciled by `repr.ts`).
+
 ## Guard clauses
 
 Unsupported constructs throw a clear `Error` (→ `tsnc: <message>`) instead of emitting bad
 C++: string concatenation of incompatible types, arithmetic on aggregates, `console.log` of an
-array/object, indexing a non-array, missing/duplicate fields, type-mismatched assignment, wrong
-arg count/type, missing `return`, and **mutating a `const&` aggregate param** (see Function
-boundaries above). Concat of unsupported types stays trivial to *enable* given the C++ target,
-but is guarded until intentionally added.
+array/object/**class instance**, indexing a non-array, missing/duplicate fields, type-mismatched
+assignment, wrong arg count/type, missing `return`, **mutating a `const&` aggregate param** (see
+Function boundaries above), an **unknown class** (`new X` / a `: X` annotation with no class `X`),
+an **unknown method/field** on a class, and **bare `this`** used as a value. Concat of unsupported
+types stays trivial to *enable* given the C++ target, but is guarded until intentionally added.

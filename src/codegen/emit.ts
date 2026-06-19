@@ -29,6 +29,9 @@ import {
   Field,
   Func,
   RetType,
+  Param,
+  ClassDecl,
+  Method,
 } from "../ir/nodes";
 import { analyze, RepTable, Rep, litRep, combineRep, MAIN_KEY } from "./repr";
 
@@ -55,6 +58,7 @@ const EQUALITY = new Set<BinaryOp>(["===", "!=="]);
 
 type ArrayType = { kind: "array"; element: Type };
 type ObjectType = { kind: "object"; fields: Field[] };
+type ClassType = { kind: "class"; name: string };
 
 function isArray(t: Type): t is ArrayType {
   return typeof t === "object" && t.kind === "array";
@@ -62,12 +66,19 @@ function isArray(t: Type): t is ArrayType {
 function isObject(t: Type): t is ObjectType {
   return typeof t === "object" && t.kind === "object";
 }
+// A class instance is a *reference* type, deliberately NOT an "aggregate": those
+// (array/object) are value types passed by const& and read-only, whereas an
+// instance is a shared_ptr passed by value and freely mutable (see paramType).
+function isClass(t: Type): t is ClassType {
+  return typeof t === "object" && t.kind === "class";
+}
 function isAggregate(t: Type): boolean {
   return isArray(t) || isObject(t);
 }
 
 function displayType(t: RetType): string {
   if (t === "void") return "void";
+  if (isClass(t)) return t.name;
   if (isArray(t)) return `${displayType(t.element)}[]`;
   if (isObject(t)) {
     return `{ ${t.fields.map((f) => `${f.name}: ${displayType(f.type)}`).join("; ")} }`;
@@ -76,6 +87,8 @@ function displayType(t: RetType): string {
 }
 
 function sameType(a: Type, b: Type): boolean {
+  // Class instances are nominal: equal iff they name the same class.
+  if (isClass(a) || isClass(b)) return isClass(a) && isClass(b) && a.name === b.name;
   if (isArray(a) && isArray(b)) return sameType(a.element, b.element);
   if (isObject(a) && isObject(b)) {
     if (a.fields.length !== b.fields.length) return false;
@@ -110,6 +123,7 @@ export function emit(mod: Module): string {
 class Emitter {
   // Module-level state.
   private sigs = new Map<string, Sig>();
+  private classes = new Map<string, ClassDecl>(); // class name -> declaration
   private structDefs: string[] = []; // generated `struct ... { ... };` lines
   private structNames = new Map<string, string>(); // field-shape key -> struct name
 
@@ -121,6 +135,9 @@ class Emitter {
   private vars = new Map<string, Type>();
   private curReturn: RetType = "void";
   private funcKey: string = MAIN_KEY; // scope key for repr lookups
+  // The class whose method/constructor body is being emitted (so `this` resolves);
+  // undefined inside free functions and main.
+  private currentClass?: ClassDecl;
   private indent = "  ";
   // Names of aggregate (array/object) params: passed by `const&`, so read-only
   // inside the function. Consulted to reject mutation-through-param with a clear
@@ -130,7 +147,13 @@ class Emitter {
   emitModule(mod: Module): string {
     this.reps = analyze(mod); // decide each number slot's representation
 
-    // First pass: collect signatures so calls can reference any function.
+    // First pass: collect class declarations and function signatures so any
+    // construct can reference any class/function regardless of source order.
+    for (const cls of mod.classes) {
+      if (this.classes.has(cls.name))
+        throw new Error(`Duplicate class '${cls.name}'`);
+      this.classes.set(cls.name, cls);
+    }
     for (const fn of mod.functions) {
       if (this.sigs.has(fn.name))
         throw new Error(`Duplicate function '${fn.name}'`);
@@ -141,9 +164,17 @@ class Emitter {
     }
 
     // Emit bodies first — this populates structDefs as object types are seen.
+    // Class struct definitions are built before their out-of-line method/ctor
+    // bodies, and both before functions/main; all populate structDefs.
+    const classStructs = mod.classes.map((c) => this.emitClassStruct(c));
+    const classDefs = mod.classes.flatMap((c) => this.emitClassDefs(c));
     const protos = mod.functions.map((fn) => this.prototype(fn));
     const defs = mod.functions.map((fn) => this.emitFunction(fn));
     const mainDef = this.emitMain(mod.main);
+    // Forward-declare every class so fields/params can reference a class defined
+    // later (or itself) through `std::shared_ptr<C>` (a pointer to an incomplete
+    // type is fine), and object structs can hold instances.
+    const classFwd = mod.classes.map((c) => `struct ${c.name};`);
 
     return [
       `#include <array>`,
@@ -151,6 +182,7 @@ class Emitter {
       `#include <charconv>`,
       `#include <cmath>`,
       `#include <iostream>`,
+      `#include <memory>`,
       `#include <string>`,
       `#include <utility>`,
       `#include <vector>`,
@@ -337,7 +369,14 @@ class Emitter {
       `  return tsn_str(out);`,
       `}`,
       ``,
+      // Ordering matters for C++: forward class decls, then object structs (may
+      // hold instances via shared_ptr), then full class struct definitions (their
+      // fields may use object structs by value), then out-of-line class method/
+      // ctor bodies (all types complete), then functions, then main.
+      ...(classFwd.length ? [...classFwd, ``] : []),
       ...(this.structDefs.length ? [...this.structDefs, ``] : []),
+      ...(classStructs.length ? [classStructs.join("\n\n"), ``] : []),
+      ...(classDefs.length ? [classDefs.join("\n\n"), ``] : []),
       ...(protos.length ? [...protos, ``] : []),
       defs.join("\n\n"),
       ...(defs.length ? [``] : []),
@@ -351,6 +390,7 @@ class Emitter {
   private cppType(t: Type): string {
     if (isArray(t)) return `std::vector<${this.cppType(t.element)}>`;
     if (isObject(t)) return this.structName(t);
+    if (isClass(t)) return `std::shared_ptr<${t.name}>`; // reference-typed instance
     if (t === "number") return "double"; // f64 rep — the default for nested aggregates
     if (t === "boolean") return "bool";
     return "tsn_str"; // string — a ref-counted immutable string (see prelude)
@@ -391,18 +431,34 @@ class Emitter {
 
   // --- functions ----------------------------------------------------------
 
-  // C++ type of a function parameter. Scalars pass by value (a `tsn_str` copy is
-  // just a refcount bump); aggregates pass by `const&`, so a whole vector/struct
-  // isn't copied into the callee. The `const` also turns JS-incompatible
-  // mutation-through-param into a clean error rather than a silent divergence.
+  // C++ type of a parameter. Scalars pass by value (a `tsn_str` copy is just a
+  // refcount bump); aggregates pass by `const&`, so a whole vector/struct isn't
+  // copied into the callee (the `const` also turns JS-incompatible mutation-
+  // through-param into a clean error). A class instance is a *reference* type, so
+  // it passes by value (a `shared_ptr` copy = a refcount bump) and stays mutable
+  // — mutating it through the param is visible to the caller, matching JS.
   private paramType(fnName: string, p: { name: string; type: Type }): string {
+    if (isClass(p.type)) return this.cppType(p.type);
     if (isAggregate(p.type)) return `const ${this.cppType(p.type)}&`;
     return this.slotType(p.type, this.reps.varRep(fnName, p.name));
   }
 
+  // `type name` declarators for a parameter list (used in definitions).
+  private declParams(funcKey: string, params: Param[]): string {
+    return params.map((p) => `${this.paramType(funcKey, p)} ${p.name}`).join(", ");
+  }
+
+  // Register parameters as local variables; aggregate params are `const&`, hence
+  // read-only (class-instance params are mutable, so they are not marked).
+  private bindParams(params: Param[]): void {
+    for (const p of params) {
+      this.vars.set(p.name, p.type);
+      if (isAggregate(p.type)) this.readonlyParams.add(p.name);
+    }
+  }
+
   private prototype(fn: Func): string {
-    const params = fn.params.map((p) => this.paramType(fn.name, p)).join(", ");
-    return `${this.retSlotType(fn.name, fn.returnType)} ${fn.name}(${params});`;
+    return `${this.retSlotType(fn.name, fn.returnType)} ${fn.name}(${this.declParams(fn.name, fn.params)});`;
   }
 
   private resetForFunction(ret: RetType, funcKey: string): void {
@@ -410,27 +466,92 @@ class Emitter {
     this.vars = new Map();
     this.curReturn = ret;
     this.funcKey = funcKey;
+    this.currentClass = undefined;
     this.indent = "  ";
     this.readonlyParams = new Set();
   }
 
   private emitFunction(fn: Func): string {
     this.resetForFunction(fn.returnType, fn.name);
-    for (const p of fn.params) {
-      this.vars.set(p.name, p.type);
-      // Aggregate params arrive as `const&` — mark them read-only.
-      if (isAggregate(p.type)) this.readonlyParams.add(p.name);
-    }
+    this.bindParams(fn.params);
     for (const s of fn.body) this.emitStmt(s);
-
-    const params = fn.params
-      .map((p) => `${this.paramType(fn.name, p)} ${p.name}`)
-      .join(", ");
     return [
-      `${this.retSlotType(fn.name, fn.returnType)} ${fn.name}(${params}) {`,
+      `${this.retSlotType(fn.name, fn.returnType)} ${fn.name}(${this.declParams(fn.name, fn.params)}) {`,
       ...this.body,
       `}`,
     ].join("\n");
+  }
+
+  // --- classes ------------------------------------------------------------
+  //
+  // A class `C` compiles to `struct C { fields; C(ctor); methods; }` and an
+  // instance to `std::shared_ptr<C>` (see cppType). Methods/ctor are analyzed by
+  // repr.ts under the scope keys below, so their number params/locals/returns get
+  // the same i64/f64 treatment as free functions; the emitter uses the same keys.
+  private methodKey(className: string, method: string): string {
+    return `${className}#${method}`;
+  }
+  private ctorKey(className: string): string {
+    return `${className}#$ctor`;
+  }
+
+  // The struct: field members, a constructor declaration, and method
+  // declarations. Definitions are emitted out-of-line (emitClassDefs) so a method
+  // body can reference any class. Calling cppType on field types here also lazily
+  // generates any object structs the fields need (into structDefs).
+  private emitClassStruct(cls: ClassDecl): string {
+    const members = cls.fields.map((f) => `  ${this.cppType(f.type)} ${f.name};`);
+    const ctorDecl = `  ${cls.name}(${this.declParams(this.ctorKey(cls.name), cls.ctor.params)});`;
+    const methodDecls = cls.methods.map((m) => {
+      const key = this.methodKey(cls.name, m.name);
+      return `  ${this.retSlotType(key, m.returnType)} ${m.name}(${this.declParams(key, m.params)});`;
+    });
+    return [`struct ${cls.name} {`, ...members, ctorDecl, ...methodDecls, `};`].join("\n");
+  }
+
+  // Out-of-line constructor and method definitions for one class.
+  private emitClassDefs(cls: ClassDecl): string[] {
+    return [this.emitCtorDef(cls), ...cls.methods.map((m) => this.emitMethodDef(cls, m))];
+  }
+
+  private emitCtorDef(cls: ClassDecl): string {
+    const key = this.ctorKey(cls.name);
+    this.resetForFunction("void", key);
+    this.currentClass = cls;
+    this.bindParams(cls.ctor.params);
+    for (const s of cls.ctor.body) this.emitStmt(s);
+    return [
+      `${cls.name}::${cls.name}(${this.declParams(key, cls.ctor.params)}) {`,
+      ...this.body,
+      `}`,
+    ].join("\n");
+  }
+
+  private emitMethodDef(cls: ClassDecl, m: Method): string {
+    const key = this.methodKey(cls.name, m.name);
+    this.resetForFunction(m.returnType, key);
+    this.currentClass = cls;
+    this.bindParams(m.params);
+    for (const s of m.body) this.emitStmt(s);
+    return [
+      `${this.retSlotType(key, m.returnType)} ${cls.name}::${m.name}(${this.declParams(key, m.params)}) {`,
+      ...this.body,
+      `}`,
+    ].join("\n");
+  }
+
+  // The receiver of a member access / method call. `this` resolves to the current
+  // class instance (a raw `C*` in a member-function body); everything else is a
+  // normal expression. Both `shared_ptr<C>` and `C*` use `->`, so member/method
+  // access is uniformly `(code)->name` regardless of which one the receiver is.
+  private thisValue(): Value {
+    if (!this.currentClass) {
+      throw new Error("'this' is only valid inside a method or constructor");
+    }
+    return { code: "this", type: { kind: "class", name: this.currentClass.name } };
+  }
+  private emitReceiver(e: Expr): Value {
+    return e.kind === "this" ? this.thisValue() : this.emitExpr(e);
   }
 
   private emitMain(stmts: Stmt[]): string {
@@ -570,7 +691,12 @@ class Emitter {
         };
       }
       case "member": {
-        const obj = this.emitExpr(target.obj);
+        const obj = this.emitReceiver(target.obj);
+        // `instance.field = …` — mutating through a class reference is fine (the
+        // shared_ptr aliases shared storage, so JS reference semantics hold).
+        if (isClass(obj.type)) {
+          return this.classField(obj, target.name);
+        }
         if (!isObject(obj.type)) {
           throw new Error(
             `Cannot assign to property '${target.name}' of '${displayType(obj.type)}'`,
@@ -606,6 +732,11 @@ class Emitter {
         if (isObject(val.type)) {
           throw new Error(
             "console.log of an object is not supported yet (log fields individually)",
+          );
+        }
+        if (isClass(val.type)) {
+          throw new Error(
+            "console.log of a class instance is not supported yet (log fields individually)",
           );
         }
         // f64 numbers print JS-style via to_chars; an i64 number is already an
@@ -787,7 +918,7 @@ class Emitter {
         };
       }
       case "member": {
-        const obj = this.emitExpr(e.obj);
+        const obj = this.emitReceiver(e.obj);
         // `arr.length` / `str.length` — size() is a non-negative integer (i64).
         if (isArray(obj.type) || obj.type === "string") {
           if (e.name === "length") {
@@ -814,9 +945,32 @@ class Emitter {
             rep: field.type === "number" ? "f64" : undefined,
           };
         }
+        // `instance.field` — `->` through the shared_ptr/`this`; fields are f64.
+        if (isClass(obj.type)) {
+          return this.classField(obj, e.name);
+        }
         throw new Error(
           `Type '${displayType(obj.type)}' has no property '${e.name}'`,
         );
+      }
+      case "this":
+        // Bare `this` as a value is not supported; member/methodCall/emitLValue
+        // shortcut `this` via emitReceiver, so reaching here means a misuse.
+        throw new Error(
+          "'this' may only be used as 'this.field' or 'this.method(...)' (v1)",
+        );
+      case "new": {
+        const cls = this.classes.get(e.className);
+        if (!cls) throw new Error(`Unknown class: ${e.className}`);
+        const args = this.checkArgs(
+          e.className,
+          cls.ctor.params.map((p) => p.type),
+          e.args,
+        );
+        return {
+          code: `std::make_shared<${e.className}>(${args.join(", ")})`,
+          type: { kind: "class", name: e.className },
+        };
       }
       case "call": {
         const val = this.emitCall(e, /*asStatement*/ false);
@@ -831,6 +985,43 @@ class Emitter {
         return { code: val.code, type: val.type as Type, rep };
       }
     }
+  }
+
+  // A field load/lvalue on a class instance: `(recv)->field`. Fields use the f64
+  // rep, like object fields. Shared by emitExpr and emitLValue.
+  private classField(recv: Value, name: string): Value {
+    const cls = this.classes.get((recv.type as ClassType).name)!;
+    const field = cls.fields.find((f) => f.name === name);
+    if (!field) {
+      throw new Error(
+        `Property '${name}' does not exist on class '${cls.name}'`,
+      );
+    }
+    return {
+      code: `(${recv.code})->${name}`,
+      type: field.type,
+      rep: field.type === "number" ? "f64" : undefined,
+    };
+  }
+
+  // Type-check a call/ctor argument list against parameter types and return each
+  // argument's C++ code. Reps are reconciled by repr.ts (a float arg demotes the
+  // matching param slot), so no per-argument cast is needed here.
+  private checkArgs(who: string, params: Type[], args: Expr[]): string[] {
+    if (args.length !== params.length) {
+      throw new Error(
+        `'${who}' expects ${params.length} argument(s), got ${args.length}`,
+      );
+    }
+    return args.map((a, i) => {
+      const val = this.emitExpr(a);
+      if (!sameType(val.type, params[i])) {
+        throw new Error(
+          `Argument ${i + 1} of '${who}': type '${displayType(val.type)}' is not assignable to '${displayType(params[i])}'`,
+        );
+      }
+      return val.code;
+    });
   }
 
   private emitBinary(e: { op: BinaryOp; left: Expr; right: Expr }): Value {
@@ -951,7 +1142,10 @@ class Emitter {
     e: { receiver: Expr; method: string; args: Expr[] },
     asStatement: boolean,
   ): { code: string; type: RetType } {
-    const recv = this.emitExpr(e.receiver);
+    const recv = this.emitReceiver(e.receiver);
+    if (isClass(recv.type)) {
+      return this.emitInstanceMethod(recv, e, asStatement);
+    }
     if (recv.type === "string") {
       return this.emitStringMethod(recv, e);
     }
@@ -1001,6 +1195,35 @@ class Emitter {
     throw new Error(
       `Type '${displayType(recv.type)}' has no method '${e.method}'`,
     );
+  }
+
+  // Emit an instance method call: `(recv)->method(args)`. The method is resolved
+  // on the receiver's class; args are type-checked against its parameters. A void
+  // method is callable only in statement position (like a void function).
+  private emitInstanceMethod(
+    recv: Value,
+    e: { method: string; args: Expr[] },
+    asStatement: boolean,
+  ): { code: string; type: RetType } {
+    const cls = this.classes.get((recv.type as ClassType).name)!;
+    const method = cls.methods.find((m) => m.name === e.method);
+    if (!method) {
+      throw new Error(`Class '${cls.name}' has no method '${e.method}'`);
+    }
+    const args = this.checkArgs(
+      `${cls.name}.${e.method}`,
+      method.params.map((p) => p.type),
+      e.args,
+    );
+    if (method.returnType === "void" && !asStatement) {
+      throw new Error(
+        `'${cls.name}.${e.method}' returns void and cannot be used as a value`,
+      );
+    }
+    return {
+      code: `(${recv.code})->${e.method}(${args.join(", ")})`,
+      type: method.returnType,
+    };
   }
 
   // Emit a string method call. Each maps to a tsn_* runtime helper that mirrors
