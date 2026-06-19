@@ -74,9 +74,11 @@ The goal is a small but complete pipeline. These features compile and run today:
 - **Types:** `number`, `boolean`, `string`, number/string **arrays** (`T[]`), and object
   literals with typed fields (`{ x: number; y: number }`).
 - **`console.log(...)`** for numbers, booleans, and strings.
-- **Arithmetic:** `+ - * / %` (`number` is IEEE double, so `5 / 2 === 2.5`)
-- **Comparisons & logic:** `< <= > >= === !==`, `&& || !`
-- **Strings:** literals and concatenation (`"a" + b`; numbers coerce, e.g. `"n=" + 5`)
+- **Arithmetic:** `+ - * / %` (`number` is IEEE double, so `5 / 2 === 2.5`), unary `-` / `+`
+- **Comparisons & logic:** `< <= > >= === !==` (numbers and strings), `&& || !`
+- **Strings:** literals, concatenation (`"a" + b`; numbers coerce, e.g. `"n=" + 5`), lexicographic
+  comparison, `s.length`, indexing `s[i]`, and methods `substring` / `slice` / `indexOf` /
+  `charAt` / `charCodeAt` / `toUpperCase` / `toLowerCase`
 - **Variables:** `let` / `const` (the type is inferred when you omit the annotation; `var` is
   not supported), assignment (`x = e`, `a[i] = e`, `obj.f = e`, `+=`, `i++`)
 - **Control flow:** `if` / `else`, `while`, `for`
@@ -99,6 +101,12 @@ console.log(xs.length); // 3
 
 let p: { x: number; y: number } = { x: 3, y: 4 };
 console.log(p.x + p.y); // 7
+
+let name = "Ada Lovelace";
+console.log(name.length); // 12
+console.log(name.toUpperCase()); // ADA LOVELACE
+console.log(name.slice(0, 3)); // Ada
+console.log("apple" < "banana"); // 1  (lexicographic; booleans print as 1/0)
 ```
 
 > `console.log` currently takes **exactly one argument**. A `let`/`const` without a type

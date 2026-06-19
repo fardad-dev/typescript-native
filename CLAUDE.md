@@ -81,7 +81,7 @@ npm test            # run the e2e suite once (vitest run)
 npm run test:watch  # re-run on change — the TDD red->green loop
 ```
 
-The suite (currently **26 cases**, all green) auto-discovers every `tests/cases/*.ts`,
+The suite (currently **33 cases**, all green) auto-discovers every `tests/cases/*.ts`,
 compiles it to a real native binary, runs it, and diffs stdout against the matching
 `.expected` file. **Every feature gets a `tests/cases/*.ts` + `.expected` pair**, ideally
 written first (red), then implemented to green. See [tests/CLAUDE.md](tests/CLAUDE.md).
@@ -93,9 +93,13 @@ Implemented and tested end-to-end:
 - **Types:** `number`, `boolean`, `string`, arrays (`T[]` / `Array<T>`), object literal types
   (`{ x: number; y: string }`).
 - **Values:** numeric/boolean/string literals, array literals `[...]`, object literals `{...}`.
-- **Operators:** arithmetic `+ - * / %`, comparison `< <= > >= === !==`, logical `&& || !`,
-  string concatenation (`"a" + b`, numbers coerce), array indexing `a[i]`, member access
-  `obj.field`, array `.length`.
+- **Operators:** arithmetic `+ - * / %`, unary `-` / `+` (`-x`, `-5`), comparison
+  `< <= > >= === !==` (numbers **and** strings — strings compare lexicographically), logical
+  `&& || !`, string concatenation (`"a" + b`, numbers coerce), array indexing `a[i]`, member
+  access `obj.field`, array `.length`.
+- **Strings:** literals, concatenation, lexicographic comparison, `s.length`, character access
+  `s[i]` (→ a one-char string), and methods `substring` / `slice` / `indexOf` / `charAt` /
+  `charCodeAt` / `toUpperCase` / `toLowerCase` (JS `String.prototype` semantics, ASCII).
 - **`console.log(x)`** for numbers/booleans and strings.
 - **Variables:** `let` / `const` (initializer required); a type annotation is optional — without
   one the type is **inferred from the initializer**. `var` is **not supported** (errors). Assignment
@@ -112,7 +116,7 @@ tsn types map onto C++ types (see [src/codegen/CLAUDE.md](src/codegen/CLAUDE.md)
 | -------- | ------------------ | ----------------------------------------------------------- |
 | number   | `double`           | IEEE f64 — `5 / 2 === 2.5`; printed JS-style via `to_chars` |
 | boolean  | `bool`             | `std::cout` prints `1` / `0`                                |
-| string   | `std::string`      | literals are `const char*`, convert implicitly              |
+| string   | `std::string`      | literals are `const char*`, convert implicitly; methods → `tsn_*` helpers |
 | `T[]`    | `std::vector<T>`   | heap-backed; `.length` → `.size()`; `.push()` → `push_back` |
 | `{ ... }`| generated `struct` | one struct per distinct field shape                         |
 
@@ -172,18 +176,19 @@ pair** (red → green).
       an integer-remainder fast path for integer-valued operands (`tsn_mod`).
 - [x] **Strings & arrays (basics)** — concatenation `"a" + b` (numbers coerce); `string[]`;
       array literals incl. empty `[]`; indexing `a[i]`; array `.length`; `xs.push(v)`.
+- [x] **Strings (full scalar surface)** — unary `-`/`+`; lexicographic comparison
+      `< <= > >= === !==`; `s.length`; character access `s[i]`; methods `substring` / `slice` /
+      `indexOf` / `charAt` / `charCodeAt` / `toUpperCase` / `toLowerCase` (JS semantics, via
+      `tsn_*` runtime helpers).
 - [x] **Native-speed backend** — `clang++ -O3`; ~10–17× faster than `node app.ts` for normal
       program sizes (Node's startup/JIT-warmup tax dominates), ~parity on sustained hot loops
       (where V8's JIT has fully warmed).
 
 ### Will support — strings (next; needed by the word-sort benchmark)
 
-- [ ] **String comparison** `< <= > >=` — lexicographic (`std::string` supports it directly);
-      lets words be sorted without carrying a parallel numeric key array.
-- [ ] **String length & char access** — `s.length`, `s[i]`, `s.charCodeAt(i)` — inspect/sort
-      by character (e.g. alphabetize by first letter from the string itself).
 - [ ] **`split` / `join`** — `paragraph.split(" ")` → `string[]`, `words.join(" ")` → `string`,
-      so a real paragraph can be tokenized and reassembled in-language.
+      so a real paragraph can be tokenized and reassembled in-language. (Blocked on returning a
+      `string[]` from a method — ties into lifting the scalar-only boundary below.)
 
 ### Will support — core completeness
 

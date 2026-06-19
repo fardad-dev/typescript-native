@@ -11,7 +11,7 @@ real lowering — no SSA temporaries or pointer bookkeeping here.
 | ------------------- | -------------------- | ------------------------------------------------------ |
 | `number`            | `double`             | IEEE f64; `%` → `std::fmod`; printed via `tsn_num_to_string` |
 | `boolean`           | `bool`               | `std::cout` prints `1`/`0`                             |
-| `string`            | `std::string`        | literals are `const char*`, convert implicitly         |
+| `string`            | `std::string`        | literals are `const char*`, convert implicitly; `<`/`==` force std::string ops (not pointer compare); `s.length`→`.size()`; `s[i]`→one-char string; methods → `tsn_*` helpers |
 | `T[]`               | `std::vector<T>`     | `.length` → `static_cast<double>(v.size())`; `.push()` → `push_back`; index cast to `std::size_t` |
 | `{ ... }`           | generated `struct`   | `structName()` dedupes by field shape                  |
 

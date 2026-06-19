@@ -38,7 +38,8 @@ export type Expr =
   | { kind: "str"; value: string }
   | { kind: "var"; name: string }
   | { kind: "binary"; op: BinaryOp; left: Expr; right: Expr }
-  | { kind: "unary"; op: "!"; operand: Expr }
+  // `!e` (boolean) and unary `-e` / `+e` (number).
+  | { kind: "unary"; op: "!" | "-" | "+"; operand: Expr }
   | { kind: "array"; elements: Expr[] }
   | { kind: "index"; arr: Expr; index: Expr }
   | { kind: "object"; properties: { name: string; value: Expr }[] }

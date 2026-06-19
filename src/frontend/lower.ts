@@ -341,8 +341,17 @@ function lowerExpr(node: ts.Expression): Expr {
       args: node.arguments.map(lowerExpr),
     };
   }
-  if (ts.isPrefixUnaryExpression(node) && node.operator === ts.SyntaxKind.ExclamationToken) {
-    return { kind: "unary", op: "!", operand: lowerExpr(node.operand) };
+  // Prefix `!e`, `-e`, `+e`. (`++`/`--` are handled as assignments, not here.)
+  if (ts.isPrefixUnaryExpression(node)) {
+    if (node.operator === ts.SyntaxKind.ExclamationToken) {
+      return { kind: "unary", op: "!", operand: lowerExpr(node.operand) };
+    }
+    if (node.operator === ts.SyntaxKind.MinusToken) {
+      return { kind: "unary", op: "-", operand: lowerExpr(node.operand) };
+    }
+    if (node.operator === ts.SyntaxKind.PlusToken) {
+      return { kind: "unary", op: "+", operand: lowerExpr(node.operand) };
+    }
   }
   if (ts.isBinaryExpression(node)) {
     return {

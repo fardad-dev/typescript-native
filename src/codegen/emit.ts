@@ -126,6 +126,7 @@ class Emitter {
 
     return [
       `#include <array>`,
+      `#include <cctype>`,
       `#include <charconv>`,
       `#include <cmath>`,
       `#include <iostream>`,
@@ -153,6 +154,67 @@ class Emitter {
       `    if ((double)ia == a && (double)ib == b) return (double)(ia % ib);`,
       `  }`,
       `  return std::fmod(a, b);`,
+      `}`,
+      ``,
+      // String methods, matching JS String.prototype semantics. Indices are JS
+      // numbers (doubles): NaN (the sentinel an omitted optional arg lowers to)
+      // means "default"; otherwise truncate toward zero, then clamp. substring
+      // clamps negatives to 0 and swaps a start > end; slice counts negatives
+      // from the end. indexOf returns a 0-based position or -1.
+      `static std::string tsn_substring(const std::string& s, double startD, double endD) {`,
+      `  long long len = (long long)s.size();`,
+      `  long long start = std::isnan(startD) ? 0 : (long long)startD;`,
+      `  long long end = std::isnan(endD) ? len : (long long)endD;`,
+      `  if (start < 0) start = 0;`,
+      `  if (end < 0) end = 0;`,
+      `  if (start > len) start = len;`,
+      `  if (end > len) end = len;`,
+      `  if (start > end) { long long t = start; start = end; end = t; }`,
+      `  return s.substr((std::size_t)start, (std::size_t)(end - start));`,
+      `}`,
+      ``,
+      `static std::string tsn_slice(const std::string& s, double startD, double endD) {`,
+      `  long long len = (long long)s.size();`,
+      `  long long start = std::isnan(startD) ? 0 : (long long)startD;`,
+      `  long long end = std::isnan(endD) ? len : (long long)endD;`,
+      `  if (start < 0) start = len + start;`,
+      `  if (end < 0) end = len + end;`,
+      `  if (start < 0) start = 0;`,
+      `  if (end < 0) end = 0;`,
+      `  if (start > len) start = len;`,
+      `  if (end > len) end = len;`,
+      `  if (start >= end) return std::string();`,
+      `  return s.substr((std::size_t)start, (std::size_t)(end - start));`,
+      `}`,
+      ``,
+      `static double tsn_index_of(const std::string& s, const std::string& sub, double fromD) {`,
+      `  long long from = std::isnan(fromD) ? 0 : (long long)fromD;`,
+      `  if (from < 0) from = 0;`,
+      `  if (from > (long long)s.size()) return sub.empty() ? (double)s.size() : -1.0;`,
+      `  std::size_t pos = s.find(sub, (std::size_t)from);`,
+      `  return pos == std::string::npos ? -1.0 : (double)pos;`,
+      `}`,
+      ``,
+      `static std::string tsn_char_at(const std::string& s, double idxD) {`,
+      `  long long i = std::isnan(idxD) ? 0 : (long long)idxD;`,
+      `  if (i < 0 || i >= (long long)s.size()) return std::string();`,
+      `  return std::string(1, s[(std::size_t)i]);`,
+      `}`,
+      ``,
+      `static double tsn_char_code_at(const std::string& s, double idxD) {`,
+      `  long long i = std::isnan(idxD) ? 0 : (long long)idxD;`,
+      `  if (i < 0 || i >= (long long)s.size()) return NAN;`,
+      `  return (double)(unsigned char)s[(std::size_t)i];`,
+      `}`,
+      ``,
+      `static std::string tsn_to_upper(std::string s) {`,
+      `  for (char& c : s) c = (char)std::toupper((unsigned char)c);`,
+      `  return s;`,
+      `}`,
+      ``,
+      `static std::string tsn_to_lower(std::string s) {`,
+      `  for (char& c : s) c = (char)std::tolower((unsigned char)c);`,
+      `  return s;`,
       `}`,
       ``,
       ...(this.structDefs.length ? [...this.structDefs, ``] : []),
@@ -461,9 +523,15 @@ class Emitter {
         return this.emitBinary(e);
       case "unary": {
         const v = this.emitExpr(e.operand);
-        if (v.type !== "boolean")
-          throw new Error("Operator '!' expects a boolean");
-        return { code: `(!${v.code})`, type: "boolean" };
+        if (e.op === "!") {
+          if (v.type !== "boolean")
+            throw new Error("Operator '!' expects a boolean");
+          return { code: `(!${v.code})`, type: "boolean" };
+        }
+        // unary `-` / `+` — numeric negation / identity.
+        if (v.type !== "number")
+          throw new Error(`Operator '${e.op}' expects a number`);
+        return { code: `(${e.op}${v.code})`, type: "number" };
       }
       case "array": {
         if (e.elements.length === 0) {
@@ -507,7 +575,7 @@ class Emitter {
       }
       case "index": {
         const arr = this.emitExpr(e.arr);
-        if (!isArray(arr.type)) {
+        if (!isArray(arr.type) && arr.type !== "string") {
           throw new Error(
             `Cannot index a value of type '${displayType(arr.type)}'`,
           );
@@ -516,11 +584,13 @@ class Emitter {
         if (idx.type !== "number") {
           throw new Error("Array index must be a number");
         }
-        // `number` is a double; vector::operator[] needs an integer index.
-        return {
-          code: `${arr.code}[static_cast<std::size_t>(${idx.code})]`,
-          type: arr.type.element,
-        };
+        // `number` is a double; operator[] needs an integer index.
+        const at = `${arr.code}[static_cast<std::size_t>(${idx.code})]`;
+        // `s[i]` on a string yields a one-char string (JS has no char type).
+        if (arr.type === "string") {
+          return { code: `std::string(1, ${at})`, type: "string" };
+        }
+        return { code: at, type: arr.type.element };
       }
       case "member": {
         const obj = this.emitExpr(e.obj);
@@ -533,6 +603,16 @@ class Emitter {
             };
           }
           throw new Error(`Arrays have no property '${e.name}'`);
+        }
+        // `str.length` — std::string::size() as a number (double). A bare string
+        // literal is a `const char*`, which has no `.size()`; wrap it so the call
+        // resolves. (Any other string-typed expression is already a std::string.)
+        if (obj.type === "string") {
+          if (e.name === "length") {
+            const s = e.obj.kind === "str" ? `std::string(${obj.code})` : `(${obj.code})`;
+            return { code: `static_cast<double>(${s}.size())`, type: "number" };
+          }
+          throw new Error(`Strings have no property '${e.name}'`);
         }
         // `obj.field`
         if (isObject(obj.type)) {
@@ -564,6 +644,15 @@ class Emitter {
     const r = this.emitExpr(e.right);
     const code = `(${l.code} ${CPP_OP[e.op]} ${r.code})`;
 
+    // String comparison (relational + equality). A bare string literal is a
+    // `const char*`, so two literals would compare pointers; wrapping the left
+    // literal forces std::string's lexicographic operators (a mixed
+    // `const char* OP std::string` already resolves the right way).
+    const stringCmp = () => {
+      const left = e.left.kind === "str" ? `std::string(${l.code})` : l.code;
+      return `(${left} ${CPP_OP[e.op]} ${r.code})`;
+    };
+
     if (ARITH.has(e.op)) {
       // `+` with a string operand is concatenation (numbers coerce via the same
       // JS-style formatter; std::string(...) on the left makes operator+ resolve
@@ -593,8 +682,12 @@ class Emitter {
       return { code: arithCode, type: "number" };
     }
     if (RELATIONAL.has(e.op)) {
+      // Lexicographic ordering on strings (std::string compares this way).
+      if (l.type === "string" && r.type === "string") {
+        return { code: stringCmp(), type: "boolean" };
+      }
       if (l.type !== "number" || r.type !== "number") {
-        throw new Error(`Operator '${e.op}' expects numbers`);
+        throw new Error(`Operator '${e.op}' expects numbers or strings`);
       }
       return { code, type: "boolean" };
     }
@@ -607,6 +700,10 @@ class Emitter {
         throw new Error(
           `Cannot compare '${displayType(l.type)}' and '${displayType(r.type)}' with '${e.op}'`,
         );
+      }
+      // Value comparison for strings (not the `const char*` pointer compare).
+      if (l.type === "string") {
+        return { code: stringCmp(), type: "boolean" };
       }
       return { code, type: "boolean" };
     }
@@ -647,13 +744,16 @@ class Emitter {
     return { code: `${e.callee}(${args.join(", ")})`, type: sig.ret };
   }
 
-  // Emit a method call. Currently only `array.push(v)` — statement-only (its
-  // result can't be used as a value yet), mapped to std::vector::push_back.
+  // Emit a method call: `array.push(v)` (statement-only, → push_back) or one of
+  // the string methods (substring/slice/indexOf/charAt/toUpperCase/toLowerCase).
   private emitMethodCall(
     e: { receiver: Expr; method: string; args: Expr[] },
     asStatement: boolean,
   ): { code: string; type: RetType } {
     const recv = this.emitExpr(e.receiver);
+    if (recv.type === "string") {
+      return this.emitStringMethod(recv, e);
+    }
     if (isArray(recv.type)) {
       if (e.method === "push") {
         if (e.args.length !== 1) {
@@ -677,6 +777,80 @@ class Emitter {
     throw new Error(
       `Type '${displayType(recv.type)}' has no method '${e.method}'`,
     );
+  }
+
+  // Emit a string method call. Each maps to a tsn_* runtime helper that mirrors
+  // the matching String.prototype semantics; an omitted optional numeric arg is
+  // passed as NAN, which the helper reads as "default". recv may be a bare
+  // `const char*` literal — every helper takes `const std::string&`/`std::string`,
+  // so it converts implicitly.
+  private emitStringMethod(
+    recv: Value,
+    e: { method: string; args: Expr[] },
+  ): { code: string; type: RetType } {
+    const s = recv.code;
+    const argv = e.args.map((a) => this.emitExpr(a));
+
+    // Require `lo..hi` args, all numbers; returns their codes (NAN-padded to hi).
+    const numArgs = (lo: number, hi: number): string[] => {
+      if (argv.length < lo || argv.length > hi) {
+        const want = lo === hi ? `${lo}` : `${lo}-${hi}`;
+        throw new Error(
+          `'${e.method}' expects ${want} argument(s), got ${argv.length}`,
+        );
+      }
+      for (const a of argv) {
+        if (a.type !== "number") {
+          throw new Error(`'${e.method}' arguments must be numbers`);
+        }
+      }
+      return Array.from({ length: hi }, (_, i) => argv[i]?.code ?? "NAN");
+    };
+
+    switch (e.method) {
+      case "toUpperCase":
+        numArgs(0, 0);
+        return { code: `tsn_to_upper(${s})`, type: "string" };
+      case "toLowerCase":
+        numArgs(0, 0);
+        return { code: `tsn_to_lower(${s})`, type: "string" };
+      case "charAt": {
+        const [i] = numArgs(1, 1);
+        return { code: `tsn_char_at(${s}, ${i})`, type: "string" };
+      }
+      case "charCodeAt": {
+        const [i] = numArgs(1, 1);
+        return { code: `tsn_char_code_at(${s}, ${i})`, type: "number" };
+      }
+      case "substring": {
+        const [start, end] = numArgs(1, 2);
+        return { code: `tsn_substring(${s}, ${start}, ${end})`, type: "string" };
+      }
+      case "slice": {
+        const [start, end] = numArgs(1, 2);
+        return { code: `tsn_slice(${s}, ${start}, ${end})`, type: "string" };
+      }
+      case "indexOf": {
+        if (argv.length < 1 || argv.length > 2) {
+          throw new Error(
+            `'indexOf' expects 1-2 argument(s), got ${argv.length}`,
+          );
+        }
+        if (argv[0].type !== "string") {
+          throw new Error("'indexOf' search argument must be a string");
+        }
+        if (argv.length === 2 && argv[1].type !== "number") {
+          throw new Error("'indexOf' fromIndex must be a number");
+        }
+        const from = argv.length === 2 ? argv[1].code : "NAN";
+        return {
+          code: `tsn_index_of(${s}, ${argv[0].code}, ${from})`,
+          type: "number",
+        };
+      }
+      default:
+        throw new Error(`Unsupported string method '${e.method}'`);
+    }
   }
 }
 

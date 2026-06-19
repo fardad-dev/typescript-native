@@ -1,0 +1,10 @@
+let a = "apple";
+let b = "banana";
+console.log(a < b);
+console.log(a > b);
+console.log(a <= "apple");
+console.log(b >= "cherry");
+console.log(a === "apple");
+console.log(a === b);
+console.log(a !== b);
+console.log("ab" < "abc");

@@ -1,0 +1,10 @@
+let s = "Hello, World";
+console.log(s.toUpperCase());
+console.log(s.toLowerCase());
+console.log(s.substring(0, 5));
+console.log(s.substring(7));
+console.log(s.slice(-5));
+console.log(s.slice(0, -7));
+console.log(s.indexOf("World"));
+console.log(s.indexOf("xyz"));
+console.log(s.charAt(1));
