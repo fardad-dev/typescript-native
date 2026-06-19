@@ -35,7 +35,7 @@ which makes heap-backed values like strings and arrays straightforward.)
 | ------------------- | ------------------------------------------------------------------- |
 | Compiler language   | **TypeScript**, run on Node (>= 22)                                 |
 | Front-end (parsing) | **Official `typescript` package** — reuse its lexer/parser          |
-| Backend             | **Emit C++ source**, compile with **`clang++ -std=c++17`**          |
+| Backend             | **Emit C++ source**, compile with **`clang++ -std=c++17 -O3`**      |
 | Target              | native binary for this host (Apple Silicon / arm64 macOS)           |
 | CLI                 | **commander**                                                       |
 | Tests               | **vitest** (end-to-end: compile → run → diff stdout)                |
@@ -81,7 +81,7 @@ npm test            # run the e2e suite once (vitest run)
 npm run test:watch  # re-run on change — the TDD red->green loop
 ```
 
-The suite (currently **12 cases**, all green) auto-discovers every `tests/cases/*.ts`,
+The suite (currently **26 cases**, all green) auto-discovers every `tests/cases/*.ts`,
 compiles it to a real native binary, runs it, and diffs stdout against the matching
 `.expected` file. **Every feature gets a `tests/cases/*.ts` + `.expected` pair**, ideally
 written first (red), then implemented to green. See [tests/CLAUDE.md](tests/CLAUDE.md).
@@ -116,7 +116,8 @@ tsn types map onto C++ types (see [src/codegen/CLAUDE.md](src/codegen/CLAUDE.md)
 | `T[]`    | `std::vector<T>`   | heap-backed; `.length` → `.size()`; `.push()` → `push_back` |
 | `{ ... }`| generated `struct` | one struct per distinct field shape                         |
 
-- **`number` is `double`.** `%` compiles to an fmod-based modulo; array indices are cast to an integer.
+- **`number` is `double`.** `%` compiles to the `tsn_mod` helper (`std::fmod`, with a hardware
+  integer-remainder fast path when both operands are integer-valued); array indices cast to integer.
 - **Inference picks the concrete C++ type.** An unannotated declaration takes its type from the
   initializer; an integer literal becomes `int` (`const a = 12` → `int a = 12`), a decimal becomes
   `double`, etc. An annotated `: number` is always `double`. `var` is rejected during lowering.
@@ -157,25 +158,48 @@ int main() {
 }
 ```
 
-## Roadmap / known limits
+## Roadmap
 
-**Done** — the foundational basics:
+Ordering principle: correctness of core types → completeness of what already exists → new
+capabilities → robustness tooling. **Every item ships with a `tests/cases/*.ts` + `.expected`
+pair** (red → green).
+
+### Done
 
 - [x] **`if` / `while` / `for`** — control flow (+ comparison/logical operators, recursion).
 - [x] **Assignment** — `x = e`, `a[i] = e`, `obj.f = e`, compound `+= …`, `i++` / `i--`.
-- [x] **`f64` numbers** — `number` is IEEE double (`5 / 2 === 2.5`); `%` via `std::fmod`.
-- [x] **String concatenation + array `push`** — `"a" + b` (numbers coerce); `xs.push(v)` and
-      empty array literals (`let xs: number[] = []`).
+- [x] **`f64` numbers** — `number` is IEEE double (`5 / 2 === 2.5`); `%` via `std::fmod`, with
+      an integer-remainder fast path for integer-valued operands (`tsn_mod`).
+- [x] **Strings & arrays (basics)** — concatenation `"a" + b` (numbers coerce); `string[]`;
+      array literals incl. empty `[]`; indexing `a[i]`; array `.length`; `xs.push(v)`.
+- [x] **Native-speed backend** — `clang++ -O3`; ~10–17× faster than `node app.ts` for normal
+      program sizes (Node's startup/JIT-warmup tax dominates), ~parity on sustained hot loops
+      (where V8's JIT has fully warmed).
 
-**Planned — ordered most-essential first.** Ordering principle: correctness of core types →
-completeness of what already exists → new capabilities → robustness tooling.
+### Will support — strings (next; needed by the word-sort benchmark)
 
-1. [ ] **Lift scalar-only boundaries** — pass/return arrays and objects to functions (C++ value
-   semantics make this safe now). Drop the front-end's scalar-only checks on params/returns.
-2. [ ] **Full `ts.Program` + TypeChecker** — replace AST-annotation reading with real semantic
-   diagnostics; abort before codegen on type errors.
+- [ ] **String comparison** `< <= > >=` — lexicographic (`std::string` supports it directly);
+      lets words be sorted without carrying a parallel numeric key array.
+- [ ] **String length & char access** — `s.length`, `s[i]`, `s.charCodeAt(i)` — inspect/sort
+      by character (e.g. alphabetize by first letter from the string itself).
+- [ ] **`split` / `join`** — `paragraph.split(" ")` → `string[]`, `words.join(" ")` → `string`,
+      so a real paragraph can be tokenized and reassembled in-language.
 
-**Smaller follow-ups:** more array methods (`pop`/`indexOf`), `push` as a value (returns length),
-boolean/aggregate in `console.log`, `string[]`/object array fields.
+### Will support — core completeness
 
-Later: classes, closures, modules, generics.
+- [ ] **Lift scalar-only boundaries** — pass/return arrays and objects to/from functions (C++
+      value semantics make this safe now). Drop the front-end's scalar-only checks.
+- [ ] **More array methods** — `pop`, `indexOf`, `slice`; `push` as a value (returns length).
+- [ ] **Richer `console.log`** — booleans as `true`/`false`; arrays/objects printed JS-style.
+
+### Will support — correctness & performance
+
+- [ ] **Full `ts.Program` + TypeChecker** — real semantic diagnostics; abort before codegen on
+      type errors instead of reading AST annotations.
+- [ ] **Integer fast path for `number`** — emit `long long` for provably integer-valued numbers
+      (keep `double` for fractional), for ~2× on integer-heavy loops (matches Rust/Go/C++; see
+      `benchmark/`). This is the one remaining compute-speed lever over Node.
+
+### Later
+
+Classes, closures, modules, generics.
