@@ -1,6 +1,6 @@
 {
   "name": "tsn-compiler",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "AOT compiler: a TypeScript subset -> LLVM IR -> native executable",
   "license": "MIT",
   "author": "Fardad Mohammadi",
