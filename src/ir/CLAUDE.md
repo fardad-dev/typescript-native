@@ -19,6 +19,8 @@ is added or changed.
   - `{ kind: "promise"; value?: Type }` — `Promise<T>` (the result type of an `async` function and a
     first-class value); `value` absent = `Promise<void>`. A reference type too (codegen → the C++20
     coroutine type `tsn_promise<…>`); resolved numbers use the f64 rep.
+  - `{ kind: "response" }` — the `Response` of a `fetch(...)` — a built-in reference type
+    (codegen → `std::shared_ptr<tsn_response>`): fields `status`/`ok`, methods `text()`/`json()`.
 - **`BinaryOp`** — `"+" | "-" | "*" | "/" | "%"`.
 - **`Expr`** (discriminated union) — `num`, `bool`, `str`, `var`, `binary`, `ternary`
   (`cond ? whenTrue : whenFalse`; branches share a type = the result type), `unary`, `array`,
@@ -27,9 +29,11 @@ is added or changed.
   (`{ text; type }` — the parse target type, since `JSON.parse` is `any` and the subset needs a
   concrete type; carried from a `JSON.parse(text) as T` assertion or an annotated target),
   `mathCall` (`{ fn; args }` — a `Math.<fn>(...)` builtin) / `mathConst` (`{ name }` — `Math.PI`, …),
-  `mapNew` (`{ key; value }`) / `setNew` (`{ element; init? }` — `new Set<T>(arr?)`), and the async
+  `mapNew` (`{ key; value }`) / `setNew` (`{ element; init? }` — `new Set<T>(arr?)`), the async
   trio `await` (`{ expr }` — `co_await`), `promiseResolve` (`{ arg }` — `Promise.resolve`), and
-  `promiseAll` (`{ arg }` — `Promise.all`).
+  `promiseAll` (`{ arg }` — `Promise.all`), and the fetch pair `fetch` (`{ url }` — a blocking GET
+  returning a settled `Promise<Response>`) / `responseJson` (`{ receiver; type }` — `res.json()` as
+  a `Promise<T>`; the target `type` is captured up front since `Response.json()` is `Promise<any>`).
 - **`Stmt`** — `let`, `log`, `return`, `exprStmt` (a bare expression evaluated for effect),
   `assign`, and the control-flow statements: `if`, `while`, `for`, `doWhile`, `forOf`
   (`{ name; iterable; body }`), `forIn` (`{ name; target; body }`), `switch` (`{ disc; cases }`

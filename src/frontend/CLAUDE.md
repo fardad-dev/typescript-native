@@ -90,8 +90,8 @@ A multi-file program is assembled from per-file `lower` results by `loadProgram`
   the `const x: T = JSON.parse(text)` idiom: when annotated and the initializer is a `JSON.parse`
   call, the annotation supplies the parse target type (→ a `jsonParse` node).
 - `lowerType(node)` — TS `TypeNode` → IR `Type` (keywords, `T[]`, `Array<T>`, `Map<K, V>` / `Set<T>`,
-  `Promise<T>` / `Promise<void>` → a promise type, object type literals; a **bare identifier** that
-  isn't a known primitive/built-in → a `class` instance type).
+  `Promise<T>` / `Promise<void>` → a promise type, `Response` → the `fetch` response type, object type
+  literals; a **bare identifier** that isn't a known primitive/built-in → a `class` instance type).
 - `lowerExpr(node)` — TS `Expression` → IR `Expr` (literals, identifiers, binary, ternary
   (`cond ? a : b`), unary, array/object literals, indexing, member access, calls, `new C(...)`,
   `this`, and the **non-null assertion `e!`** — lowered transparently as `lowerExpr(e)`, since it
@@ -103,9 +103,14 @@ A multi-file program is assembled from per-file `lower` results by `loadProgram`
   (`tryLowerMathCall` / `lowerMathConst`, intercepted before the generic method/member path),
   `new Map<K, V>()` / `new Set<T>(arr?)` (`lowerNewMap` / `lowerNewSet`, intercepted before the
   generic `new C(...)` path), the `Promise.*` statics (`tryLowerPromiseCall` — `Promise.resolve` /
-  `Promise.all`; reject/race/etc. are clean errors), and **`await e`** (→ an `await` node — kept
+  `Promise.all`; reject/race/etc. are clean errors), the **`fetch(url)`** builtin
+  (`tryLowerFetchCall` — a plain call to the global `fetch`, intercepted like the namespaced
+  builtins; a 2nd options arg is a clean v1 error), and **`await e`** (→ an `await` node — kept
   even in statement position, `await f();`, since the suspension matters). `new Promise(executor)`
-  is a clean `tsnc:` error (needs closures).
+  is a clean `tsnc:` error (needs closures). The `as`-expression branch accepts one form beyond
+  `JSON.parse(text) as T`: **`await res.json() as T`** (and `const x: T = await res.json()` in
+  `lowerVarDecl`) — `Response.json()` is `Promise<any>`, so the target type is captured into a
+  `responseJson` node (`responseJsonCall` / `responseJsonAwaitNode`), since the subset has no `any`.
 - `lowerBinaryOp(kind)` — operator token → `BinaryOp`.
 - `isConsoleLog(expr)` — recognizes the `console.log` callee.
 - `tryLowerJsonCall(node)` / `isJsonParseCall(node)` / `jsonParseNode(call, type)` — recognize and

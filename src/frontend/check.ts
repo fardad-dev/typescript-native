@@ -16,9 +16,17 @@
 import * as ts from "typescript";
 
 // A virtual file declaring the globals the tsn subset relies on. `log` takes any
-// args so `console.log(x)` type-checks for every value type in the subset.
+// args so `console.log(x)` type-checks for every value type in the subset. `fetch`
+// + `Response` are declared here (not loaded from the DOM lib, which we omit) —
+// a synchronous-but-Promise-shaped subset of the real API: a URL-only GET, and a
+// `Response` with `status`/`ok` and `text()`/`json()`. `json()` is `Promise<any>`
+// (the subset has no `any`, so lowering requires a target type: `await res.json()
+// as T` or an annotated target — like JSON.parse).
 const GLOBALS_FILE = "__tsn_globals__.d.ts";
-const GLOBALS_SOURCE = `declare var console: { log(...data: any[]): void; };\n`;
+const GLOBALS_SOURCE =
+  `declare var console: { log(...data: any[]): void; };\n` +
+  `interface Response { readonly status: number; readonly ok: boolean; text(): Promise<string>; json(): Promise<any>; }\n` +
+  `declare function fetch(url: string): Promise<Response>;\n`;
 
 // Strict checking on the ES2020 lib. `strict` turns on the full suite of sound
 // checks (noImplicitAny, strictNullChecks, …); the unused-local/parameter checks

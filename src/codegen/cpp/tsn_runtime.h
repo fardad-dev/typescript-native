@@ -234,6 +234,16 @@ static tsn_promise<T> tsn_resolve(T v) {
   return p;
 }
 
+// A promise already *rejected* with `reason` (used by `fetch` on a transport
+// error). Like `tsn_resolve` but settles to status 2, so `await`ing it re-throws
+// the reason string — catchable by an ordinary `try`/`catch`.
+template <class T>
+static tsn_promise<T> tsn_reject(tsn_str reason) {
+  tsn_promise<T> p;
+  p.state->reject(std::move(reason));
+  return p;
+}
+
 // `Promise.all(ps)`: itself a coroutine that awaits each input promise in order
 // and resolves to an array of the results (rejecting if any input rejects). The
 // inputs already run concurrently (an async function starts when called), so the
@@ -245,6 +255,67 @@ static tsn_promise<std::shared_ptr<std::vector<T>>> tsn_all(
   for (auto& p : *ps) out->push_back(co_await p);
   co_return out;
 }
+
+// --- fetch: a blocking HTTP GET behind a Promise<Response> ---------------
+//
+// The microtask runtime has no async I/O, so `fetch(url)` does a *blocking*
+// libcurl GET and returns an already-settled promise. `await fetch(url)` still
+// defers one microtask tick (await_ready is always false), so JS ordering holds.
+// A `Response` is a reference type (shared_ptr<tsn_response>): `status`/`ok`
+// fields plus a buffered `body`; `text()`/`json()` (emitted by codegen) return
+// already-resolved promises over `body`. The struct itself is unconditional (it
+// only uses tsn_str), so a function signature mentioning `Response` compiles even
+// in a program that links without libcurl; only `tsn_fetch` needs curl.
+struct tsn_response {
+  double status;  // HTTP status code (f64, like every number field)
+  bool ok;        // status in 200..=299
+  tsn_str body;   // the response body, read eagerly
+};
+
+#ifdef TSN_ENABLE_FETCH
+#include <curl/curl.h>
+
+// libcurl write callback: append received bytes to the std::string body buffer.
+static size_t tsn_fetch_write(char* ptr, size_t size, size_t nmemb, void* ud) {
+  static_cast<std::string*>(ud)->append(ptr, size * nmemb);
+  return size * nmemb;
+}
+
+// `fetch(url)` — a blocking HTTP(S) GET, returning an already-settled
+// Promise<Response>. A transport error (DNS failure, connection refused, timeout,
+// …) *rejects* the promise (so `await` throws the reason string, catchable with
+// try/catch); an HTTP error *status* (404/500) is not a failure — it resolves with
+// `ok === false`, matching real `fetch`.
+static tsn_promise<std::shared_ptr<tsn_response>> tsn_fetch(const tsn_str& url) {
+  static bool inited = false;  // single-threaded, so a plain guard is fine
+  if (!inited) { curl_global_init(CURL_GLOBAL_DEFAULT); inited = true; }
+  CURL* curl = curl_easy_init();
+  if (!curl) {
+    return tsn_reject<std::shared_ptr<tsn_response>>(
+        tsn_str("fetch failed: could not initialize libcurl"));
+  }
+  std::string body;
+  curl_easy_setopt(curl, CURLOPT_URL, url.str().c_str());
+  curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+  curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, tsn_fetch_write);
+  curl_easy_setopt(curl, CURLOPT_WRITEDATA, &body);
+  CURLcode rc = curl_easy_perform(curl);
+  if (rc != CURLE_OK) {
+    tsn_str reason =
+        tsn_str(std::string("fetch failed: ") + curl_easy_strerror(rc));
+    curl_easy_cleanup(curl);
+    return tsn_reject<std::shared_ptr<tsn_response>>(reason);
+  }
+  long code = 0;
+  curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
+  curl_easy_cleanup(curl);
+  auto resp = std::make_shared<tsn_response>();
+  resp->status = (double)code;
+  resp->ok = code >= 200 && code <= 299;
+  resp->body = tsn_str(std::move(body));
+  return tsn_resolve<std::shared_ptr<tsn_response>>(resp);
+}
+#endif  // TSN_ENABLE_FETCH
 
 // `number` is a double; print it JS-style (shortest round-trip, integers
 // without a trailing ".0") via std::to_chars. NaN/Infinity get their JS
@@ -820,6 +891,14 @@ static std::string tsn_inspect(const std::shared_ptr<std::vector<T>>& a) {
 
 // A Promise<void> value prints as `undefined` when nested (e.g. `[ undefined ]`).
 static std::string tsn_inspect(tsn_unit) { return "undefined"; }
+
+// A fetched Response: print its status/ok (Node prints a much richer object; this
+// keeps `console.log(res)` compiling and informative on the subset).
+static std::string tsn_inspect(const std::shared_ptr<tsn_response>& r) {
+  if (!r) return "undefined";
+  return "Response { status: " + tsn_num_to_string(r->status) +
+         ", ok: " + (r->ok ? "true" : "false") + " }";
+}
 
 // Promise printing, best-effort toward Node: `Promise { <pending> }`,
 // `Promise { 5 }` (fulfilled), `Promise { <rejected> }`. The fulfilled value

@@ -396,7 +396,8 @@ class Renamer {
           if (s.catchName) inner.add(s.catchName); // the caught binding shadows
           s.catchBody = this.body(s.catchBody, inner);
         }
-        if (s.finallyBody) s.finallyBody = this.body(s.finallyBody, new Set(locals));
+        if (s.finallyBody)
+          s.finallyBody = this.body(s.finallyBody, new Set(locals));
         return s;
       }
     }
@@ -469,6 +470,13 @@ class Renamer {
         e.text = this.expr(e.text, locals);
         this.type(e.type); // resolve any class type-ref (codegen rejects it later)
         return e;
+      case "fetch":
+        e.url = this.expr(e.url, locals);
+        return e;
+      case "responseJson":
+        e.receiver = this.expr(e.receiver, locals);
+        this.type(e.type); // resolve any class type-ref (codegen rejects it later)
+        return e;
       default:
         return e; // num / bool / str / this
     }
@@ -484,7 +492,9 @@ class Renamer {
     } else if (t.kind === "set") this.type(t.element);
     else if (t.kind === "promise") {
       if (t.value) this.type(t.value); // resolve a class type-ref in Promise<C>
-    } else for (const f of t.fields) this.type(f.type);
+    } else if (t.kind === "response")
+      return; // built-in, no nested type-refs
+    else for (const f of t.fields) this.type(f.type);
   }
 }
 

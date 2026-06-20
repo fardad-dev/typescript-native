@@ -11,6 +11,7 @@ tests/
   e2e.test.ts        # the harness (vitest)
   typecheck.test.ts  # stage-0 checker: asserts type-erroneous programs are rejected
   modules.test.ts    # module loader: asserts graph rejections (cycles, collisions, …)
+  fetch.test.ts      # fetch: compile+run against a localhost server (network-hermetic)
   cases/
     <name>.ts        # a complete tsn program (the entry)
     <name>.expected  # its exact expected stdout
@@ -59,6 +60,18 @@ module-private variable read by the module's own function (`module-record`). Str
 (cycles, unsupported import forms) and shape assertions (e.g. a collision is mangled apart, not
 rejected) can't be runnable pairs, so they live in [modules.test.ts](modules.test.ts), which writes
 temp files and asserts `loadProgram`'s behavior.
+
+## Network cases (`fetch`)
+
+`fetch` hits the network, so a fixed `cases/*.ts` + `.expected` pair would be flaky and
+non-hermetic. Instead [fetch.test.ts](fetch.test.ts) stands up a localhost `http.Server` on an
+**ephemeral port** (`listen(0)`) in `beforeAll`, then for each scenario writes a small program
+(interpolating the server URL), compiles it via `driver.compileAsync`, runs the native binary,
+and asserts stdout — fully hermetic (no real network). It covers status/`ok`/`text()`, `json()`
+parsing (`await res.json() as T`), an HTTP-error status *resolving* with `ok === false` (not
+rejecting), a transport error *rejecting* (caught by `try`/`catch`), and the bare-`res.json()`
+clean error (`compileAsync` rejects). Each test allows a generous timeout — a fetch program
+`#include`s `<curl/curl.h>`, so clang takes a moment.
 
 ## TDD loop (how this project is built)
 

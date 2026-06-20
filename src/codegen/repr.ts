@@ -380,8 +380,7 @@ class RepAnalyzer {
         this.visit(e.cond, scope, fk);
         const a = this.visit(e.whenTrue, scope, fk);
         const b = this.visit(e.whenFalse, scope, fk);
-        const rep =
-          a.type === "number" ? combineRep(a.rep, b.rep) : "f64";
+        const rep = a.type === "number" ? combineRep(a.rep, b.rep) : "f64";
         return { type: a.type, rep };
       }
       case "binary": {
@@ -445,6 +444,11 @@ class RepAnalyzer {
             .get(obj.type.name)
             ?.fields.find((f) => f.name === e.name);
           if (field) return { type: field.type, rep: "f64" };
+        }
+        // Response: `.ok` is boolean, `.status` a number (f64, like the default).
+        if (typeof obj.type === "object" && obj.type.kind === "response") {
+          if (e.name === "ok") return { type: "boolean", rep: "f64" };
+          return { type: "number", rep: "f64" };
         }
         return { type: "number", rep: "f64" };
       }
@@ -522,6 +526,16 @@ class RepAnalyzer {
               return { type: "number", rep: "f64" };
           }
         }
+        // Response methods: `text()` resolves to a Promise<string>; `json()` only
+        // reaches the emitter without a target type (an error), so a placeholder
+        // here is fine. Numbers stay f64.
+        if (typeof recv.type === "object" && recv.type.kind === "response") {
+          e.args.forEach((a) => this.visit(a, scope, fk));
+          if (e.method === "text") {
+            return { type: { kind: "promise", value: "string" }, rep: "f64" };
+          }
+          return { type: "number", rep: "f64" };
+        }
         // Array methods: dispatch on the receiver type so the result type matches
         // the emitter (e.g. array `slice` is an array, not a string). Number
         // results stay f64, like every other method's number return.
@@ -585,7 +599,10 @@ class RepAnalyzer {
       case "mathConst":
         return { type: "number", rep: "f64" };
       case "mapNew":
-        return { type: { kind: "map", key: e.key, value: e.value }, rep: "f64" };
+        return {
+          type: { kind: "map", key: e.key, value: e.value },
+          rep: "f64",
+        };
       case "setNew":
         if (e.init) this.visit(e.init, scope, fk);
         return { type: { kind: "set", element: e.element }, rep: "f64" };
@@ -598,10 +615,7 @@ class RepAnalyzer {
         // `await p` yields the promise's resolved type. A resolved number is the
         // f64 rep (promise values are stored as f64, like array elements).
         const inner = this.visit(e.expr, scope, fk);
-        if (
-          typeof inner.type === "object" &&
-          inner.type.kind === "promise"
-        ) {
+        if (typeof inner.type === "object" && inner.type.kind === "promise") {
           // value absent => Promise<void>; report a number placeholder (a void
           // await is statement-only and never feeds a slot).
           return { type: inner.type.value ?? "number", rep: "f64" };
@@ -632,6 +646,17 @@ class RepAnalyzer {
         }
         return { type: { kind: "promise", value }, rep: "f64" };
       }
+      case "fetch":
+        this.visit(e.url, scope, fk);
+        return {
+          type: { kind: "promise", value: { kind: "response" } },
+          rep: "f64",
+        };
+      case "responseJson":
+        // Resolves to a Promise<T>; a parsed number is f64 (JSON numbers), like
+        // jsonParse — the await yields f64 regardless.
+        this.visit(e.receiver, scope, fk);
+        return { type: { kind: "promise", value: e.type }, rep: "f64" };
     }
   }
 }

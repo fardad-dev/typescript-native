@@ -74,6 +74,7 @@ type ClassType = { kind: "class"; name: string };
 type MapType = { kind: "map"; key: Type; value: Type };
 type SetType = { kind: "set"; element: Type };
 type PromiseType = { kind: "promise"; value?: Type };
+type ResponseType = { kind: "response" };
 
 function isArray(t: Type): t is ArrayType {
   return typeof t === "object" && t.kind === "array";
@@ -97,6 +98,10 @@ function isPromise(t: Type): t is PromiseType {
 function isClass(t: Type): t is ClassType {
   return typeof t === "object" && t.kind === "class";
 }
+// A `fetch` Response (reference type → `std::shared_ptr<tsn_response>`).
+function isResponse(t: Type): t is ResponseType {
+  return typeof t === "object" && t.kind === "response";
+}
 function isAggregate(t: Type): boolean {
   return isArray(t) || isObject(t);
 }
@@ -110,6 +115,7 @@ function displayType(t: RetType): string {
   if (isPromise(t)) {
     return `Promise<${t.value === undefined ? "void" : displayType(t.value)}>`;
   }
+  if (isResponse(t)) return "Response";
   if (isObject(t)) {
     return `{ ${t.fields.map((f) => `${f.name}: ${displayType(f.type)}`).join("; ")} }`;
   }
@@ -123,7 +129,10 @@ function sameType(a: Type, b: Type): boolean {
   // Map/Set: equal iff their key/value/element types match (structural).
   if (isMap(a) || isMap(b))
     return (
-      isMap(a) && isMap(b) && sameType(a.key, b.key) && sameType(a.value, b.value)
+      isMap(a) &&
+      isMap(b) &&
+      sameType(a.key, b.key) &&
+      sameType(a.value, b.value)
     );
   if (isSet(a) || isSet(b))
     return isSet(a) && isSet(b) && sameType(a.element, b.element);
@@ -134,6 +143,8 @@ function sameType(a: Type, b: Type): boolean {
       return a.value === b.value;
     return sameType(a.value, b.value);
   }
+  // Response is a singleton built-in type (no parameters).
+  if (isResponse(a) || isResponse(b)) return isResponse(a) && isResponse(b);
   if (isArray(a) && isArray(b)) return sameType(a.element, b.element);
   if (isObject(a) && isObject(b)) {
     if (a.fields.length !== b.fields.length) return false;
@@ -178,8 +189,13 @@ interface BreakCtx {
   continueLabel?: string; // C++ label jumped to by `continue` (goto-form loops)
 }
 
-export function emit(mod: Module): string {
-  return new Emitter().emitModule(mod);
+// Emit the C++ source for a module, plus `usesFetch` — whether the program calls
+// `fetch` (and so needs the `-lcurl` link flag; the `#define TSN_ENABLE_FETCH` is
+// already baked into `cpp`). The driver threads `usesFetch` to the backend.
+export function emit(mod: Module): { cpp: string; usesFetch: boolean } {
+  const emitter = new Emitter();
+  const cpp = emitter.emitModule(mod);
+  return { cpp, usesFetch: emitter.fetchUsed };
 }
 
 class Emitter {
@@ -212,6 +228,15 @@ class Emitter {
   // one `tsn_run_microtasks()` drain in main(); kept false for non-async programs
   // so their emitted main() stays byte-identical.
   private usesAsync = false;
+
+  // True once a `fetch(...)`/`res.json()` is emitted. Gates the `#define
+  // TSN_ENABLE_FETCH` (which turns on the curl include + tsn_fetch in the runtime
+  // header) and the `-lcurl` link flag (threaded out via `usesFetch`). A non-fetch
+  // program emits neither and links exactly as before. Read after emitModule.
+  private usesFetch = false;
+  get fetchUsed(): boolean {
+    return this.usesFetch;
+  }
 
   // Per-function scratch, reset by resetForFunction().
   private body: string[] = [];
@@ -290,6 +315,10 @@ class Emitter {
     const jsonDefs = this.aggregateJsonStringifyDefs();
 
     return [
+      // `fetch` programs define this BEFORE including the runtime so its guarded
+      // curl include + tsn_fetch compile in (and the driver adds `-lcurl`). A
+      // non-fetch program emits neither line, so its .cpp is byte-identical.
+      ...(this.usesFetch ? [`#define TSN_ENABLE_FETCH 1`] : []),
       // The fixed C++ runtime (tsn_str, JS-semantics numeric/string/array helpers,
       // and the scalar + array `tsn_inspect` overloads) lives as real C++ in
       // src/codegen/cpp/tsn_runtime.h and is #included instead of inlined here, so
@@ -353,6 +382,8 @@ class Emitter {
     if (isPromise(t)) {
       return `tsn_promise<${t.value === undefined ? "tsn_unit" : this.cppType(t.value)}>`;
     }
+    // A `fetch` Response — a reference-typed built-in (runtime `tsn_response`).
+    if (isResponse(t)) return "std::shared_ptr<tsn_response>";
     if (t === "number") return "double"; // f64 rep — the default for nested aggregates
     if (t === "boolean") return "bool";
     return "tsn_str"; // string — a ref-counted immutable string (see prelude)
@@ -597,7 +628,12 @@ class Emitter {
   // guarantees it), so its `co_return`s already make it a coroutine.
   private emitAsyncVoidTail(): void {
     const ret = this.curReturn;
-    if (this.curAsync && ret !== "void" && isPromise(ret) && ret.value === undefined) {
+    if (
+      this.curAsync &&
+      ret !== "void" &&
+      isPromise(ret) &&
+      ret.value === undefined
+    ) {
       this.push(`co_return tsn_unit{};`);
     }
   }
@@ -612,7 +648,9 @@ class Emitter {
     if (valueType === undefined) {
       // Promise<void>.
       if (stmt.value) {
-        throw new Error("Cannot return a value from an async 'Promise<void>' function");
+        throw new Error(
+          "Cannot return a value from an async 'Promise<void>' function",
+        );
       }
       this.push(`co_return tsn_unit{};`);
       return;
@@ -626,7 +664,11 @@ class Emitter {
     }
     // `return somePromise` where the function resolves to the same type: adopt the
     // returned promise by awaiting it (matching JS's async return-a-thenable).
-    if (isPromise(val.type) && val.type.value !== undefined && sameType(val.type.value, valueType)) {
+    if (
+      isPromise(val.type) &&
+      val.type.value !== undefined &&
+      sameType(val.type.value, valueType)
+    ) {
       this.push(`co_return co_await (${val.code});`);
       return;
     }
@@ -742,7 +784,9 @@ class Emitter {
     // main() is byte-identical to the pre-async output). No timers/IO => no
     // macrotasks, so draining to empty is the whole loop.
     const drain = this.usesAsync ? [`  tsn_run_microtasks();`] : [];
-    return [`int main() {`, ...this.body, ...drain, `  return 0;`, `}`].join("\n");
+    return [`int main() {`, ...this.body, ...drain, `  return 0;`, `}`].join(
+      "\n",
+    );
   }
 
   // The entry top-level contains `await`. Emit it into a coroutine
@@ -981,7 +1025,9 @@ class Emitter {
         return c;
       }
     }
-    throw new Error(`'continue ${label}': no enclosing labeled loop '${label}'`);
+    throw new Error(
+      `'continue ${label}': no enclosing labeled loop '${label}'`,
+    );
   }
 
   // A `finally` body runs from a C++ destructor (see tsn_make_finally), which must
@@ -1003,7 +1049,9 @@ class Emitter {
           throw new Error("'throw' inside a 'finally' block is not supported");
         case "break":
           if (s.label !== undefined || loopDepth + switchDepth === 0)
-            throw new Error("'break' escaping a 'finally' block is not supported");
+            throw new Error(
+              "'break' escaping a 'finally' block is not supported",
+            );
           break;
         case "continue":
           if (s.label !== undefined || loopDepth === 0)
@@ -1031,7 +1079,8 @@ class Emitter {
           break;
         case "try":
           this.checkFinally(s.block, loopDepth, switchDepth);
-          if (s.catchBody) this.checkFinally(s.catchBody, loopDepth, switchDepth);
+          if (s.catchBody)
+            this.checkFinally(s.catchBody, loopDepth, switchDepth);
           if (s.finallyBody)
             this.checkFinally(s.finallyBody, loopDepth, switchDepth);
           break;
@@ -1728,6 +1777,20 @@ class Emitter {
         if (isClass(obj.type)) {
           return this.classField(obj, e.name);
         }
+        // `res.status` (f64 number) / `res.ok` (boolean) on a fetch Response.
+        if (isResponse(obj.type)) {
+          if (e.name === "status") {
+            return {
+              code: `(${obj.code})->status`,
+              type: "number",
+              rep: "f64",
+            };
+          }
+          if (e.name === "ok") {
+            return { code: `(${obj.code})->ok`, type: "boolean" };
+          }
+          throw new Error(`Response has no property '${e.name}'`);
+        }
         throw new Error(
           `Type '${displayType(obj.type)}' has no property '${e.name}'`,
         );
@@ -1770,7 +1833,11 @@ class Emitter {
         // rather than emit a C++ overload error.
         const v = this.emitExpr(e.arg);
         if (isMap(v.type) || isSet(v.type) || isPromise(v.type)) {
-          const what = isMap(v.type) ? "Map" : isSet(v.type) ? "Set" : "Promise";
+          const what = isMap(v.type)
+            ? "Map"
+            : isSet(v.type)
+              ? "Set"
+              : "Promise";
           throw new Error(`JSON.stringify of a ${what} is not supported (v1)`);
         }
         return { code: `tsn_json_stringify(${v.code})`, type: "string" };
@@ -1835,12 +1902,50 @@ class Emitter {
         }
         const inner = v.type.element.value;
         if (inner === undefined) {
-          throw new Error("Promise.all of a Promise<void>[] is not supported (v1)");
+          throw new Error(
+            "Promise.all of a Promise<void>[] is not supported (v1)",
+          );
         }
         // tsn_all(ps) resolves to a vector of the element results -> T[].
         return {
           code: `tsn_all(${v.code})`,
           type: { kind: "promise", value: { kind: "array", element: inner } },
+        };
+      }
+      case "fetch": {
+        this.usesFetch = true;
+        const url = this.emitExpr(e.url);
+        if (url.type !== "string") {
+          throw new Error(
+            `fetch expects a string URL, got '${displayType(url.type)}'`,
+          );
+        }
+        // tsn_fetch (runtime) does the blocking GET and returns an already-settled
+        // Promise<Response> (rejected on a transport error).
+        return {
+          code: `tsn_fetch(${url.code})`,
+          type: { kind: "promise", value: { kind: "response" } },
+        };
+      }
+      case "responseJson": {
+        this.usesFetch = true;
+        const recv = this.emitExpr(e.receiver);
+        if (!isResponse(recv.type)) {
+          throw new Error(
+            `'.json()' is only valid on a fetch Response, got '${displayType(recv.type)}'`,
+          );
+        }
+        this.assertJsonType(e.type);
+        // Parse the buffered body into the target type (reusing JSON.parse's
+        // extraction), then resolve a promise over it — so `await res.json()`
+        // yields the typed value (one tick later, like any await).
+        const extracted = this.extractJson(
+          `tsn_json_parse((${recv.code})->body)`,
+          e.type,
+        );
+        return {
+          code: `tsn_resolve(${extracted})`,
+          type: { kind: "promise", value: e.type },
         };
       }
     }
@@ -1891,12 +1996,25 @@ class Emitter {
 
   // Unary `Math.<fn>` that maps straight to a <cmath> function.
   private static readonly MATH_UNARY_STD: Record<string, string> = {
-    abs: "std::fabs", floor: "std::floor", ceil: "std::ceil",
-    trunc: "std::trunc", sqrt: "std::sqrt", cbrt: "std::cbrt",
-    exp: "std::exp", log: "std::log", log2: "std::log2", log10: "std::log10",
-    sin: "std::sin", cos: "std::cos", tan: "std::tan",
-    asin: "std::asin", acos: "std::acos", atan: "std::atan",
-    sinh: "std::sinh", cosh: "std::cosh", tanh: "std::tanh",
+    abs: "std::fabs",
+    floor: "std::floor",
+    ceil: "std::ceil",
+    trunc: "std::trunc",
+    sqrt: "std::sqrt",
+    cbrt: "std::cbrt",
+    exp: "std::exp",
+    log: "std::log",
+    log2: "std::log2",
+    log10: "std::log10",
+    sin: "std::sin",
+    cos: "std::cos",
+    tan: "std::tan",
+    asin: "std::asin",
+    acos: "std::acos",
+    atan: "std::atan",
+    sinh: "std::sinh",
+    cosh: "std::cosh",
+    tanh: "std::tanh",
   };
 
   // The exact double-literal value of each Math constant (the shortest round-trip
@@ -1960,7 +2078,8 @@ class Emitter {
       case "max": {
         // Fold the (variadic) args with a NaN-propagating binary helper. With no
         // args JS yields +Infinity (min) / -Infinity (max).
-        if (ds.length === 0) return num(fn === "min" ? "INFINITY" : "-INFINITY");
+        if (ds.length === 0)
+          return num(fn === "min" ? "INFINITY" : "-INFINITY");
         const helper = fn === "min" ? "tsn_math_min" : "tsn_math_max";
         let acc = ds[0];
         for (let i = 1; i < ds.length; i++) acc = `${helper}(${acc}, ${ds[i]})`;
@@ -1971,7 +2090,8 @@ class Emitter {
         if (ds.length === 0) return num("0.0");
         if (ds.length === 1) return num(`std::fabs(${ds[0]})`);
         let acc = `std::hypot(${ds[0]}, ${ds[1]})`;
-        for (let i = 2; i < ds.length; i++) acc = `std::hypot(${acc}, ${ds[i]})`;
+        for (let i = 2; i < ds.length; i++)
+          acc = `std::hypot(${acc}, ${ds[i]})`;
         return num(acc);
       }
       case "random":
@@ -2460,7 +2580,9 @@ class Emitter {
         }
         case "shift": {
           if (e.args.length !== 0) {
-            throw new Error(`'shift' expects 0 arguments, got ${e.args.length}`);
+            throw new Error(
+              `'shift' expects 0 arguments, got ${e.args.length}`,
+            );
           }
           // Removes and returns the first element (empty -> element default).
           return { code: `tsn_array_shift(${vecRecv})`, type: elem };
@@ -2507,9 +2629,37 @@ class Emitter {
     }
     if (isMap(recv.type)) return this.emitMapMethod(recv, e, asStatement);
     if (isSet(recv.type)) return this.emitSetMethod(recv, e, asStatement);
+    if (isResponse(recv.type)) return this.emitResponseMethod(recv, e);
     throw new Error(
       `Type '${displayType(recv.type)}' has no method '${e.method}'`,
     );
+  }
+
+  // Emit a fetch Response method. `text()` resolves a promise over the buffered
+  // body; `json()` reaches here only without a target type (lowering captures it
+  // at `await res.json() as T` / annotated targets), so it's a clear error.
+  private emitResponseMethod(
+    recv: Value,
+    e: { method: string; args: Expr[] },
+  ): { code: string; type: RetType } {
+    if (e.method === "text") {
+      if (e.args.length !== 0) {
+        throw new Error(
+          `'Response.text' expects 0 arguments, got ${e.args.length}`,
+        );
+      }
+      this.usesFetch = true;
+      return {
+        code: `tsn_resolve((${recv.code})->body)`,
+        type: { kind: "promise", value: "string" },
+      };
+    }
+    if (e.method === "json") {
+      throw new Error(
+        "res.json() needs a target type — write `await res.json() as T` or annotate the target (`const x: T = await res.json()`)",
+      );
+    }
+    throw new Error(`Type 'Response' has no method '${e.method}'`);
   }
 
   // Emit a Map method call. `set` returns the map (chainable) via an IIFE that
@@ -2572,7 +2722,9 @@ class Emitter {
       case "clear":
         arity(0);
         if (!asStatement) {
-          throw new Error("'Map.clear' returns void and cannot be used as a value");
+          throw new Error(
+            "'Map.clear' returns void and cannot be used as a value",
+          );
         }
         return { code: `(${recv.code})->clear()`, type: "void" };
       case "keys":
@@ -2649,7 +2801,9 @@ class Emitter {
       case "clear":
         arity(0);
         if (!asStatement) {
-          throw new Error("'Set.clear' returns void and cannot be used as a value");
+          throw new Error(
+            "'Set.clear' returns void and cannot be used as a value",
+          );
         }
         return { code: `(${recv.code})->clear()`, type: "void" };
       case "values":
@@ -2834,7 +2988,10 @@ class Emitter {
             : e.method === "startsWith"
               ? "tsn_starts_with"
               : "tsn_ends_with";
-        return { code: `${helper}(${s}, ${argv[0].code}, ${pos})`, type: "boolean" };
+        return {
+          code: `${helper}(${s}, ${argv[0].code}, ${pos})`,
+          type: "boolean",
+        };
       }
       case "repeat": {
         const [n] = numArgs(1, 1);
@@ -2867,7 +3024,8 @@ class Emitter {
           }
           pad = argv[1].code;
         }
-        const helper = e.method === "padStart" ? "tsn_pad_start" : "tsn_pad_end";
+        const helper =
+          e.method === "padStart" ? "tsn_pad_start" : "tsn_pad_end";
         return {
           code: `${helper}(${s}, ${argv[0].code}, ${pad})`,
           type: "string",
@@ -2887,7 +3045,8 @@ class Emitter {
             `'${e.method}' arguments must be strings (regex / function args are out of subset)`,
           );
         }
-        const helper = e.method === "replace" ? "tsn_replace" : "tsn_replace_all";
+        const helper =
+          e.method === "replace" ? "tsn_replace" : "tsn_replace_all";
         return {
           code: `${helper}(${s}, ${argv[0].code}, ${argv[1].code})`,
           type: "string",
@@ -2954,6 +3113,10 @@ function containsAwait(e: Expr): boolean {
       return e.args.some(containsAwait);
     case "setNew":
       return e.init ? containsAwait(e.init) : false;
+    case "fetch":
+      return containsAwait(e.url);
+    case "responseJson":
+      return containsAwait(e.receiver);
     default:
       return false; // num / bool / str / var / this / mathConst / mapNew
   }

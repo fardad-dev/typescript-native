@@ -106,7 +106,7 @@ npm run test:watch  # re-run on change — the TDD red->green loop
 ```
 
 The suite (currently **113 e2e cases** + a stage-0 type-checker test file + a module-loader test
-file, all green) auto-discovers every `tests/cases/*.ts`, compiles it to a real native binary,
+file + a `fetch` test file, all green) auto-discovers every `tests/cases/*.ts`, compiles it to a real native binary,
 runs it, and diffs stdout against the matching `.expected` file. **Every feature gets a
 `tests/cases/*.ts` + `.expected` pair**, ideally written first (red), then implemented to green.
 Programs that must be *rejected* (type errors) can't be expressed as a case pair, so they live in
@@ -242,6 +242,20 @@ Implemented and tested end-to-end:
   and `Promise.reject`/`race`/`any`/`allSettled` (need closures / a richer model), top-level `await`
   in an **imported** module (would make the whole module graph async), and `for await` (no async
   iterables).
+- **`fetch(url)`** — a real, `await`-able HTTP(S) GET returning `Promise<Response>`, the same code
+  you'd write in TypeScript: `const res = await fetch(url); const data = await res.json() as T`.
+  `Response` is a built-in reference type with `status: number`, `ok: boolean`, and methods
+  `text(): Promise<string>` / `json(): Promise<T>`. The microtask runtime has **no async I/O**, so
+  `fetch` does a **blocking** libcurl request and returns an already-settled promise (`await` still
+  defers one tick, so JS ordering holds); it's the one I/O builtin and the natural payoff of async.
+  A **transport error** (DNS/refused/timeout) **rejects** the promise — `await` throws a string,
+  catchable with `try`/`catch`; an **HTTP error status** (404/500) is *not* a failure — it resolves
+  with `ok === false`, matching real `fetch`. `Response.json()` is `Promise<any>` and the subset has
+  no `any`, so the target type is required (idiomatic TS): `await res.json() as T` or an annotated
+  target — reusing the typed-`JSON.parse` extraction (so `JSON.parse(await res.text()) as T` works
+  too). Compiling a `fetch` program links `-lcurl` (only then — a non-fetch binary is unchanged).
+  **Deferred** (clean errors): request options / non-GET methods, headers, and `res.headers` /
+  `blob()` / `statusText` (request options need optional object fields, blocked on unions).
 - **Classes:** `class C { f: T; constructor(...) {…}; method(...): R {…} }`, `new C(...)`,
   `this.field` / `this.method()` (read + write), instances in variables / params / returns / arrays.
   Instances are **reference types** (`new` is shared; `let b = a` aliases, so a mutation through one
@@ -290,6 +304,7 @@ tsn types map onto C++ types (see [src/codegen/CLAUDE.md](src/codegen/CLAUDE.md)
 | `Map<K, V>` | `std::shared_ptr<tsn_map<K, V>>` | **reference** type: insertion-ordered `tsn_map` (runtime), shared on copy/assign; methods via `->`; `.size` → `->size()` (i64). Keys/values use the f64 rep |
 | `Set<T>` | `std::shared_ptr<tsn_set<T>>` | **reference** type: insertion-ordered `tsn_set`; iterable by `for…of`; methods via `->`; `.size` (i64) |
 | `Promise<T>` | `tsn_promise<T>` (a C++20 coroutine type) | **reference** type: a handle holding a `shared_ptr` to shared promise state. An `async` function returns one (its body is a coroutine using `co_return`/`co_await`); `await` is `co_await`. `Promise<void>` → `tsn_promise<tsn_unit>`. Resolved numbers use the f64 rep |
+| `Response` | `std::shared_ptr<tsn_response>` | **reference** type: the `fetch(...)` result (runtime `tsn_response { status; ok; body }`). Fields `status` (f64) / `ok` (bool); `text()` → `Promise<string>`, `json()` → `Promise<T>`. `tsn_fetch` (libcurl) is `#ifdef TSN_ENABLE_FETCH`; using it links `-lcurl` |
 
 - **`number` is f64, but integer-valued numbers use a 64-bit integer representation.** A
   pre-pass ([src/codegen/repr.ts](src/codegen/repr.ts)) infers, per variable / parameter / return,
@@ -682,13 +697,38 @@ pair** (red → green).
       inside the coroutine). **Deferred** (clean `tsnc:` errors): `new Promise(executor)`,
       `Promise.reject`/`race`/`any`/`allSettled` (closures / richer model), top-level `await` in an
       **imported** module (would make the whole module graph async), and `for await` (no async iterables).
+- [x] **`fetch` (real, `await`-able HTTP)** — `fetch(url): Promise<Response>`, the genuine idiom:
+      `const res = await fetch(url); if (res.ok) { const data = await res.json() as T }`. The design
+      decision the async work set up: the microtask runtime has **no async I/O**, so `fetch` does a
+      **blocking** libcurl GET and returns an *already-settled* promise (`tsn_fetch` → `tsn_resolve`/
+      `tsn_reject`) — `await_ready` is still false, so `await fetch(url)` defers one tick and JS
+      ordering holds. A **transport error rejects** (so `await` throws a catchable string — the user's
+      choice over hard-exit, and now possible since async exists), while an **HTTP error status
+      resolves** with `ok === false` (real-fetch semantics). `Response` is a built-in reference type
+      (`isResponse`, like Map/Set): `status`/`ok` fields + `text(): Promise<string>` / `json():
+      Promise<T>`. The one real constraint was **typing `json()`** — it's `Promise<any>`, which the
+      no-`any` subset can't hold, so the target type is captured up front (idiomatic TS): a new
+      `as`-expression form `await res.json() as T` (and `const x: T = await res.json()`) lowers to a
+      `responseJson { receiver, type }` node that **reuses the typed-`JSON.parse` extraction**
+      (`extractJson`) — so `JSON.parse(await res.text()) as T` works identically. Threaded across the
+      usual files: a `Type` (`{ kind: "response" }`), two `Expr` nodes (`fetch`, `responseJson`),
+      `lowerType`/`tryLowerFetchCall`/the `as`-branch, `repr.ts`, the module `Renamer`, and the runtime
+      ([src/codegen/cpp/tsn_runtime.h](src/codegen/cpp/tsn_runtime.h): `tsn_response`, a guarded
+      `tsn_fetch`, `tsn_reject`, a Response `tsn_inspect`). A program that uses fetch emits `#define
+      TSN_ENABLE_FETCH` (gating the curl include) and the driver links `-lcurl` (threaded out of
+      `emit(mod) → { cpp, usesFetch }`, parallel to the `usesAsync` gate); **non-fetch programs are
+      byte-identical and link without curl**. Network-hermetic tests (localhost server, ephemeral port)
+      live in [tests/fetch.test.ts](tests/fetch.test.ts), not a `cases/*` pair. **Deferred** (clean
+      `tsnc:` errors): request options / non-GET (`fetch(url, {…})` — needs optional object fields,
+      blocked on unions), `res.headers`/`blob()`/`statusText`, and a bare `res.json()` with no target.
 
 ### todo
 
 Ordering is a rough dependency chain: cheap self-contained syntax first → the **union-types
 keystone** (which unlocks `null`/optional/literals) → closures → generics. **Every item still
 ships with a `tests/cases/*.ts` + `.expected` pair** (red → green), except programs that must be
-*rejected* ([tests/typecheck.test.ts](tests/typecheck.test.ts) / [tests/modules.test.ts](tests/modules.test.ts)).
+*rejected* ([tests/typecheck.test.ts](tests/typecheck.test.ts) / [tests/modules.test.ts](tests/modules.test.ts))
+or that need a live server (`fetch`, in [tests/fetch.test.ts](tests/fetch.test.ts)).
 
 **Cheap, self-contained syntax** (each is ~one IR node + one `lower` branch + one `emit` case):
 

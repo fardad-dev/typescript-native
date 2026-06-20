@@ -26,7 +26,12 @@ export type Type =
   // `await` on a promise yields its `value`; codegen compiles it to a C++20
   // coroutine type `tsn_promise<…>` (see codegen). Numbers in `value` use the
   // f64 rep (like array elements / object fields).
-  | { kind: "promise"; value?: Type };
+  | { kind: "promise"; value?: Type }
+  // The `Response` of a `fetch(...)` — a built-in reference type (like Map/Set),
+  // compiled to `std::shared_ptr<tsn_response>`. Fields `status: number` /
+  // `ok: boolean`; methods `text(): Promise<string>` and `json(): Promise<T>`
+  // (the body is buffered, so both return already-resolved promises). See codegen.
+  | { kind: "response" };
 
 export type BinaryOp =
   // arithmetic (number -> number)
@@ -96,7 +101,17 @@ export type Expr =
   | { kind: "promiseResolve"; arg: Expr }
   // `Promise.all(arg)` — `arg` is a `Promise<T>[]`; resolves to a `T[]` once every
   // input promise resolves (rejects if any rejects).
-  | { kind: "promiseAll"; arg: Expr };
+  | { kind: "promiseAll"; arg: Expr }
+  // `fetch(url)` — a blocking HTTP GET that returns an already-settled
+  // `Promise<Response>` (the microtask runtime has no async I/O; see codegen).
+  // A transport error rejects the promise; an HTTP error status resolves with
+  // `ok === false` (matching real `fetch`).
+  | { kind: "fetch"; url: Expr }
+  // `res.json()` as a `Promise<T>` — `Response.json()` is `Promise<any>`, which
+  // the subset can't represent, so the target type `T` is captured up front (from
+  // `await res.json() as T` or `const x: T = await res.json()`, like `jsonParse`).
+  // Resolves to the response body parsed as JSON into a value of type `T`.
+  | { kind: "responseJson"; receiver: Expr; type: Type };
 
 export type Stmt =
   // `type` is the annotation; absent means infer from the initializer.

@@ -92,9 +92,8 @@ function hasStatic(node: ts.HasModifiers): boolean {
 // and that an async function's annotated return type is a `Promise<...>`.)
 function hasAsync(node: ts.HasModifiers): boolean {
   return (
-    ts
-      .getModifiers(node)
-      ?.some((m) => m.kind === ts.SyntaxKind.AsyncKeyword) ?? false
+    ts.getModifiers(node)?.some((m) => m.kind === ts.SyntaxKind.AsyncKeyword) ??
+    false
   );
 }
 
@@ -523,7 +522,8 @@ function lowerTry(node: ts.TryStatement): Stmt {
   let finallyBody: Stmt[] | undefined;
   if (node.finallyBlock) {
     finallyBody = [];
-    for (const s of node.finallyBlock.statements) lowerStatement(s, finallyBody);
+    for (const s of node.finallyBlock.statements)
+      lowerStatement(s, finallyBody);
   }
 
   return { kind: "try", block, catchName, catchBody, finallyBody };
@@ -559,6 +559,19 @@ function lowerVarDecl(decl: ts.VariableDeclaration): Stmt {
       type,
       init: jsonParseNode(initNode, type),
     };
+  }
+  // `const x: T = await res.json()` — the annotation supplies the JSON target type
+  // (the typed-target idiom alongside `await res.json() as T`).
+  if (type !== undefined) {
+    const jsonCall = responseJsonCall(decl.initializer);
+    if (jsonCall) {
+      return {
+        kind: "let",
+        name: decl.name.text,
+        type,
+        init: responseJsonAwaitNode(jsonCall, type),
+      };
+    }
   }
   // `const m: Map<K, V> = new Map()` / `const s: Set<T> = new Set(arr)` — the
   // annotation supplies the element types when `new Map()`/`new Set()` is written
@@ -658,6 +671,11 @@ function lowerType(node: ts.TypeNode): Type {
       if (arg.kind === ts.SyntaxKind.VoidKeyword) return { kind: "promise" };
       return { kind: "promise", value: lowerType(arg) };
     }
+    // `Response` — the built-in result of `fetch(...)` (see codegen). A bare
+    // identifier, so it's matched here before the class-instance fallthrough.
+    if (n === "Response" && !node.typeArguments) {
+      return { kind: "response" };
+    }
     // A bare identifier that isn't a known primitive/built-in is treated as a
     // class instance type (`let p: Point`). The emitter validates the class
     // exists. Generic refs (with type arguments) still fall through as
@@ -743,16 +761,21 @@ function lowerExpr(node: ts.Expression): Expr {
   // — no runtime effect — so it lowers transparently. This is what lets the common
   // `map.get(k)!` idiom type-check (Map.get is `V | undefined`) and still lower.
   if (ts.isNonNullExpression(node)) return lowerExpr(node.expression);
-  // `e as T` — only supported as the type carrier for `JSON.parse(text) as T`
-  // (JSON.parse is `any`, so the assertion supplies the value's static type). A
-  // general type assertion has no representation in the typed subset.
+  // `e as T` — supported as the type carrier for `JSON.parse(text) as T` and
+  // `await res.json() as T` (both produce an `any`, so the assertion supplies the
+  // value's static type). A general type assertion has no representation in the
+  // typed subset.
   if (ts.isAsExpression(node)) {
     const inner = skipParens(node.expression);
     if (isJsonParseCall(inner)) {
       return jsonParseNode(inner, lowerType(node.type));
     }
+    const jsonCall = responseJsonCall(node.expression);
+    if (jsonCall) {
+      return responseJsonAwaitNode(jsonCall, lowerType(node.type));
+    }
     throw new Error(
-      "Type assertions ('as T') are only supported on JSON.parse(...) (v1)",
+      "Type assertions ('as T') are only supported on JSON.parse(...) and `await res.json()` (v1)",
     );
   }
   if (ts.isArrayLiteralExpression(node)) {
@@ -809,6 +832,8 @@ function lowerExpr(node: ts.Expression): Expr {
     if (math) return math;
     const promise = tryLowerPromiseCall(node);
     if (promise) return promise;
+    const fetched = tryLowerFetchCall(node);
+    if (fetched) return fetched;
     // `recv.method(args)` -> methodCall (e.g. xs.push(v)).
     if (ts.isPropertyAccessExpression(node.expression)) {
       return {
@@ -965,20 +990,48 @@ function tryLowerJsonCall(node: ts.CallExpression): Expr | null {
 // use a small `tsn_math_*` helper in the runtime (see emit.ts / tsn_runtime.h).
 const MATH_FUNCTIONS = new Set([
   // unary
-  "abs", "floor", "ceil", "round", "trunc", "sign", "sqrt", "cbrt",
-  "exp", "log", "log2", "log10", "sin", "cos", "tan",
-  "asin", "acos", "atan", "sinh", "cosh", "tanh",
+  "abs",
+  "floor",
+  "ceil",
+  "round",
+  "trunc",
+  "sign",
+  "sqrt",
+  "cbrt",
+  "exp",
+  "log",
+  "log2",
+  "log10",
+  "sin",
+  "cos",
+  "tan",
+  "asin",
+  "acos",
+  "atan",
+  "sinh",
+  "cosh",
+  "tanh",
   // binary
-  "pow", "atan2",
+  "pow",
+  "atan2",
   // variadic
-  "min", "max", "hypot",
+  "min",
+  "max",
+  "hypot",
   // no args
   "random",
 ]);
 
 // The `Math.<name>` constants the subset supports (all `number`).
 const MATH_CONSTANTS = new Set([
-  "PI", "E", "LN2", "LN10", "LOG2E", "LOG10E", "SQRT2", "SQRT1_2",
+  "PI",
+  "E",
+  "LN2",
+  "LN10",
+  "LOG2E",
+  "LOG10E",
+  "SQRT2",
+  "SQRT1_2",
 ]);
 
 // Recognize a `Math.<fn>(...)` builtin call. Returns a `mathCall` node, or null
@@ -1041,6 +1094,52 @@ function tryLowerPromiseCall(node: ts.CallExpression): Expr | null {
   throw new Error(`Unsupported Promise method 'Promise.${method}' (v1)`);
 }
 
+// Recognize a `fetch(url)` builtin call — a plain call to the global `fetch`,
+// intercepted before generic call lowering (like JSON/Math/Promise). Exactly one
+// string URL argument; request options (a 2nd arg) need optional object fields,
+// so they're a clean v1 error. Returns null for any other call.
+function tryLowerFetchCall(node: ts.CallExpression): Expr | null {
+  if (!ts.isIdentifier(node.expression) || node.expression.text !== "fetch") {
+    return null;
+  }
+  if (node.arguments.length !== 1) {
+    throw new Error(
+      "fetch supports only a URL (GET) in v1 — request options (method/headers/body) need optional object fields (blocked on union types)",
+    );
+  }
+  return { kind: "fetch", url: lowerExpr(node.arguments[0]) };
+}
+
+// Recognize `await <recv>.json()` (zero-arg). Returns the `.json()` call (so the
+// receiver can be extracted), or null. `Response.json()` is `Promise<any>`, which
+// the subset can't represent, so a target type must be supplied up front — this is
+// matched only at the call sites that have one (`as T` / an annotated target).
+function responseJsonCall(node: ts.Expression): ts.CallExpression | null {
+  const inner = skipParens(node);
+  if (!ts.isAwaitExpression(inner)) return null;
+  const call = skipParens(inner.expression);
+  if (
+    ts.isCallExpression(call) &&
+    ts.isPropertyAccessExpression(call.expression) &&
+    call.expression.name.text === "json" &&
+    call.arguments.length === 0
+  ) {
+    return call;
+  }
+  return null;
+}
+
+// Build `await (responseJson)` from an `await recv.json()` call and its target
+// type. (`responseJson` is a `Promise<type>`; the `await` unwraps it to `type`,
+// matching the `as T` / annotation that supplied the type.)
+function responseJsonAwaitNode(call: ts.CallExpression, type: Type): Expr {
+  const recv = (call.expression as ts.PropertyAccessExpression).expression;
+  return {
+    kind: "await",
+    expr: { kind: "responseJson", receiver: lowerExpr(recv), type },
+  };
+}
+
 // Lower a `Math.<name>` constant reference to a `mathConst` node. An unknown name
 // is a clear error (a bare `Math.<fn>` reference — no first-class functions — too).
 function lowerMathConst(name: string): Expr {
@@ -1086,14 +1185,10 @@ function lowerNewSet(node: ts.NewExpression): Expr {
 
 // Build a `setNew` node from an element type and the constructor arguments (an
 // optional array initializer). More than one argument is rejected.
-function setNewNode(
-  element: Type,
-  args?: ts.NodeArray<ts.Expression>,
-): Expr {
+function setNewNode(element: Type, args?: ts.NodeArray<ts.Expression>): Expr {
   if (args && args.length > 1) {
     throw new Error("new Set expects at most one argument (an array) (v1)");
   }
-  const init =
-    args && args.length === 1 ? lowerExpr(args[0]) : undefined;
+  const init = args && args.length === 1 ? lowerExpr(args[0]) : undefined;
   return { kind: "setNew", element, init };
 }

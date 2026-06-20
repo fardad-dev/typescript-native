@@ -49,6 +49,7 @@ field names, the user's functions, `main`).
 | `Map<K, V>`         | `std::shared_ptr<tsn_map<Kc, Vc>>` | **reference** type (`mapPointee`): an insertion-ordered `tsn_map` (runtime). `new Map<K,V>()` → `make_shared`; methods (`set`/`get`/`has`/`del`/`clear`/`keys`/`values`) via `->`; `.size` like `.length` (i64). Keys/values use the f64 rep. See *Math / Map / Set* below |
 | `Set<T>`            | `std::shared_ptr<tsn_set<Tc>>` | **reference** type (`setPointee`): an insertion-ordered `tsn_set`. `new Set<T>(arr?)` → `make_shared` (the array seeds it); `add`/`has`/`del`/`clear`/`values` via `->`; iterable by `for…of`; `.size` (i64) |
 | `Promise<T>`        | `tsn_promise<Tc>` (C++20 coroutine type) | **reference** type: a handle wrapping a `shared_ptr` to promise state. An `async` function's declared return type — its body is a coroutine (`co_return`/`co_await`). `Promise<void>` → `tsn_promise<tsn_unit>`. Resolved numbers use the f64 rep. See *Async / await* below |
+| `Response`          | `std::shared_ptr<tsn_response>` | **reference** type: the `fetch(...)` result. Fields `status` (f64) / `ok` (bool); methods `text()` → `Promise<string>`, `json()` → `Promise<T>` (target type required). See *fetch / Response* below |
 
 Arrays, objects and class instances are now **all reference types** (`std::shared_ptr<…>`), so JS
 semantics hold uniformly: copy/assign aliases, mutation through one alias is visible through the
@@ -371,6 +372,34 @@ are internal coroutine handles. Ordering matches Node/V8 byte-for-byte (verified
   lambda isn't a coroutine. `containsAwait` detects this and raises a clean `tsnc:` error (assign the
   awaited value first). `await` in IIFE *arguments* (e.g. the receiver of a chainable method, or
   `JSON.parse(await …)`) is fine — it's evaluated in the enclosing coroutine, not the lambda.
+
+## fetch / Response
+
+`fetch(url)` → `Promise<Response>`, faithfully `await`-able, built on the async runtime above. The
+microtask loop has **no async I/O**, so `fetch` does a **blocking** libcurl GET and returns an
+*already-settled* promise (`tsn_fetch` calls `tsn_resolve`/`tsn_reject`); `await_ready` being false
+keeps the one-tick deferral, so JS ordering still holds.
+
+- **`fetch` node** → `tsn_fetch(url)` (verifies the URL is a string). The runtime
+  ([cpp/tsn_runtime.h](cpp/tsn_runtime.h)) buffers the body, then resolves `shared_ptr<tsn_response>{
+  status, ok = 200..=299, body }`; a **transport error rejects** (so `await` throws the reason
+  string, catchable by `try`/`catch`), while an **HTTP error status resolves** with `ok === false`
+  (matching real fetch). The curl include + `tsn_fetch` are `#ifdef TSN_ENABLE_FETCH`.
+- **`Response` is a built-in reference type** (`isResponse`, like Map/Set). `res.status`/`res.ok` are
+  emitted as member loads in `emitExpr`'s `member` case; `res.text()` dispatches in `emitMethodCall`
+  (`emitResponseMethod`) to `tsn_resolve((res)->body)` (a `Promise<string>`).
+- **`json()`** is `Promise<any>`, which the subset can't represent, so the **target type is required**
+  (idiomatic TS): lowering captures it from `await res.json() as T` (a new `as`-expression form) or an
+  annotated target (`const x: T = await res.json()`) into a `responseJson { receiver, type }` node;
+  emit reuses `extractJson` to parse `(res)->body` into `T`, wrapped in `tsn_resolve` → a `Promise<T>`.
+  A bare `res.json()` (no target) reaches `emitResponseMethod` and is a clean `tsnc:` error.
+- **`usesFetch` gate** (parallel to `usesAsync`): set when a `fetch`/`responseJson`/`res.text()` is
+  emitted. It prepends `#define TSN_ENABLE_FETCH 1` before the runtime `#include`, and the driver
+  threads it out of `emit(mod) → { cpp, usesFetch }` to add `-lcurl` to the clang link. A non-fetch
+  program emits neither and links exactly as before. `console.log(res)` works via a `tsn_inspect`
+  overload (`Response { status: N, ok: B }`). **Deferred** (clean errors): request options
+  (`fetch(url, {…})` — caught at stage 0 by the one-arg ambient signature), `res.headers`/`blob()`/
+  `statusText`, GET only.
 
 ## Guard clauses
 

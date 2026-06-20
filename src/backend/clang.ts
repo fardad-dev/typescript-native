@@ -16,7 +16,11 @@ const execFileP = promisify(execFile);
 //    hard error, so control-flow paths that forget to return fail the build.
 // -std=c++20 (was c++17) gives us coroutines, which back async/await: an async
 //    function compiles to a coroutine returning tsn_promise<T> (see tsn_runtime.h).
-const CLANG_ARGS = (cppPath: string, outPath: string) => [
+// `extra` are extra trailing args — currently link libraries the program needs
+//    (e.g. `-lcurl` when it uses `fetch`). They go after `-o outPath`; clang takes
+//    `-l` flags at the end, and a non-fetch program passes `[]`, so its link line
+//    is byte-identical to before.
+const CLANG_ARGS = (cppPath: string, outPath: string, extra: string[]) => [
   "-std=c++20",
   "-O3",
   "-ffp-contract=off",
@@ -24,10 +28,17 @@ const CLANG_ARGS = (cppPath: string, outPath: string) => [
   cppPath,
   "-o",
   outPath,
+  ...extra,
 ];
 
-export function buildExecutable(cppPath: string, outPath: string): void {
-  execFileSync("clang++", CLANG_ARGS(cppPath, outPath), { stdio: "inherit" });
+export function buildExecutable(
+  cppPath: string,
+  outPath: string,
+  extra: string[] = [],
+): void {
+  execFileSync("clang++", CLANG_ARGS(cppPath, outPath, extra), {
+    stdio: "inherit",
+  });
 }
 
 // Async variant: clang++ runs as a child process without blocking the event
@@ -36,9 +47,10 @@ export function buildExecutable(cppPath: string, outPath: string): void {
 export async function buildExecutableAsync(
   cppPath: string,
   outPath: string,
+  extra: string[] = [],
 ): Promise<void> {
   try {
-    await execFileP("clang++", CLANG_ARGS(cppPath, outPath));
+    await execFileP("clang++", CLANG_ARGS(cppPath, outPath, extra));
   } catch (err) {
     const e = err as { stderr?: string; message: string };
     throw new Error(e.stderr?.trim() || e.message, { cause: err });
