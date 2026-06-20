@@ -16,7 +16,9 @@ is added or changed.
 - **`BinaryOp`** — `"+" | "-" | "*" | "/" | "%"`.
 - **`Expr`** (discriminated union) — `num`, `bool`, `str`, `var`, `binary`, `array`, `index`,
   `object`, `member` (covers `obj.field` and `arr.length`), `call`, `methodCall`, `new`
-  (`new C(args)`), `this`.
+  (`new C(args)`), `this`, `jsonStringify` (`JSON.stringify(arg)`), `jsonParse`
+  (`{ text; type }` — the parse target type, since `JSON.parse` is `any` and the subset needs a
+  concrete type; carried from a `JSON.parse(text) as T` assertion or an annotated target).
 - **`Stmt`** — `let`, `log`, `return`, `exprStmt` (a bare expression evaluated for effect).
 - **`RetType`** — `Type | "void"` (functions may return nothing; values never have `void` type).
 - **`Param`**, **`Func`** (`name`, `params`, `returnType`, `body`).

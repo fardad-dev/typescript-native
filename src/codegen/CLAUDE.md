@@ -8,11 +8,13 @@ real lowering — no SSA temporaries or pointer bookkeeping here.
 ## The runtime header (`cpp/tsn_runtime.h`)
 
 The program-**independent** C++ — `tsn_str`, the JS-semantics numeric/string/array helpers
-(`tsn_mod`, `tsn_substring`, `tsn_push`, …), and the scalar + array-template `tsn_inspect`
-overloads — lives as **real, editable C++** in [cpp/tsn_runtime.h](cpp/tsn_runtime.h), not as a
-string in `emit.ts`. Every emitted `.cpp` is just `#include "<abs>/tsn_runtime.h"` on top,
-followed by the program-**dependent** code `emit` generates (per-object-shape structs, the
-per-type `tsn_inspect` overloads that know field names, the user's functions, `main`).
+(`tsn_mod`, `tsn_substring`, `tsn_push`, …), the scalar + array-template `tsn_inspect` overloads,
+and the JSON runtime (`tsn_json` + `tsn_json_parse`, the `tsn_json_as_*` accessors, and the scalar +
+array-template `tsn_json_stringify`) — lives as **real, editable C++** in
+[cpp/tsn_runtime.h](cpp/tsn_runtime.h), not as a string in `emit.ts`. Every emitted `.cpp` is just
+`#include "<abs>/tsn_runtime.h"` on top, followed by the program-**dependent** code `emit` generates
+(per-object-shape structs, the per-type `tsn_inspect` / `tsn_json_stringify` overloads that know
+field names, the user's functions, `main`).
 
 - `emit.ts` resolves `RUNTIME_HEADER = ${__dirname}/cpp/tsn_runtime.h` and emits it as an
   **absolute** path, so the generated `.cpp` recompiles by hand (`clang++ -std=c++17 file.cpp`)
@@ -220,6 +222,31 @@ first; then class/struct forward decls; then the per-type inspect forward decls;
 struct/class defs; then the array-template + per-type inspect *definitions* (every type complete by
 now). Caveat: always single-line (no Node `breakLength` wrapping) — matches Node for small values.
 
+## JSON (`JSON.stringify` / `JSON.parse`)
+
+Both match Node byte-for-byte on the subset. The runtime ([cpp/tsn_runtime.h](cpp/tsn_runtime.h))
+carries the program-independent halves; codegen emits the program-dependent shaping.
+
+- **`jsonStringify` → `tsn_json_stringify(<arg>)`.** Dispatch is pure C++ overload resolution: the
+  runtime has the scalar overloads (`double`/`long long`/`bool`/`tsn_str`, with `null` for
+  non-finite numbers) + the array template; codegen generates one overload **per object struct /
+  class** (`jsonStringifyFwdDecls` / `aggregateJsonStringifyDefs` / `jsonStringifyBody`) — the exact
+  `tsn_inspect` machinery, including forward decls and ADL resolution of array elements at the
+  instantiation point. The difference is JSON output: double-quoted keys (`"k":v`), no spaces, and
+  **no class name** on an instance. These per-type fwd-decls/defs are interleaved in `emitModule`
+  right after the matching `tsn_inspect` ones.
+- **`jsonParse` → an inline extraction expression** (`emitJsonParse` / `extractJson`). The runtime
+  parses the text to a generic `tsn_json` (a tagged union); codegen pulls the **statically-known
+  target type** out of it: scalars via the `tsn_json_as_*` accessors, arrays/objects via
+  immediately-invoked lambdas that build the `vector`/`struct` and recurse (`uid`-suffixed locals,
+  so nested lambdas don't shadow). No per-type helpers or forward decls are needed — a JSON value
+  type is a finite tree (the subset has no recursive/aliased types). `assertJsonType` rejects a
+  **class** target (no prototype to rebuild). A parsed `number` is always the f64 rep (JSON numbers
+  parse to doubles), so `repr.ts` reports `jsonParse` as f64 regardless of the target's number rep.
+- **Errors.** No exceptions in the subset, so a malformed parse or a value that doesn't match the
+  asserted type calls `tsn_json_fail` (stderr + `exit(1)`) — the closest analog to an uncaught JS
+  `SyntaxError`.
+
 ## Guard clauses
 
 Type errors (wrong assignment/argument/return types, undeclared names, bad property access) are
@@ -228,5 +255,8 @@ and never reach codegen. The emitter still throws a clear `Error` (→ `tsnc: <m
 constructs the subset doesn't lower: string concatenation of incompatible types, arithmetic on
 aggregates, indexing a non-array, an empty array literal with no annotation, void-as-value, an
 **unknown class** (`new X` / a `: X` annotation with no class `X`), an **unknown method/field** on a
-class, and **bare `this`** used as a value. (`console.log` of an array/object/instance is now
-supported — see *Printing* — and `===`/`!==` on arrays/objects is reference identity, not an error.)
+class, a **`JSON.parse` target that is a class type** (`assertJsonType`), and **bare `this`** used as
+a value. (`console.log` of an array/object/instance is now supported — see *Printing* — and
+`===`/`!==` on arrays/objects is reference identity, not an error.) Lowering ([../frontend/lower.ts](../frontend/lower.ts))
+adds two more: a bare `JSON.parse(x)` with no target type, and a general `as T` assertion (only
+`JSON.parse(text) as T` is accepted).

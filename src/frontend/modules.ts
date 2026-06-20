@@ -397,6 +397,13 @@ class Renamer {
         e.receiver = this.expr(e.receiver, locals); // not e.method
         e.args = e.args.map((a) => this.expr(a, locals));
         return e;
+      case "jsonStringify":
+        e.arg = this.expr(e.arg, locals);
+        return e;
+      case "jsonParse":
+        e.text = this.expr(e.text, locals);
+        this.type(e.type); // resolve any class type-ref (codegen rejects it later)
+        return e;
       default:
         return e; // num / bool / str / this
     }

@@ -80,13 +80,20 @@ A multi-file program is assembled from per-file `lower` results by `loadProgram`
   also rejects parameter-properties (`constructor(private x: ...)`).
 - `lowerStatement(node, out)` — `let`/`const`, `return`, `console.log(...)` (special-cased to a
   `log` stmt), and bare call expressions (`exprStmt`).
-- `lowerVarDecl(decl)` — a single `let`/`const` binding; initializer is required.
+- `lowerVarDecl(decl)` — a single `let`/`const` binding; initializer is required. Also the home of
+  the `const x: T = JSON.parse(text)` idiom: when annotated and the initializer is a `JSON.parse`
+  call, the annotation supplies the parse target type (→ a `jsonParse` node).
 - `lowerType(node)` — TS `TypeNode` → IR `Type` (keywords, `T[]`, `Array<T>`, object type literals;
   a **bare identifier** that isn't a known primitive/`Array` → a `class` instance type).
 - `lowerExpr(node)` — TS `Expression` → IR `Expr` (literals, identifiers, binary, array/object
-  literals, indexing, member access, calls, `new C(...)`, `this`).
+  literals, indexing, member access, calls, `new C(...)`, `this`). Also recognizes the `JSON.*`
+  builtins (`tryLowerJsonCall`) and the `JSON.parse(text) as T` assertion (the one `as`-expression
+  form the subset accepts — a general type assertion is rejected).
 - `lowerBinaryOp(kind)` — operator token → `BinaryOp`.
 - `isConsoleLog(expr)` — recognizes the `console.log` callee.
+- `tryLowerJsonCall(node)` / `isJsonParseCall(node)` / `jsonParseNode(call, type)` — recognize and
+  lower the `JSON.stringify` / `JSON.parse` builtins. `JSON.stringify(x)` lowers directly; a bare
+  `JSON.parse(x)` (no `as T` / annotation, so no target type) is a clear error.
 
 ## Conventions / gotchas
 

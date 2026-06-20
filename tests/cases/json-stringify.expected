@@ -1,0 +1,12 @@
+42
+3.5
+true
+"hi"
+"quote \" backslash \\ newline \n tab \t"
+[1,2,3]
+["a","b"]
+{"x":1,"y":2,"name":"p"}
+{"id":1,"tags":["a","b"],"pos":{"x":3,"y":4}}
+[{"id":1},{"id":2}]
+[]
+{"x":5,"y":6}

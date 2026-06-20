@@ -142,6 +142,10 @@ class Emitter {
   // per-struct `tsn_inspect` (JS-style printing) once every struct is known.
   private structFields = new Map<string, Field[]>();
 
+  // Monotonic counter for uniquely naming the locals of the inline lambdas that
+  // JSON.parse extraction emits (so nested lambdas never shadow one another).
+  private jsonUid = 0;
+
   // Representation table (number i64/f64), inferred up front by repr.ts.
   private reps!: RepTable;
 
@@ -208,6 +212,11 @@ class Emitter {
     // every aggregate/instance type is covered) — see the JS-style printing block.
     const inspectFwd = this.inspectFwdDecls();
     const inspectDefs = this.aggregateInspectDefs();
+    // Per-type `tsn_json_stringify` overloads — same per-object/class machinery as
+    // tsn_inspect, but JSON output. (JSON.parse needs no per-type defs — it emits
+    // inline extraction lambdas.)
+    const jsonFwd = this.jsonStringifyFwdDecls();
+    const jsonDefs = this.aggregateJsonStringifyDefs();
 
     return [
       // The fixed C++ runtime (tsn_str, JS-semantics numeric/string/array helpers,
@@ -229,9 +238,11 @@ class Emitter {
         ? [...classFwd, ...structFwd, ``]
         : []),
       ...(inspectFwd.length ? [...inspectFwd, ``] : []),
+      ...(jsonFwd.length ? [...jsonFwd, ``] : []),
       ...(this.structDefs.length ? [...this.structDefs, ``] : []),
       ...(classStructs.length ? [classStructs.join("\n\n"), ``] : []),
       ...(inspectDefs.length ? [inspectDefs.join("\n\n"), ``] : []),
+      ...(jsonDefs.length ? [jsonDefs.join("\n\n"), ``] : []),
       // Module-level globals (promoted top-level `let`/`const`) — declared after
       // the struct/class definitions and before the function/method bodies and
       // main that read them. A shared_ptr global only needs a forward decl, but
@@ -370,6 +381,64 @@ class Emitter {
       );
     });
     lines.push(`  out += " }";`);
+    lines.push(`  return out;`);
+    lines.push(`}`);
+    return lines.join("\n");
+  }
+
+  // --- JSON.stringify (per-object / per-class overloads) ------------------
+  //
+  // Mirrors the tsn_inspect machinery exactly (the runtime carries the scalar
+  // overloads + array template; these are the program-dependent ones that need
+  // field names), but emits JSON: double-quoted keys, no spaces, and no class
+  // name on an instance — `JSON.stringify(new Pt(1,2))` is `{"x":1,"y":2}`.
+
+  // `tsn_json_stringify(const std::shared_ptr<NAME>&)` forward declarations.
+  private jsonStringifyFwdDecls(): string[] {
+    const names = [...this.structFields.keys(), ...this.classes.keys()];
+    return names.map(
+      (n) =>
+        `static std::string tsn_json_stringify(const std::shared_ptr<${n}>& v);`,
+    );
+  }
+
+  // The `tsn_json_stringify` definitions for every object struct and class.
+  private aggregateJsonStringifyDefs(): string[] {
+    const defs: string[] = [];
+    for (const [name, fields] of this.structFields) {
+      defs.push(this.jsonStringifyBody(name, fields));
+    }
+    for (const cls of this.classes.values()) {
+      defs.push(this.jsonStringifyBody(cls.name, cls.fields));
+    }
+    return defs;
+  }
+
+  // One `tsn_json_stringify` body. Each field recurses through tsn_json_stringify
+  // (nested objects/arrays/strings are serialized correctly); a null pointer (an
+  // uninitialized global) serializes as `null`, like JS.
+  private jsonStringifyBody(name: string, fields: Field[]): string {
+    if (fields.length === 0) {
+      return [
+        `static std::string tsn_json_stringify(const std::shared_ptr<${name}>& v) {`,
+        `  if (!v) return "null";`,
+        `  return "{}";`,
+        `}`,
+      ].join("\n");
+    }
+    const lines = [
+      `static std::string tsn_json_stringify(const std::shared_ptr<${name}>& v) {`,
+      `  if (!v) return "null";`,
+      `  std::string out = "{";`,
+    ];
+    fields.forEach((f, i) => {
+      // The leading separator + the JSON-quoted key, e.g. `,"x":`.
+      const key = cppStringLiteral(
+        `${i === 0 ? "" : ","}${JSON.stringify(f.name)}:`,
+      );
+      lines.push(`  out += ${key}; out += tsn_json_stringify(v->${f.name});`);
+    });
+    lines.push(`  out += "}";`);
     lines.push(`  return out;`);
     lines.push(`}`);
     return lines.join("\n");
@@ -1056,7 +1125,97 @@ class Emitter {
         const rep = val.type === "number" ? "f64" : undefined;
         return { code: val.code, type: val.type as Type, rep };
       }
+      case "jsonStringify": {
+        // Any value type serializes — overload resolution on tsn_json_stringify
+        // picks the scalar / array-template / generated per-type overload.
+        const v = this.emitExpr(e.arg);
+        return { code: `tsn_json_stringify(${v.code})`, type: "string" };
+      }
+      case "jsonParse":
+        return this.emitJsonParse(e);
     }
+  }
+
+  // --- JSON.parse ---------------------------------------------------------
+  //
+  // The runtime parses the text into a generic `tsn_json` value; here we emit a
+  // recursive *extraction* expression that pulls the statically-known target type
+  // out of it: scalars via the `tsn_json_as_*` accessors, arrays/objects via inline
+  // lambdas (so no per-type helper functions or forward decls are needed — the
+  // target type is a finite tree, the subset has no recursive/aliased types).
+  private emitJsonParse(e: { text: Expr; type: Type }): Value {
+    const text = this.emitExpr(e.text);
+    if (text.type !== "string") {
+      throw new Error("JSON.parse expects a string argument");
+    }
+    this.assertJsonType(e.type);
+    return {
+      code: this.extractJson(`tsn_json_parse(${text.code})`, e.type),
+      type: e.type,
+      // JSON numbers parse to doubles, so a parsed value is always the f64 rep.
+      rep: e.type === "number" ? "f64" : undefined,
+    };
+  }
+
+  // A JSON.parse target must be a JSON *value* type: scalars and arrays/objects of
+  // them. A class instance has no JSON form (no prototype/constructor to rebuild),
+  // so it's rejected with a clear error rather than miscompiled.
+  private assertJsonType(t: Type): void {
+    if (isClass(t)) {
+      throw new Error(
+        `JSON.parse target type may not be a class ('${t.name}') — use an object type like { ... }`,
+      );
+    }
+    if (isArray(t)) {
+      this.assertJsonType(t.element);
+    } else if (isObject(t)) {
+      for (const f of t.fields) this.assertJsonType(f.type);
+    }
+  }
+
+  // C++ expression that extracts a value of tsn type `t` from the `tsn_json`
+  // expression `j`. Recurses for aggregates via immediately-invoked lambdas
+  // (`uid`-suffixed locals avoid name clashes between nested lambdas).
+  private extractJson(j: string, t: Type): string {
+    if (t === "number") return `tsn_json_as_number(${j})`;
+    if (t === "boolean") return `tsn_json_as_bool(${j})`;
+    if (t === "string") return `tsn_json_as_string(${j})`;
+    if (isArray(t)) {
+      const id = this.jsonUid++;
+      const a = `_ja${id}`;
+      const v = `_jv${id}`;
+      const el = `_je${id}`;
+      const vec = this.vecType(t);
+      const elem = this.extractJson(el, t.element);
+      return (
+        `([&](const tsn_json& ${a}) { ` +
+        `auto ${v} = std::make_shared<${vec}>(); ` +
+        `for (const tsn_json& ${el} : ${a}.as_array()) { ${v}->push_back(${elem}); } ` +
+        `return ${v}; }(${j}))`
+      );
+    }
+    if (isObject(t)) {
+      const id = this.jsonUid++;
+      const o = `_jo${id}`;
+      const r = `_jr${id}`;
+      const struct = this.structName(t); // registers the struct
+      const assigns = t.fields
+        .map((f) => {
+          const fv = this.extractJson(
+            `${o}.get(${cppStringLiteral(f.name)})`,
+            f.type,
+          );
+          return `${r}->${f.name} = ${fv};`;
+        })
+        .join(" ");
+      return (
+        `([&](const tsn_json& ${o}) { ` +
+        `auto ${r} = std::make_shared<${struct}>(); ${assigns} ` +
+        `return ${r}; }(${j}))`
+      );
+    }
+    // Class types are rejected by assertJsonType before we get here.
+    throw new Error("Unsupported JSON.parse target type");
   }
 
   // A field load/lvalue on a class instance: `(recv)->field`. Fields use the f64

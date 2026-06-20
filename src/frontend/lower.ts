@@ -379,6 +379,17 @@ function lowerVarDecl(decl: ts.VariableDeclaration): Stmt {
   }
   // No annotation -> leave type undefined; codegen infers it from the initializer.
   const type = decl.type ? lowerType(decl.type) : undefined;
+  // `const x: T = JSON.parse(text)` — the variable annotation supplies the parse
+  // target type (the common idiom alongside `JSON.parse(text) as T`).
+  const initNode = skipParens(decl.initializer);
+  if (type !== undefined && isJsonParseCall(initNode)) {
+    return {
+      kind: "let",
+      name: decl.name.text,
+      type,
+      init: jsonParseNode(initNode, type),
+    };
+  }
   return {
     kind: "let",
     name: decl.name.text,
@@ -460,6 +471,18 @@ function lowerExpr(node: ts.Expression): Expr {
     };
   }
   if (ts.isParenthesizedExpression(node)) return lowerExpr(node.expression);
+  // `e as T` — only supported as the type carrier for `JSON.parse(text) as T`
+  // (JSON.parse is `any`, so the assertion supplies the value's static type). A
+  // general type assertion has no representation in the typed subset.
+  if (ts.isAsExpression(node)) {
+    const inner = skipParens(node.expression);
+    if (isJsonParseCall(inner)) {
+      return jsonParseNode(inner, lowerType(node.type));
+    }
+    throw new Error(
+      "Type assertions ('as T') are only supported on JSON.parse(...) (v1)",
+    );
+  }
   if (ts.isArrayLiteralExpression(node)) {
     return {
       kind: "array",
@@ -500,6 +523,10 @@ function lowerExpr(node: ts.Expression): Expr {
     };
   }
   if (ts.isCallExpression(node)) {
+    // `JSON.stringify(x)` / `JSON.parse(x)` are builtins, not method calls —
+    // intercept before the generic `recv.method(args)` path.
+    const json = tryLowerJsonCall(node);
+    if (json) return json;
     // `recv.method(args)` -> methodCall (e.g. xs.push(v)).
     if (ts.isPropertyAccessExpression(node.expression)) {
       return {
@@ -586,4 +613,59 @@ function isConsoleLog(expr: ts.Expression): boolean {
     expr.expression.text === "console" &&
     expr.name.text === "log"
   );
+}
+
+// Strip enclosing parentheses so a call wrapped like `(JSON.parse(x))` is still
+// recognized. (lowerExpr already unwraps parens for emission; this is just for
+// the structural `isJsonParseCall` check before lowering.)
+function skipParens(node: ts.Expression): ts.Expression {
+  while (ts.isParenthesizedExpression(node)) node = node.expression;
+  return node;
+}
+
+// Is this call `JSON.<method>(...)`? Returns the method name, or null otherwise.
+function jsonMethod(node: ts.CallExpression): string | null {
+  const callee = node.expression;
+  if (
+    ts.isPropertyAccessExpression(callee) &&
+    ts.isIdentifier(callee.expression) &&
+    callee.expression.text === "JSON"
+  ) {
+    return callee.name.text;
+  }
+  return null;
+}
+
+function isJsonParseCall(node: ts.Expression): node is ts.CallExpression {
+  return ts.isCallExpression(node) && jsonMethod(node) === "parse";
+}
+
+// Build a `jsonParse` IR node from a `JSON.parse(text)` call and its target type.
+function jsonParseNode(call: ts.CallExpression, type: Type): Expr {
+  if (call.arguments.length !== 1) {
+    throw new Error("JSON.parse expects exactly one argument (v1)");
+  }
+  return { kind: "jsonParse", text: lowerExpr(call.arguments[0]), type };
+}
+
+// Recognize the `JSON.*` builtins in call position. `JSON.stringify(x)` lowers
+// directly; `JSON.parse(x)` only lowers with a target type (from `as T` or a
+// variable annotation, handled by the AsExpression branch / lowerVarDecl), so a
+// bare `JSON.parse(x)` reaching here is a clear error. Returns null for a non-JSON
+// call (it falls through to the normal method/function-call lowering).
+function tryLowerJsonCall(node: ts.CallExpression): Expr | null {
+  const method = jsonMethod(node);
+  if (method === null) return null;
+  if (method === "stringify") {
+    if (node.arguments.length !== 1) {
+      throw new Error("JSON.stringify expects exactly one argument (v1)");
+    }
+    return { kind: "jsonStringify", arg: lowerExpr(node.arguments[0]) };
+  }
+  if (method === "parse") {
+    throw new Error(
+      "JSON.parse needs a target type — write `JSON.parse(text) as T` or annotate the target (`const x: T = JSON.parse(text)`)",
+    );
+  }
+  throw new Error(`Unsupported JSON method 'JSON.${method}' (v1)`);
 }

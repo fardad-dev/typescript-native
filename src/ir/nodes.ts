@@ -54,7 +54,13 @@ export type Expr =
   // `new C(args)` — construct a class instance
   | { kind: "new"; className: string; args: Expr[] }
   // `this` inside a method/constructor (only valid as `this.field`/`this.method()`)
-  | { kind: "this" };
+  | { kind: "this" }
+  // `JSON.stringify(arg)` — serialize any value to a JSON string.
+  | { kind: "jsonStringify"; arg: Expr }
+  // `JSON.parse(text) as T` (or a `T`-annotated target) — parse a JSON string into
+  // a value of a statically-known type `T`. JSON.parse is `any` in TypeScript, so
+  // the subset requires the target type up front (it can't lower an untyped value).
+  | { kind: "jsonParse"; text: Expr; type: Type };
 
 export type Stmt =
   // `type` is the annotation; absent means infer from the initializer.

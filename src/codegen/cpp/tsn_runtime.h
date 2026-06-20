@@ -23,6 +23,7 @@
 #include <cctype>
 #include <charconv>
 #include <cmath>
+#include <cstdlib>
 #include <iostream>
 #include <memory>
 #include <string>
@@ -327,5 +328,328 @@ static std::string tsn_inspect(const std::shared_ptr<std::vector<T>>& a) {
     out += tsn_inspect((*a)[i]);
   }
   out += " ]";
+  return out;
+}
+
+// --- JSON (JSON.parse / JSON.stringify) ---------------------------------
+//
+// JSON.parse is `any` in TypeScript, but the tsn subset is statically typed, so
+// codegen always knows the *target* type at the call site (from `as T` or the
+// receiving annotation). The two halves below reflect that split:
+//
+//   - PARSE. A generic, program-INDEPENDENT recursive-descent parser turns a
+//     string into a `tsn_json` value (a tagged union). The generated .cpp then
+//     extracts the statically-typed C++ value out of that `tsn_json` (scalars via
+//     the `tsn_json_as_*` accessors below, arrays/objects via inline lambdas) —
+//     so the parser stays here and the per-type shaping is emitted per call.
+//   - STRINGIFY. Like `tsn_inspect`, but JSON format (double-quoted keys/strings,
+//     no spaces, `null` for NaN/Infinity, no class name). The scalar overloads +
+//     array template live here; the per-object/class overloads are generated.
+//
+// There is no exception machinery in the subset, so a parse failure or a value
+// that doesn't match the asserted type prints a message and exits non-zero
+// (`tsn_json_fail`) — the closest analog to JS's uncaught `SyntaxError`.
+
+[[noreturn]] static void tsn_json_fail(const std::string& msg) {
+  std::cerr << "tsn: JSON: " << msg << "\n";
+  std::exit(1);
+}
+
+// A parsed JSON value: a tagged union over the six JSON kinds. Objects keep their
+// members in source order (a small vector, looked up by key) — JSON objects are
+// small in practice, so a linear scan beats a map's overhead.
+struct tsn_json {
+  enum Kind { Null, Bool, Number, String, Array, Object } kind = Null;
+  bool b = false;
+  double num = 0;
+  std::string str;                                    // String
+  std::vector<tsn_json> arr;                          // Array
+  std::vector<std::pair<std::string, tsn_json>> obj;  // Object (in order)
+
+  const std::vector<tsn_json>& as_array() const {
+    if (kind != Array) tsn_json_fail("expected an array");
+    return arr;
+  }
+  const tsn_json& get(const std::string& key) const {
+    if (kind != Object) tsn_json_fail("expected an object");
+    for (const auto& kv : obj)
+      if (kv.first == key) return kv.second;
+    // JS would yield `undefined`; the subset has no undefined, so this is an error.
+    tsn_json_fail("missing key '" + key + "'");
+  }
+};
+
+// Scalar extractors used by generated JSON.parse code. Each enforces that the
+// parsed value matches the statically-asserted type (a mismatch is a hard error,
+// since there is no `any` to fall back to).
+static double tsn_json_as_number(const tsn_json& j) {
+  if (j.kind != tsn_json::Number) tsn_json_fail("expected a number");
+  return j.num;
+}
+static bool tsn_json_as_bool(const tsn_json& j) {
+  if (j.kind != tsn_json::Bool) tsn_json_fail("expected a boolean");
+  return j.b;
+}
+static tsn_str tsn_json_as_string(const tsn_json& j) {
+  if (j.kind != tsn_json::String) tsn_json_fail("expected a string");
+  return tsn_str(j.str);
+}
+
+// Encode a Unicode code point as UTF-8 bytes (for `\uXXXX` escapes in strings).
+static void tsn_json_append_utf8(std::string& out, unsigned cp) {
+  if (cp <= 0x7F) {
+    out += (char)cp;
+  } else if (cp <= 0x7FF) {
+    out += (char)(0xC0 | (cp >> 6));
+    out += (char)(0x80 | (cp & 0x3F));
+  } else if (cp <= 0xFFFF) {
+    out += (char)(0xE0 | (cp >> 12));
+    out += (char)(0x80 | ((cp >> 6) & 0x3F));
+    out += (char)(0x80 | (cp & 0x3F));
+  } else {
+    out += (char)(0xF0 | (cp >> 18));
+    out += (char)(0x80 | ((cp >> 12) & 0x3F));
+    out += (char)(0x80 | ((cp >> 6) & 0x3F));
+    out += (char)(0x80 | (cp & 0x3F));
+  }
+}
+
+// A small recursive-descent JSON parser over a std::string. Standard JSON grammar:
+// whitespace, null/true/false, numbers (int/frac/exp), strings (with `\` escapes
+// incl. `\uXXXX` and surrogate pairs), arrays, and objects. Any malformed input
+// calls tsn_json_fail (which exits) — matching an uncaught JS SyntaxError.
+struct tsn_json_parser {
+  const std::string& s;
+  std::size_t i = 0;
+  explicit tsn_json_parser(const std::string& src) : s(src) {}
+
+  void skip_ws() {
+    while (i < s.size()) {
+      char c = s[i];
+      if (c == ' ' || c == '\t' || c == '\n' || c == '\r') ++i;
+      else break;
+    }
+  }
+
+  tsn_json parse() {
+    skip_ws();
+    tsn_json v = parse_value();
+    skip_ws();
+    if (i != s.size()) tsn_json_fail("unexpected trailing characters");
+    return v;
+  }
+
+  tsn_json parse_value() {
+    skip_ws();
+    if (i >= s.size()) tsn_json_fail("unexpected end of input");
+    char c = s[i];
+    if (c == '{') return parse_object();
+    if (c == '[') return parse_array();
+    if (c == '"') {
+      tsn_json v;
+      v.kind = tsn_json::String;
+      v.str = parse_string();
+      return v;
+    }
+    if (c == 't' || c == 'f') return parse_bool();
+    if (c == 'n') return parse_null();
+    if (c == '-' || (c >= '0' && c <= '9')) return parse_number();
+    tsn_json_fail("unexpected character");
+  }
+
+  unsigned parse_hex4() {
+    if (i + 4 > s.size()) tsn_json_fail("bad \\u escape");
+    unsigned v = 0;
+    for (int k = 0; k < 4; ++k) {
+      char c = s[i++];
+      v <<= 4;
+      if (c >= '0' && c <= '9') v |= (unsigned)(c - '0');
+      else if (c >= 'a' && c <= 'f') v |= (unsigned)(c - 'a' + 10);
+      else if (c >= 'A' && c <= 'F') v |= (unsigned)(c - 'A' + 10);
+      else tsn_json_fail("bad \\u escape");
+    }
+    return v;
+  }
+
+  std::string parse_string() {
+    ++i;  // consume opening quote
+    std::string out;
+    while (i < s.size()) {
+      char c = s[i++];
+      if (c == '"') return out;
+      if (c == '\\') {
+        if (i >= s.size()) tsn_json_fail("bad escape");
+        char e = s[i++];
+        switch (e) {
+          case '"': out += '"'; break;
+          case '\\': out += '\\'; break;
+          case '/': out += '/'; break;
+          case 'b': out += '\b'; break;
+          case 'f': out += '\f'; break;
+          case 'n': out += '\n'; break;
+          case 'r': out += '\r'; break;
+          case 't': out += '\t'; break;
+          case 'u': {
+            unsigned cp = parse_hex4();
+            if (cp >= 0xD800 && cp <= 0xDBFF) {  // high surrogate -> need a low one
+              if (i + 1 < s.size() && s[i] == '\\' && s[i + 1] == 'u') {
+                i += 2;
+                unsigned lo = parse_hex4();
+                if (lo < 0xDC00 || lo > 0xDFFF) tsn_json_fail("bad surrogate pair");
+                cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+              } else {
+                tsn_json_fail("bad surrogate pair");
+              }
+            }
+            tsn_json_append_utf8(out, cp);
+            break;
+          }
+          default: tsn_json_fail("bad escape");
+        }
+      } else {
+        out += c;
+      }
+    }
+    tsn_json_fail("unterminated string");
+  }
+
+  tsn_json parse_number() {
+    std::size_t start = i;
+    if (i < s.size() && s[i] == '-') ++i;
+    while (i < s.size() && s[i] >= '0' && s[i] <= '9') ++i;
+    if (i < s.size() && s[i] == '.') {
+      ++i;
+      while (i < s.size() && s[i] >= '0' && s[i] <= '9') ++i;
+    }
+    if (i < s.size() && (s[i] == 'e' || s[i] == 'E')) {
+      ++i;
+      if (i < s.size() && (s[i] == '+' || s[i] == '-')) ++i;
+      while (i < s.size() && s[i] >= '0' && s[i] <= '9') ++i;
+    }
+    tsn_json v;
+    v.kind = tsn_json::Number;
+    v.num = std::strtod(s.substr(start, i - start).c_str(), nullptr);
+    return v;
+  }
+
+  tsn_json parse_bool() {
+    if (s.compare(i, 4, "true") == 0) {
+      i += 4;
+      tsn_json v;
+      v.kind = tsn_json::Bool;
+      v.b = true;
+      return v;
+    }
+    if (s.compare(i, 5, "false") == 0) {
+      i += 5;
+      tsn_json v;
+      v.kind = tsn_json::Bool;
+      v.b = false;
+      return v;
+    }
+    tsn_json_fail("invalid literal");
+  }
+
+  tsn_json parse_null() {
+    if (s.compare(i, 4, "null") == 0) {
+      i += 4;
+      return tsn_json();  // Null
+    }
+    tsn_json_fail("invalid literal");
+  }
+
+  tsn_json parse_array() {
+    ++i;  // consume '['
+    tsn_json v;
+    v.kind = tsn_json::Array;
+    skip_ws();
+    if (i < s.size() && s[i] == ']') { ++i; return v; }
+    while (true) {
+      v.arr.push_back(parse_value());
+      skip_ws();
+      if (i >= s.size()) tsn_json_fail("unterminated array");
+      char c = s[i++];
+      if (c == ']') return v;
+      if (c != ',') tsn_json_fail("expected ',' or ']'");
+    }
+  }
+
+  tsn_json parse_object() {
+    ++i;  // consume '{'
+    tsn_json v;
+    v.kind = tsn_json::Object;
+    skip_ws();
+    if (i < s.size() && s[i] == '}') { ++i; return v; }
+    while (true) {
+      skip_ws();
+      if (i >= s.size() || s[i] != '"') tsn_json_fail("expected object key");
+      std::string key = parse_string();
+      skip_ws();
+      if (i >= s.size() || s[i] != ':') tsn_json_fail("expected ':'");
+      ++i;
+      v.obj.emplace_back(std::move(key), parse_value());
+      skip_ws();
+      if (i >= s.size()) tsn_json_fail("unterminated object");
+      char c = s[i++];
+      if (c == '}') return v;
+      if (c != ',') tsn_json_fail("expected ',' or '}'");
+    }
+  }
+};
+
+static tsn_json tsn_json_parse(const std::string& s) {
+  return tsn_json_parser(s).parse();
+}
+
+// JSON.stringify, JSON format: double-quoted keys and strings (with escapes), no
+// spaces, `null` for non-finite numbers. The scalar overloads + array template
+// are here; the per-object-struct / per-class overloads (which need field names)
+// are generated into the .cpp, mirroring the tsn_inspect split (and resolved on
+// array elements by ADL at the instantiation point, same as tsn_inspect).
+static std::string tsn_json_quote(const std::string& s) {
+  std::string out;
+  out += '"';
+  const char* hex = "0123456789abcdef";
+  for (unsigned char c : s) {
+    switch (c) {
+      case '"': out += '\\'; out += '"'; break;
+      case '\\': out += '\\'; out += '\\'; break;
+      case '\b': out += '\\'; out += 'b'; break;
+      case '\f': out += '\\'; out += 'f'; break;
+      case '\n': out += '\\'; out += 'n'; break;
+      case '\r': out += '\\'; out += 'r'; break;
+      case '\t': out += '\\'; out += 't'; break;
+      default:
+        if (c < 0x20) {
+          out += '\\'; out += 'u'; out += '0'; out += '0';
+          out += hex[(c >> 4) & 0xF];
+          out += hex[c & 0xF];
+        } else {
+          out += (char)c;
+        }
+    }
+  }
+  out += '"';
+  return out;
+}
+static std::string tsn_json_stringify(double v) {
+  if (!std::isfinite(v)) return "null";  // JSON has no NaN/Infinity
+  return tsn_num_to_string(v);
+}
+static std::string tsn_json_stringify(long long v) { return std::to_string(v); }
+static std::string tsn_json_stringify(bool b) { return b ? "true" : "false"; }
+static std::string tsn_json_stringify(const tsn_str& s) { return tsn_json_quote(s.str()); }
+template <class T>
+static std::string tsn_json_stringify(const std::shared_ptr<std::vector<T>>& a);
+
+template <class T>
+static std::string tsn_json_stringify(const std::shared_ptr<std::vector<T>>& a) {
+  if (!a) return "null";
+  std::string out = "[";
+  for (std::size_t i = 0; i < a->size(); ++i) {
+    if (i) out += ",";
+    out += tsn_json_stringify((*a)[i]);
+  }
+  out += "]";
   return out;
 }

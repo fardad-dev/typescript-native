@@ -105,7 +105,7 @@ npm test            # run the e2e suite once (vitest run)
 npm run test:watch  # re-run on change — the TDD red->green loop
 ```
 
-The suite (currently **78 e2e cases** + a stage-0 type-checker test file + a module-loader test
+The suite (currently **81 e2e cases** + a stage-0 type-checker test file + a module-loader test
 file, all green) auto-discovers every `tests/cases/*.ts`, compiles it to a real native binary,
 runs it, and diffs stdout against the matching `.expected` file. **Every feature gets a
 `tests/cases/*.ts` + `.expected` pair**, ideally written first (red), then implemented to green.
@@ -142,6 +142,17 @@ Implemented and tested end-to-end:
   round-trip, booleans `true`/`false`, top-level strings bare; arrays `[ 1, 2 ]`, objects
   `{ k: v }`, class instances `Name { k: v }`, with nested strings quoted (`'x'`) and aggregates
   printed recursively (single-line; see _Richer console.log_ in the roadmap for the size caveat).
+- **`JSON.stringify(x)` / `JSON.parse(text)`** (single value arg), matching Node byte-for-byte on
+  the subset. `JSON.stringify` serializes any value to a compact JSON `string` (double-quoted
+  keys/strings with JSON escaping, no spaces, `null` for `NaN`/`Infinity`, no class name on an
+  instance). `JSON.parse` is statically typed: TypeScript types it `any`, which the subset can't
+  represent, so the **target type is required up front** — `JSON.parse(text) as T` or an annotated
+  target (`const x: T = JSON.parse(text)`). `T` is any JSON **value** type (scalars, arrays,
+  objects, nested); a **class** target is a clean `tsnc:` error (no prototype to rebuild). The
+  runtime parses to a generic value and codegen extracts the typed value out of it; malformed JSON
+  or a value that doesn't match `T` prints a message and exits non-zero (no exceptions in the
+  subset — the closest analog to an uncaught JS `SyntaxError`). **Deferred** (clean errors): the
+  `replacer`/`space` args of `stringify`, the `reviver` arg of `parse`, and class targets.
 - **Variables:** `let` / `const` (initializer required); a type annotation is optional — without
   one the type is **inferred from the initializer**. `var` is **not supported** (errors). Assignment
   `x = e`, `a[i] = e`, `obj.f = e`, compound `+= -= *= /= %=`, and `i++` / `i--`. A **top-level**
@@ -466,17 +477,90 @@ pair** (red → green).
       statements, non-relative specifiers, and circular imports. Helper modules for the e2e suite live
       in `tests/cases/modlib/` (a subdirectory, so the non-recursive harness doesn't run them as
       standalone cases); structural rejections are in [tests/modules.test.ts](tests/modules.test.ts).
+- [x] **`JSON.parse` / `JSON.stringify`** — both builtins, matching Node byte-for-byte on the subset
+      (cross-checked against `node` in the e2e cases). The interesting half was **typing
+      `JSON.parse`**: it's `any` in TypeScript, which the statically-typed subset can't represent, so
+      the **target type is required up front** — `JSON.parse(text) as T` (a new, narrowly-scoped
+      `as`-expression branch in [src/frontend/lower.ts](src/frontend/lower.ts), accepted *only* on a
+      `JSON.parse` call) or an annotated target (`const x: T = JSON.parse(text)`, handled in
+      `lowerVarDecl`). `T` is any JSON value type (scalars / arrays / objects, nested); a class target
+      is a clean `tsnc:` error (no prototype to rebuild). Two new IR nodes (`jsonStringify`,
+      `jsonParse { text, type }`); both are threaded through `repr.ts` (a parsed `number` is always
+      f64 — JSON numbers parse to doubles) and the module `Renamer` (so a `JSON.*` call on a module
+      variable still resolves). The **runtime** ([src/codegen/cpp/tsn_runtime.h](src/codegen/cpp/tsn_runtime.h))
+      gained a generic `tsn_json` tagged-union value + a recursive-descent `tsn_json_parse` (full JSON
+      grammar incl. `\uXXXX` + surrogate pairs), scalar `tsn_json_as_*` accessors, and the
+      `tsn_json_stringify` scalar overloads + array template. **Codegen**: `stringify` mirrors the
+      `tsn_inspect` split exactly (generated per-object/class overloads + forward decls, array elements
+      resolved by ADL), but emits JSON (double-quoted keys, no spaces, `null` for `NaN`/`Infinity`, no
+      class name). `parse` emits a recursive **extraction expression** — scalars via the accessors,
+      arrays/objects via inline immediately-invoked lambdas (no per-type helpers/forward-decls needed:
+      a JSON value type is a finite tree, the subset has no recursive/aliased types). No exceptions in
+      the subset, so malformed JSON or a value that doesn't match `T` prints to stderr and exits
+      non-zero (`tsn_json_fail`) — the closest analog to an uncaught `SyntaxError`. **Deferred** (clean
+      errors): `stringify`'s `replacer`/`space` args, `parse`'s `reviver` arg, and class targets.
+
+### todo
+
+Ordering is a rough dependency chain: cheap self-contained syntax first → the **union-types
+keystone** (which unlocks `null`/optional/literals) → closures → generics. **Every item still
+ships with a `tests/cases/*.ts` + `.expected` pair** (red → green), except programs that must be
+*rejected* ([tests/typecheck.test.ts](tests/typecheck.test.ts) / [tests/modules.test.ts](tests/modules.test.ts)).
+
+**Cheap, self-contained syntax** (each is ~one IR node + one `lower` branch + one `emit` case):
+
+- [ ] **Ternary `? :`** — conditional expressions (today: `Unsupported expression`).
+- [ ] **Bitwise `& | ^ ~ << >> >>>` and exponentiation `**`** — today: `Unsupported binary operator`.
+- [ ] **Template-literal interpolation** — `` `a${x}b` ``; only no-substitution backtick strings
+      lower today ([src/frontend/lower.ts](src/frontend/lower.ts)).
+- [ ] **`console.log` with multiple args** — currently exactly one ([src/frontend/lower.ts](src/frontend/lower.ts)).
+
+**Control flow** (all currently `Unsupported statement`, except the C-style `for` which works):
+
+- [ ] **`break` / `continue`**.
+- [ ] **Switch / `case`**.
+- [ ] **`for…of` / `for…in`** — only C-style `for (init; cond; update)` works today.
+- [ ] **`do…while`**, labeled statements.
+- [ ] **`try` / `catch` / `finally` / `throw`** — needs an exception/error-model decision first.
+
+**Builtins / stdlib:**
+
+- [ ] **`Math.*`, `Map` / `Set`, broader string/array methods**.
+
+### Blocked on the type system
+
+These need a representation/inference decision before they can lower. **Union types are the
+keystone** — a tagged representation that unlocks most of the rest.
+
+- [ ] **Union types** — `number | string`; no tagged-union representation yet.
+- [ ] **`null` / `undefined` + optional `?:`** fields/params — depend on unions.
+- [ ] **Enums & literal types**, **tuples** (`[number, string]`), **intersection** (`A & B`).
+- [ ] **Thread the `TypeChecker`'s inferred types into lowering** — stage 0 is a *gate* only;
+      lowering re-reads annotations off the AST and can't see inferred types
+      ([src/frontend/check.ts](src/frontend/check.ts)). Blocks robust union/inference work.
 
 ### Later
 
 - [ ] **Classes — beyond the basic shape** — the basic shape is done (see above). Still to come:
       `extends` / inheritance (base-struct layout + virtual dispatch + `super(...)`), enforcing
       `private`/`public`/`protected`/`readonly` visibility, `static` members, get/set accessors,
-      parameter properties, field initializers (default member init), and bare `this` as a value
-      (via `std::enable_shared_from_this`, so `let b = this` / passing `this` around works).
-- [ ] **Closures, generics** — first-class function values and type parameters. (`import`/`export`
-      modules shipped — see _Done_; a module variable is already usable inside that module's function
-      bodies, via the module record.)
+      parameter properties, and field initializers (default member init). (Bare `this` as a value is
+      **out of scope** — see _will never support_.)
+- [ ] **Closures + first-class functions** — arrow functions / function expressions, function-typed
+      values (`(x: number) => number`), default/rest params, and the capture machinery. (`import`/
+      `export` modules shipped — see _Done_; a module variable is already usable inside that module's
+      function bodies, via the module record.)
+- [ ] **Destructuring + spread/rest** — array/object binding patterns in `let` and params, and spread
+      in array literals and calls (all currently rejected: only simple identifier bindings,
+      [src/frontend/lower.ts](src/frontend/lower.ts)).
+- [ ] **Generics / type parameters** — `<T>(x: T) => T`, `Map<K, V>`; depends on the type-system work above.
+- [ ] **`typeof` / `instanceof` / `in`**, **optional chaining `?.` / nullish `??`**.
+
+### Deferred module forms (clean `tsnc:` errors today)
+
+- [ ] `export default` / default imports, `import * as` namespace imports, import aliasing
+      (`{ a as b }`), re-export statements, non-relative (package) specifiers, and circular imports.
+      See [src/frontend/modules.ts](src/frontend/modules.ts).
 
 ## will never support
 

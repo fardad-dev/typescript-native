@@ -446,6 +446,14 @@ class RepAnalyzer {
             return { type: "number", rep: "f64" };
         }
       }
+      case "jsonStringify":
+        this.visit(e.arg, scope, fk);
+        return { type: "string", rep: "f64" };
+      case "jsonParse":
+        // JSON numbers parse to doubles, so a JSON.parse value is always f64 (the
+        // annotated/asserted target type may be number, but it's never i64-rep).
+        this.visit(e.text, scope, fk);
+        return { type: e.type, rep: "f64" };
     }
   }
 }
