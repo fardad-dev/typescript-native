@@ -105,7 +105,7 @@ npm test            # run the e2e suite once (vitest run)
 npm run test:watch  # re-run on change — the TDD red->green loop
 ```
 
-The suite (currently **81 e2e cases** + a stage-0 type-checker test file + a module-loader test
+The suite (currently **92 e2e cases** + a stage-0 type-checker test file + a module-loader test
 file, all green) auto-discovers every `tests/cases/*.ts`, compiles it to a real native binary,
 runs it, and diffs stdout against the matching `.expected` file. **Every feature gets a
 `tests/cases/*.ts` + `.expected` pair**, ideally written first (red), then implemented to green.
@@ -173,7 +173,22 @@ Implemented and tested end-to-end:
   (negatives count from the end); `xs.indexOf(v[, from])` → `number` (`-1` if absent; element
   `===`, so object/array-element arrays are rejected; class elements compare by identity); and
   `xs.join(sep?)` → `string` (separator defaults to `","`; `string[]` and `number[]`).
-- **Control flow:** `if` / `else`, `while`, `for (init; cond; update)`.
+- **Control flow:** `if` / `else`, `while`, `do…while`, `for (init; cond; update)`,
+  **`for…of`** (over an array's elements or a string's characters), **`for…in`** (over the *keys* —
+  array/string indices as strings, or an object/instance's field names), and **`switch` / `case` /
+  `default`** (JS `===` matching with **fall-through**; `default` may sit anywhere). **`break` /
+  `continue`** target the innermost loop/switch, or an enclosing **labeled** loop (`outer: for (…) {
+  … break outer; }` — only loops may be labeled). `switch` and labeled break/continue compile the
+  way a C compiler does internally — a single discriminant eval + `goto`s to generated labels — so
+  fall-through, default-in-the-middle, and multi-level jumps are exact.
+- **Exceptions:** **`throw`**, **`try` / `catch` / `finally`**. `throw` takes a **string** (the
+  subset has no `Error` objects, and no `unknown`/union to type an arbitrary thrown value), and
+  `throw new Error(msg)` is accepted as a synonym for throwing `msg`; the caught binding in
+  `catch (e)` is bound as a **`string`**. `finally` is realized as an **RAII guard**, so it runs on
+  *every* exit from the `try` — normal completion, an early `return`, or an exception unwinding
+  through it — and therefore needs no `catch` (a `try`/`finally` with no `catch` is fine). **Deferred**
+  (clean `tsnc:` errors): throwing a non-string, labeling a non-loop, and `return`/`throw`/escaping
+  `break`/`continue` **inside** a `finally` body (it runs from a destructor, which must not unwind).
 - **Functions:** top-level, typed params + return type, `return`, calls, `void`; recursion works.
   Params and returns may be **arrays and objects**, not just scalars. Every parameter passes **by
   value** — for arrays/objects/instances that's a `shared_ptr` copy (a refcount bump) that aliases
@@ -446,7 +461,7 @@ pair** (red → green).
       of the source plus a tiny ambient `console` declaration, loading only the **ES2020 lib** (not
       DOM, so its hundreds of globals can't shadow user names) under `strict: true` (plus `module:
       ESNext` + `moduleResolution: Bundler`, so it resolves the whole import graph from disk and
-      checks cross-module types — see _Modules_). All 78 e2e cases type-check clean under these
+      checks cross-module types — see _Modules_). All e2e cases type-check clean under these
       options (verified empirically); rejection behavior — which can't
       be a case pair — is covered by [tests/typecheck.test.ts](tests/typecheck.test.ts). Subset-
       specific rejections (e.g. `var`) still happen later in lowering; this stage only enforces
@@ -525,6 +540,31 @@ pair** (red → green).
       Interpolated values coerce exactly as `+` does (string and number operands) — anything else is the
       same clean "Cannot concatenate" error, not a new code path. ([src/frontend/lower.ts](src/frontend/lower.ts);
       no-substitution `` `...` `` literals already lowered as plain strings.)
+- [x] **Control flow — `do…while`, `for…of`, `for…in`, `switch`, `break`/`continue`, labeled loops,
+      `try`/`catch`/`finally`/`throw`** — the rest of JS's statement-level control flow, in one pass.
+      Nine new `Stmt` nodes ([src/ir/nodes.ts](src/ir/nodes.ts)) threaded through `lower` → `emit` →
+      `repr.ts` → the module `Renamer`. Highlights:
+      - **`for…of`** (arrays/strings) and **`for…in`** (keys) are real IR nodes (not a lowering desugar)
+        so `emit` can scope their temporaries in `{ }` and resolve the element/key type — which lowering
+        doesn't have. `for…of`'s number loop var is forced **f64** in `repr.ts` (array elements/string
+        chars are stored as `double`), keeping the rep sound. Both compile to an index loop over a
+        once-evaluated temp.
+      - **`switch`** and **labeled `break`/`continue`** are compiled the way a C compiler lowers them
+        internally — a single discriminant eval (or loop) + **`goto`s to generated labels** — so JS
+        `===` matching, **fall-through**, **`default` in the middle**, and **multi-level** jumps are all
+        exact. The emitter carries a `breakStack` of `BreakCtx`: an unlabeled loop is *native*
+        (`break;`/`continue;`); a **labeled** loop or any `switch` is *goto-form* (a labeled `for` moves
+        its update after the continue label so `continue` still runs it). Each `switch` clause body is
+        its own `{ }` block so the forward dispatch `goto`s never bypass a clause-local's initialization.
+      - **`try`/`catch`/`finally`/`throw`** picks a small exception model: `throw` takes a **string**
+        (`throw new Error(msg)` lowers to throwing `msg`), `catch (e)` binds `e` as a **string** (no
+        `Error` objects / no `unknown`/union to type a general value). `finally` is a C++ **RAII guard**
+        (`tsn_make_finally`, the one runtime addition), so it runs on normal exit, `return`, *and*
+        exception unwind — meaning a `finally` needs **no** C++ `try` (only a `catch` does). Escaping
+        control flow inside a `finally` (`return`/`throw`/`break`/`continue`) is rejected, since the body
+        runs from a destructor. The `-Werror=return-type` build survives `return`-in-every-`case`
+        switches (clang proves the `goto` dispatch never falls through), and clang's only gripe is a
+        harmless `-Wparentheses-equality` (the pre-existing fully-parenthesized `(a == b)` style).
 
 ### todo
 
@@ -538,13 +578,11 @@ ships with a `tests/cases/*.ts` + `.expected` pair** (red → green), except pro
 - [ ] **Bitwise `& | ^ ~ << >> >>>` and exponentiation `**`** — today: `Unsupported binary operator`.
 - [ ] **`console.log` with multiple args** — currently exactly one ([src/frontend/lower.ts](src/frontend/lower.ts)).
 
-**Control flow** (all currently `Unsupported statement`, except the C-style `for` which works):
-
-- [ ] **`break` / `continue`**.
-- [ ] **Switch / `case`**.
-- [ ] **`for…of` / `for…in`** — only C-style `for (init; cond; update)` works today.
-- [ ] **`do…while`**, labeled statements.
-- [ ] **`try` / `catch` / `finally` / `throw`** — needs an exception/error-model decision first.
+**Control flow** — the statement-level control flow is now complete (`if`/`else`, `while`,
+`do…while`, C-style `for`, `for…of`/`for…in`, `switch`, `break`/`continue` + labeled loops,
+`try`/`catch`/`finally`/`throw`; see _Done_). Still open at the statement level: only the rarely
+needed **`for await`** and **labeling a non-loop** (both currently clean `tsnc:` errors), which
+wait on async and a block/labeled-block representation respectively.
 
 **Builtins / stdlib:**
 

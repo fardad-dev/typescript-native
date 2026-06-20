@@ -20,7 +20,13 @@ is added or changed.
   (`new C(args)`), `this`, `jsonStringify` (`JSON.stringify(arg)`), `jsonParse`
   (`{ text; type }` — the parse target type, since `JSON.parse` is `any` and the subset needs a
   concrete type; carried from a `JSON.parse(text) as T` assertion or an annotated target).
-- **`Stmt`** — `let`, `log`, `return`, `exprStmt` (a bare expression evaluated for effect).
+- **`Stmt`** — `let`, `log`, `return`, `exprStmt` (a bare expression evaluated for effect),
+  `assign`, and the control-flow statements: `if`, `while`, `for`, `doWhile`, `forOf`
+  (`{ name; iterable; body }`), `forIn` (`{ name; target; body }`), `switch` (`{ disc; cases }`
+  where `SwitchCase = { test?; body }`, `test` absent = `default`), `break`/`continue`
+  (optional `label`), `labeled` (`{ label; body }` — wraps a loop), `throw` (`{ value }`, a
+  string), and `try` (`{ block; catchName?; catchBody?; finallyBody? }`). `switch` + labeled
+  break/continue are lowered to `goto`s in codegen, not modeled with a value table.
 - **`RetType`** — `Type | "void"` (functions may return nothing; values never have `void` type).
 - **`Param`**, **`Func`** (`name`, `params`, `returnType`, `body`).
 - **`Method`** (a `Func` minus the implicit receiver) and **`ClassDecl`** (`name`, `fields`,

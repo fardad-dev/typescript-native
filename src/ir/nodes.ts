@@ -77,7 +77,47 @@ export type Stmt =
   | { kind: "if"; cond: Expr; then: Stmt[]; else?: Stmt[] }
   | { kind: "while"; cond: Expr; body: Stmt[] }
   // `for (init; cond; update) { body }` — `++`/compound-assign desugar into `update`
-  | { kind: "for"; init?: Stmt; cond?: Expr; update?: Stmt; body: Stmt[] };
+  | { kind: "for"; init?: Stmt; cond?: Expr; update?: Stmt; body: Stmt[] }
+  // `do { body } while (cond)` — like `while`, but the body runs once first.
+  | { kind: "doWhile"; body: Stmt[]; cond: Expr }
+  // `for (let name of iterable) { body }` — iterate an array's elements or a
+  // string's characters. `name` is bound fresh each iteration to the element /
+  // one-char string. (The element/char type is resolved from `iterable` in
+  // codegen, since lowering has no type info.)
+  | { kind: "forOf"; name: string; iterable: Expr; body: Stmt[] }
+  // `for (let name in target) { body }` — iterate the *keys* of `target`: array /
+  // string indices as strings ("0", "1", …), or an object/instance's field names.
+  // `name` is always a `string`.
+  | { kind: "forIn"; name: string; target: Expr; body: Stmt[] }
+  // `switch (disc) { case t: …; default: … }`. A clause with no `test` is the
+  // `default`. JS `switch` matches with `===` and *falls through* until a `break`,
+  // so codegen lowers to a dispatch + labels (see emit.ts), not a value table.
+  | { kind: "switch"; disc: Expr; cases: SwitchCase[] }
+  // `break;` / `break label;` and `continue;` / `continue label;`. An absent label
+  // targets the innermost loop (or, for `break`, switch); a label targets the
+  // matching enclosing labeled loop.
+  | { kind: "break"; label?: string }
+  | { kind: "continue"; label?: string }
+  // `label: <loop>` — a labeled statement. Only loops may be labeled (so a labeled
+  // `break`/`continue` has a well-defined target). `body` is the wrapped loop.
+  | { kind: "labeled"; label: string; body: Stmt }
+  // `throw value` — value must be a string (the subset has no Error objects; a
+  // `throw new Error(msg)` lowers to throwing `msg`). Compiles to a C++ `throw`.
+  | { kind: "throw"; value: Expr }
+  // `try { block } catch (catchName) { catchBody } finally { finallyBody }`.
+  // `catchName`/`catchBody` are absent when there is no `catch`; `finallyBody` is
+  // absent when there is no `finally`. The caught value is bound as a `string`.
+  | {
+      kind: "try";
+      block: Stmt[];
+      catchName?: string;
+      catchBody?: Stmt[];
+      finallyBody?: Stmt[];
+    };
+
+// One clause of a `switch`. `test` absent ⇒ the `default` clause. `body` are the
+// clause's statements (they fall through into the next clause unless a `break`).
+export type SwitchCase = { test?: Expr; body: Stmt[] };
 
 // A function's return type, which may be `void` (no value) — distinct from the
 // value types in `Type`.

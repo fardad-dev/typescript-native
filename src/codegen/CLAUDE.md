@@ -247,6 +247,46 @@ carries the program-independent halves; codegen emits the program-dependent shap
   asserted type calls `tsn_json_fail` (stderr + `exit(1)`) — the closest analog to an uncaught JS
   `SyntaxError`.
 
+## Control flow (loops, switch, break/continue, try)
+
+Beyond `if`/`while`/C-style `for`, the emitter lowers JS's remaining statement-level control flow:
+
+- **`for…of` / `for…in`** (`emitForOf` / `emitForIn`) — an index loop over a once-evaluated temp
+  (`auto _tsn_itN = <iterable>;`). `for…of` over an array reads `(*_it)[i]`, over a string reads a
+  one-char `tsn_str`; the element type comes from the iterable's `Value.type` (lowering can't see
+  it). A number `for…of` var is declared `double` — array elements/string chars are the f64 rep, and
+  `repr.ts` demotes the loop-var slot to match. `for…in` yields *string* keys: array/string indices
+  (`tsn_str(std::to_string(i))`) or an object/instance's field names (a fixed `std::vector<tsn_str>`,
+  from `forInKeys`).
+- **`break` / `continue` and the `breakStack`.** Every loop pushes a `BreakCtx`; a `switch` pushes
+  one too. A context is *native* (`goto:false`) — `break;`/`continue;` are the C++ keywords — or
+  *goto-form* (`goto:true`) — it carries generated `breakLabel`/`continueLabel` and the statements
+  emit `goto`s. **Unlabeled loops are native; every labeled loop and every `switch` is goto-form**
+  (so a labeled break/continue, which may target an *outer* loop, can jump to it, and so a `switch`'s
+  fall-through works). `breakTarget`/`continueTarget` resolve the stack: a label finds the matching
+  loop; unlabeled `break` takes the innermost loop-or-switch, unlabeled `continue` the innermost loop
+  (skipping switches). A `labeled` statement just stashes `pendingLabel`, which the wrapped loop
+  consumes in `enterLoop`. A goto-form `for` moves its update after the continue label so `continue`
+  still runs it.
+- **`switch`** (`emitSwitch`) — compiled like a C compiler does internally, *not* as a value table
+  (JS matches with `===`, falls through, and `default` can sit anywhere — none of which a C++
+  `switch` expresses): evaluate the discriminant once into `auto _sw = …`, emit `if ((_sw == test))
+  goto _cN;` per case in source order (first match wins, later tests unevaluated), then `goto` the
+  default (or the end). Each clause body is its own `{ }` block (so the forward dispatch `goto`s never
+  bypass a clause-local's initialization) at a label, in source order — so fall-through is just
+  falling into the next block. `break` (the switch's `BreakCtx`) is `goto _swend`.
+- **`try` / `catch` / `finally` / `throw`** (`emitTry`). `throw` requires a `string` (→ C++ `throw
+  <tsn_str>`); the subset has no `Error`/`unknown`. A `catch` is a C++ `catch (const tsn_str& e)`
+  (the binding typed `string`). A **`finally` is a RAII guard** — `auto _tsn_finN =
+  tsn_make_finally([&]{ … });` (the one runtime addition, [cpp/tsn_runtime.h](cpp/tsn_runtime.h)) —
+  whose destructor runs the body on *every* exit (normal, `return`, exception unwind), so a `finally`
+  needs **no** C++ `try`; only a `catch` does. `assertFinallySafe` rejects `return`/`throw`/escaping
+  `break`/`continue` inside a `finally` (the body runs from a destructor, which must not unwind).
+- **`-Werror=return-type`.** A `switch` whose every clause `return`s and a goto-form loop both leave
+  no trailing `return`, but clang's reachability analysis follows the `goto` dispatch and is
+  satisfied. (Clang does emit a harmless `-Wparentheses-equality` on the fully-parenthesized
+  `(_sw == test)` dispatch — a warning, not an error, and the same style the rest of codegen uses.)
+
 ## Guard clauses
 
 Type errors (wrong assignment/argument/return types, undeclared names, bad property access) are

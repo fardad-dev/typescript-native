@@ -355,6 +355,50 @@ class Renamer {
         s.body = this.body(s.body, new Set(inner));
         return s;
       }
+      case "doWhile":
+        s.body = this.body(s.body, new Set(locals));
+        s.cond = this.expr(s.cond, locals);
+        return s;
+      case "forOf": {
+        s.iterable = this.expr(s.iterable, locals); // outer scope (name not bound)
+        const inner = new Set(locals);
+        inner.add(s.name); // the loop variable shadows the table in the body
+        s.body = this.body(s.body, inner);
+        return s;
+      }
+      case "forIn": {
+        s.target = this.expr(s.target, locals);
+        const inner = new Set(locals);
+        inner.add(s.name);
+        s.body = this.body(s.body, inner);
+        return s;
+      }
+      case "switch":
+        s.disc = this.expr(s.disc, locals);
+        for (const c of s.cases) {
+          if (c.test) c.test = this.expr(c.test, locals);
+          c.body = this.body(c.body, new Set(locals));
+        }
+        return s;
+      case "break":
+      case "continue":
+        return s; // labels are not symbols — nothing to rewrite
+      case "labeled":
+        s.body = this.stmt(s.body, locals);
+        return s;
+      case "throw":
+        s.value = this.expr(s.value, locals);
+        return s;
+      case "try": {
+        s.block = this.body(s.block, new Set(locals));
+        if (s.catchBody) {
+          const inner = new Set(locals);
+          if (s.catchName) inner.add(s.catchName); // the caught binding shadows
+          s.catchBody = this.body(s.catchBody, inner);
+        }
+        if (s.finallyBody) s.finallyBody = this.body(s.finallyBody, new Set(locals));
+        return s;
+      }
     }
   }
 

@@ -34,6 +34,7 @@ import {
   ClassDecl,
   Method,
   DepModule,
+  SwitchCase,
 } from "../ir/nodes";
 import { analyze, RepTable, Rep, litRep, combineRep, MAIN_KEY } from "./repr";
 
@@ -128,6 +129,23 @@ interface Sig {
   ret: RetType;
 }
 
+// An enclosing breakable/continuable construct, tracked on a stack so `break` /
+// `continue` (labeled or not) resolve to the right target. A loop or switch is
+// emitted in one of two forms:
+//   - native (`goto: false`): a plain C++ loop, so `break`/`continue` are the C++
+//     keywords. Used for every *unlabeled* loop.
+//   - goto-form (`goto: true`): the loop/switch carries explicit C++ labels and
+//     `break`/`continue` become `goto`s. Used for every *labeled* loop (so a
+//     labeled break/continue can jump to it) and for every `switch` (whose JS
+//     fall-through semantics are themselves compiled with labels — see emitStmt).
+interface BreakCtx {
+  label?: string; // the JS label, if this is a labeled loop
+  kind: "loop" | "switch";
+  goto: boolean;
+  breakLabel?: string; // C++ label jumped to by `break` (goto-form)
+  continueLabel?: string; // C++ label jumped to by `continue` (goto-form loops)
+}
+
 export function emit(mod: Module): string {
   return new Emitter().emitModule(mod);
 }
@@ -167,6 +185,14 @@ class Emitter {
   // undefined inside free functions and main.
   private currentClass?: ClassDecl;
   private indent = "  ";
+  // Stack of enclosing loops/switches, for `break`/`continue` resolution.
+  private breakStack: BreakCtx[] = [];
+  // A pending JS label from a `labeled` statement, consumed by the loop it wraps.
+  private pendingLabel?: string;
+  // Monotonic counter for the C++ labels / temporaries control-flow lowering emits
+  // (loop break/continue labels, switch dispatch labels, for-of/in temporaries,
+  // finally guards). Reset per function so names stay short and stable.
+  private ctrlUid = 0;
 
   emitModule(mod: Module): string {
     this.reps = analyze(mod); // decide each number slot's representation
@@ -481,6 +507,9 @@ class Emitter {
     this.funcKey = funcKey;
     this.currentClass = undefined;
     this.indent = "  ";
+    this.breakStack = [];
+    this.pendingLabel = undefined;
+    this.ctrlUid = 0;
   }
 
   private emitFunction(fn: Func): string {
@@ -718,6 +747,139 @@ class Emitter {
     return v.code;
   }
 
+  // --- loops / break / continue -------------------------------------------
+  //
+  // Every loop pushes a BreakCtx so an inner `break`/`continue` resolves to it.
+  // A loop wrapped by a `labeled` statement (its label arrives via pendingLabel)
+  // is emitted in *goto-form*: it carries explicit C++ break/continue labels so a
+  // labeled `break`/`continue` — which may target an *outer* loop — can `goto` it.
+  // An unlabeled loop is emitted natively (plain C++ `break`/`continue`).
+
+  // Begin a loop: consume any pending label, allocate a context, push it.
+  private enterLoop(): BreakCtx {
+    const label = this.pendingLabel;
+    this.pendingLabel = undefined;
+    const id = this.ctrlUid++;
+    const ctx: BreakCtx =
+      label === undefined
+        ? { kind: "loop", goto: false }
+        : {
+            label,
+            kind: "loop",
+            goto: true,
+            breakLabel: `_tsn_brk${id}`,
+            continueLabel: `_tsn_cont${id}`,
+          };
+    this.breakStack.push(ctx);
+    return ctx;
+  }
+
+  // End a loop: pop it and, for goto-form, place the break target after it.
+  private exitLoop(ctx: BreakCtx): void {
+    this.breakStack.pop();
+    if (ctx.goto) this.push(`${ctx.breakLabel}: ;`);
+  }
+
+  // Emit the body of a goto-form loop: the statements, then the continue label.
+  // Used where `continue` must `goto` (a labeled loop); for a plain loop the body
+  // goes through emitBlock instead.
+  private emitLoopBodyWithContinue(body: Stmt[], ctx: BreakCtx): void {
+    const saved = this.indent;
+    this.indent += "  ";
+    for (const s of body) this.emitStmt(s);
+    this.push(`${ctx.continueLabel}: ;`);
+    this.indent = saved;
+  }
+
+  // Resolve the target of a `break`: the matching labeled loop, or (unlabeled) the
+  // innermost loop or switch.
+  private breakTarget(label?: string): BreakCtx {
+    if (label === undefined) {
+      const ctx = this.breakStack[this.breakStack.length - 1];
+      if (!ctx) throw new Error("'break' used outside a loop or switch");
+      return ctx;
+    }
+    for (let i = this.breakStack.length - 1; i >= 0; i--) {
+      if (this.breakStack[i].label === label) return this.breakStack[i];
+    }
+    throw new Error(`'break ${label}': no enclosing labeled loop '${label}'`);
+  }
+
+  // Resolve the target of a `continue`: the matching labeled loop, or (unlabeled)
+  // the innermost *loop* (a switch is skipped — `continue` continues the loop).
+  private continueTarget(label?: string): BreakCtx {
+    if (label === undefined) {
+      for (let i = this.breakStack.length - 1; i >= 0; i--) {
+        if (this.breakStack[i].kind === "loop") return this.breakStack[i];
+      }
+      throw new Error("'continue' used outside a loop");
+    }
+    for (let i = this.breakStack.length - 1; i >= 0; i--) {
+      const c = this.breakStack[i];
+      if (c.label === label) {
+        if (c.kind !== "loop")
+          throw new Error(`'continue ${label}': '${label}' is not a loop`);
+        return c;
+      }
+    }
+    throw new Error(`'continue ${label}': no enclosing labeled loop '${label}'`);
+  }
+
+  // A `finally` body runs from a C++ destructor (see tsn_make_finally), which must
+  // not itself `return`, `throw`, or `break`/`continue` out of the guard's scope.
+  // Reject those; break/continue *into a loop/switch inside the finally* is fine.
+  private assertFinallySafe(stmts: Stmt[]): void {
+    this.checkFinally(stmts, 0, 0);
+  }
+  private checkFinally(
+    stmts: Stmt[],
+    loopDepth: number,
+    switchDepth: number,
+  ): void {
+    for (const s of stmts) {
+      switch (s.kind) {
+        case "return":
+          throw new Error("'return' inside a 'finally' block is not supported");
+        case "throw":
+          throw new Error("'throw' inside a 'finally' block is not supported");
+        case "break":
+          if (s.label !== undefined || loopDepth + switchDepth === 0)
+            throw new Error("'break' escaping a 'finally' block is not supported");
+          break;
+        case "continue":
+          if (s.label !== undefined || loopDepth === 0)
+            throw new Error(
+              "'continue' escaping a 'finally' block is not supported",
+            );
+          break;
+        case "if":
+          this.checkFinally(s.then, loopDepth, switchDepth);
+          if (s.else) this.checkFinally(s.else, loopDepth, switchDepth);
+          break;
+        case "while":
+        case "for":
+        case "doWhile":
+        case "forOf":
+        case "forIn":
+          this.checkFinally(s.body, loopDepth + 1, switchDepth);
+          break;
+        case "labeled":
+          this.checkFinally([s.body], loopDepth, switchDepth);
+          break;
+        case "switch":
+          for (const c of s.cases)
+            this.checkFinally(c.body, loopDepth, switchDepth + 1);
+          break;
+        case "try":
+          this.checkFinally(s.block, loopDepth, switchDepth);
+          if (s.catchBody) this.checkFinally(s.catchBody, loopDepth, switchDepth);
+          if (s.finallyBody)
+            this.checkFinally(s.finallyBody, loopDepth, switchDepth);
+          break;
+      }
+    }
+  }
+
   // --- statements ---------------------------------------------------------
 
   // A `let`/`assign` rendered as a C++ fragment without trailing `;` (also used
@@ -897,25 +1059,292 @@ class Emitter {
         return;
       }
       case "while": {
+        const ctx = this.enterLoop();
         this.push(`while (${this.condition(stmt.cond)}) {`);
-        this.emitBlock(stmt.body);
+        if (ctx.goto) this.emitLoopBodyWithContinue(stmt.body, ctx);
+        else this.emitBlock(stmt.body);
         this.push(`}`);
+        this.exitLoop(ctx);
+        return;
+      }
+      case "doWhile": {
+        const ctx = this.enterLoop();
+        this.push(`do {`);
+        if (ctx.goto) this.emitLoopBodyWithContinue(stmt.body, ctx);
+        else this.emitBlock(stmt.body);
+        this.push(`} while (${this.condition(stmt.cond)});`);
+        this.exitLoop(ctx);
         return;
       }
       case "for": {
         // init/cond/update are emitted inline into the C++ for-header; init
         // (when a `let`) registers the loop variable before cond/update/body.
+        const ctx = this.enterLoop();
         const init = stmt.init ? this.inlineStmt(stmt.init) : "";
         const cond = stmt.cond ? this.condition(stmt.cond) : "";
         const update = stmt.update ? this.inlineStmt(stmt.update) : "";
-        this.push(`for (${init}; ${cond}; ${update}) {`);
-        this.emitBlock(stmt.body);
-        this.push(`}`);
+        if (ctx.goto) {
+          // Goto-form: the update moves into the body after the continue label, so
+          // `continue` (a goto) still runs it before re-testing the condition.
+          this.push(`for (${init}; ${cond}; ) {`);
+          const saved = this.indent;
+          this.indent += "  ";
+          for (const s of stmt.body) this.emitStmt(s);
+          this.push(`${ctx.continueLabel}: ;`);
+          if (update) this.push(`${update};`);
+          this.indent = saved;
+          this.push(`}`);
+        } else {
+          this.push(`for (${init}; ${cond}; ${update}) {`);
+          this.emitBlock(stmt.body);
+          this.push(`}`);
+        }
+        this.exitLoop(ctx);
         // A `let`-introduced loop variable is scoped to the loop in C++; drop it.
         if (stmt.init && stmt.init.kind === "let")
           this.vars.delete(stmt.init.name);
         return;
       }
+      case "forOf":
+        this.emitForOf(stmt);
+        return;
+      case "forIn":
+        this.emitForIn(stmt);
+        return;
+      case "switch":
+        this.emitSwitch(stmt);
+        return;
+      case "break": {
+        const ctx = this.breakTarget(stmt.label);
+        this.push(ctx.goto ? `goto ${ctx.breakLabel};` : `break;`);
+        return;
+      }
+      case "continue": {
+        const ctx = this.continueTarget(stmt.label);
+        this.push(ctx.goto ? `goto ${ctx.continueLabel};` : `continue;`);
+        return;
+      }
+      case "labeled": {
+        // The label is handed to the loop it wraps (lowering guarantees a loop),
+        // which picks it up in enterLoop and emits its goto-form.
+        this.pendingLabel = stmt.label;
+        this.emitStmt(stmt.body);
+        return;
+      }
+      case "throw": {
+        const v = this.emitExpr(stmt.value);
+        if (v.type !== "string") {
+          throw new Error(
+            `Can only throw a string (got '${displayType(v.type)}') — use 'throw "msg"' or 'throw new Error("msg")'`,
+          );
+        }
+        this.push(`throw ${v.code};`);
+        return;
+      }
+      case "try":
+        this.emitTry(stmt);
+        return;
+    }
+  }
+
+  // `for (let x of iterable)` — iterate an array's elements or a string's chars.
+  // Lowered to an index loop over a temp holding the iterable (evaluated once).
+  private emitForOf(stmt: {
+    name: string;
+    iterable: Expr;
+    body: Stmt[];
+  }): void {
+    const ctx = this.enterLoop();
+    const iter = this.emitExpr(stmt.iterable);
+    const id = this.ctrlUid++;
+    const it = `_tsn_it${id}`;
+    const i = `_tsn_i${id}`;
+    let elemType: Type;
+    let sizeExpr: string;
+    let elemCode: string;
+    if (isArray(iter.type)) {
+      elemType = iter.type.element;
+      sizeExpr = `${it}->size()`;
+      elemCode = `(*${it})[${i}]`;
+    } else if (iter.type === "string") {
+      elemType = "string";
+      sizeExpr = `${it}.size()`;
+      // Each character is a one-char string (JS has no char type), like `s[i]`.
+      elemCode = `tsn_str(std::string(1, ${it}.str()[${i}]))`;
+    } else {
+      throw new Error(
+        `Cannot iterate with for…of over '${displayType(iter.type)}'`,
+      );
+    }
+    // Array elements / string chars are stored as the f64 number rep, so a number
+    // loop variable is always `double` (repr.ts marks it f64 to match).
+    const elemCpp = elemType === "number" ? "double" : this.cppType(elemType);
+    this.push(`auto ${it} = ${iter.code};`);
+    const incr = ctx.goto ? "" : `${i}++`;
+    this.push(`for (std::size_t ${i} = 0; ${i} < ${sizeExpr}; ${incr}) {`);
+    const saved = this.indent;
+    this.indent += "  ";
+    this.push(`${elemCpp} ${stmt.name} = ${elemCode};`);
+    this.vars.set(stmt.name, elemType);
+    for (const s of stmt.body) this.emitStmt(s);
+    if (ctx.goto) {
+      this.push(`${ctx.continueLabel}: ;`);
+      this.push(`${i}++;`);
+    }
+    this.vars.delete(stmt.name);
+    this.indent = saved;
+    this.push(`}`);
+    this.exitLoop(ctx);
+  }
+
+  // `for (let k in target)` — iterate the *keys* (always strings). Array/string
+  // keys are the indices "0".."n-1"; object/instance keys are the field names.
+  private emitForIn(stmt: { name: string; target: Expr; body: Stmt[] }): void {
+    const ctx = this.enterLoop();
+    const tgt = this.emitExpr(stmt.target);
+    const id = this.ctrlUid++;
+    const t = `_tsn_in${id}`;
+    const i = `_tsn_i${id}`;
+    // Evaluate the target once (its side effects happen even when, for an object,
+    // we only need the statically-known field names).
+    this.push(`auto ${t} = ${tgt.code};`);
+    const fields = this.forInKeys(tgt.type);
+    const saved = this.indent;
+    let keyCode: string;
+    let sizeExpr: string;
+    if (fields === null) {
+      // Array / string: keys are stringified indices.
+      sizeExpr = tgt.type === "string" ? `${t}.size()` : `${t}->size()`;
+      keyCode = `tsn_str(std::to_string(${i}))`;
+    } else {
+      // Object / class: a fixed vector of the field-name strings.
+      const keys = `_tsn_keys${id}`;
+      const items = fields
+        .map((f) => `tsn_str(${cppStringLiteral(f)})`)
+        .join(", ");
+      this.push(`std::vector<tsn_str> ${keys} = {${items}};`);
+      sizeExpr = `${keys}.size()`;
+      keyCode = `${keys}[${i}]`;
+    }
+    const incr = ctx.goto ? "" : `${i}++`;
+    this.push(`for (std::size_t ${i} = 0; ${i} < ${sizeExpr}; ${incr}) {`);
+    this.indent += "  ";
+    this.push(`tsn_str ${stmt.name} = ${keyCode};`);
+    this.vars.set(stmt.name, "string");
+    for (const s of stmt.body) this.emitStmt(s);
+    if (ctx.goto) {
+      this.push(`${ctx.continueLabel}: ;`);
+      this.push(`${i}++;`);
+    }
+    this.vars.delete(stmt.name);
+    this.indent = saved;
+    this.push(`}`);
+    this.exitLoop(ctx);
+  }
+
+  // The for-in keys of a value: an object/instance's field names, or `null` for an
+  // array/string (whose keys are positional indices, handled by the caller).
+  private forInKeys(t: Type): string[] | null {
+    if (isObject(t)) return t.fields.map((f) => f.name);
+    if (isClass(t)) {
+      const cls = this.classes.get(t.name);
+      if (!cls) throw new Error(`Unknown class: ${t.name}`);
+      return cls.fields.map((f) => f.name);
+    }
+    if (isArray(t) || t === "string") return null;
+    throw new Error(`Cannot iterate with for…in over '${displayType(t)}'`);
+  }
+
+  // `switch (disc) { ... }`. JS matches with `===` and *falls through* until a
+  // `break`, with `default` runnable from any position — semantics a value table
+  // can't express. So we compile it the way a C compiler does internally: evaluate
+  // the discriminant once, dispatch with `goto`s to per-clause labels (in source
+  // order, so fall-through is just falling into the next clause), and make `break`
+  // a `goto` past the end. Each clause body is its own `{ }` block so the forward
+  // dispatch jumps never bypass a clause-local variable's initialization.
+  private emitSwitch(stmt: { disc: Expr; cases: SwitchCase[] }): void {
+    const disc = this.emitExpr(stmt.disc);
+    const id = this.ctrlUid++;
+    const sw = `_tsn_sw${id}`;
+    const endLabel = `_tsn_swend${id}`;
+    const caseLabel = (i: number) => `_tsn_sw${id}_c${i}`;
+    const defaultIdx = stmt.cases.findIndex((c) => c.test === undefined);
+    const saved = this.indent;
+    this.push(`{`);
+    this.indent += "  ";
+    this.push(`auto ${sw} = ${disc.code};`);
+    // Dispatch: first matching `case` wins; later tests aren't evaluated (the goto
+    // jumps away), matching JS's evaluate-in-order-until-match.
+    stmt.cases.forEach((c, idx) => {
+      if (c.test === undefined) return;
+      const t = this.emitExpr(c.test);
+      if (!sameType(t.type, disc.type)) {
+        throw new Error(
+          `switch case type '${displayType(t.type)}' is not comparable to discriminant type '${displayType(disc.type)}'`,
+        );
+      }
+      this.push(`if ((${sw} == ${t.code})) goto ${caseLabel(idx)};`);
+    });
+    this.push(`goto ${defaultIdx >= 0 ? caseLabel(defaultIdx) : endLabel};`);
+    // Clause bodies. `break` inside resolves to this switch (goto past the end).
+    const ctx: BreakCtx = { kind: "switch", goto: true, breakLabel: endLabel };
+    this.breakStack.push(ctx);
+    stmt.cases.forEach((c, idx) => {
+      this.push(`${caseLabel(idx)}: {`);
+      this.indent += "  ";
+      for (const s of c.body) this.emitStmt(s);
+      this.indent = saved + "  ";
+      this.push(`}`);
+    });
+    this.breakStack.pop();
+    this.push(`${endLabel}: ;`);
+    this.indent = saved;
+    this.push(`}`);
+  }
+
+  // `try { } catch (e) { } finally { }`. A `finally` is realized as a RAII guard
+  // (tsn_make_finally) so it runs on every exit — normal, `return`, or exception —
+  // which means a finally needs no C++ `try` of its own; only a `catch` does. The
+  // caught value is bound as a `string` (the subset throws only strings).
+  private emitTry(stmt: {
+    block: Stmt[];
+    catchName?: string;
+    catchBody?: Stmt[];
+    finallyBody?: Stmt[];
+  }): void {
+    const hasFinally = stmt.finallyBody !== undefined;
+    const hasCatch = stmt.catchBody !== undefined;
+    const saved = this.indent;
+    if (hasFinally) {
+      this.assertFinallySafe(stmt.finallyBody!);
+      const id = this.ctrlUid++;
+      this.push(`{`);
+      this.indent += "  ";
+      this.push(`auto _tsn_fin${id} = tsn_make_finally([&]() {`);
+      const inner = this.indent;
+      this.indent += "  ";
+      for (const s of stmt.finallyBody!) this.emitStmt(s);
+      this.indent = inner;
+      this.push(`});`);
+    }
+    if (hasCatch) {
+      this.push(`try {`);
+      this.emitBlock(stmt.block);
+      const cname = stmt.catchName ?? `_tsn_ex${this.ctrlUid++}`;
+      this.push(`} catch (const tsn_str& ${cname}) {`);
+      if (stmt.catchName) this.vars.set(stmt.catchName, "string");
+      this.emitBlock(stmt.catchBody!);
+      if (stmt.catchName) this.vars.delete(stmt.catchName);
+      this.push(`}`);
+    } else {
+      // finally-only: the RAII guard already covers exceptions/returns.
+      this.push(`{`);
+      this.emitBlock(stmt.block);
+      this.push(`}`);
+    }
+    if (hasFinally) {
+      this.indent = saved;
+      this.push(`}`);
     }
   }
 

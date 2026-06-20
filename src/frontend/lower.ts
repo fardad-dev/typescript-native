@@ -14,6 +14,7 @@ import {
   Param,
   ClassDecl,
   Method,
+  SwitchCase,
 } from "../ir/nodes";
 
 export function lower(fileName: string, source: string): Module {
@@ -239,6 +240,69 @@ function lowerStatement(node: ts.Statement, out: Stmt[]): void {
     });
     return;
   }
+  if (ts.isDoStatement(node)) {
+    out.push({
+      kind: "doWhile",
+      body: lowerBlock(node.statement),
+      cond: lowerExpr(node.expression),
+    });
+    return;
+  }
+  if (ts.isForOfStatement(node)) {
+    if (node.awaitModifier) {
+      throw new Error("'for await' is not supported (v1)");
+    }
+    out.push({
+      kind: "forOf",
+      name: lowerForBindingName(node.initializer, "of"),
+      iterable: lowerExpr(node.expression),
+      body: lowerBlock(node.statement),
+    });
+    return;
+  }
+  if (ts.isForInStatement(node)) {
+    out.push({
+      kind: "forIn",
+      name: lowerForBindingName(node.initializer, "in"),
+      target: lowerExpr(node.expression),
+      body: lowerBlock(node.statement),
+    });
+    return;
+  }
+  if (ts.isSwitchStatement(node)) {
+    out.push({
+      kind: "switch",
+      disc: lowerExpr(node.expression),
+      cases: node.caseBlock.clauses.map((clause): SwitchCase => {
+        const body: Stmt[] = [];
+        for (const s of clause.statements) lowerStatement(s, body);
+        return ts.isCaseClause(clause)
+          ? { test: lowerExpr(clause.expression), body }
+          : { body };
+      }),
+    });
+    return;
+  }
+  if (ts.isBreakStatement(node)) {
+    out.push({ kind: "break", label: node.label?.text });
+    return;
+  }
+  if (ts.isContinueStatement(node)) {
+    out.push({ kind: "continue", label: node.label?.text });
+    return;
+  }
+  if (ts.isLabeledStatement(node)) {
+    out.push(lowerLabeled(node));
+    return;
+  }
+  if (ts.isThrowStatement(node)) {
+    out.push({ kind: "throw", value: lowerThrowValue(node.expression) });
+    return;
+  }
+  if (ts.isTryStatement(node)) {
+    out.push(lowerTry(node));
+    return;
+  }
   if (ts.isExpressionStatement(node)) {
     const expr = node.expression;
     if (ts.isCallExpression(expr) && isConsoleLog(expr.expression)) {
@@ -357,6 +421,91 @@ function lowerForInit(init: ts.ForInitializer): Stmt {
     return lowerVarDecl(init.declarations[0]);
   }
   return lowerAssignLike(init);
+}
+
+// The loop variable name of a `for…of` / `for…in`. Requires a single `let`/`const`
+// declaration with a simple identifier (no `var`, no destructuring, no assigning
+// to a pre-existing variable). Any type annotation is ignored — the element/key
+// type is resolved from the iterable during codegen.
+function lowerForBindingName(init: ts.ForInitializer, kw: "of" | "in"): string {
+  if (!ts.isVariableDeclarationList(init)) {
+    throw new Error(
+      `for…${kw} requires a 'let'/'const' binding (v1) — e.g. for (const x ${kw} ...)`,
+    );
+  }
+  if (!(init.flags & (ts.NodeFlags.Let | ts.NodeFlags.Const))) {
+    throw new Error("'var' is not supported — use 'let' or 'const'");
+  }
+  if (init.declarations.length !== 1) {
+    throw new Error(`for…${kw} must declare exactly one variable (v1)`);
+  }
+  const name = init.declarations[0].name;
+  if (!ts.isIdentifier(name)) {
+    throw new Error("Only simple identifier bindings are supported (v1)");
+  }
+  return name.text;
+}
+
+// `label: <stmt>` — only loops may be labeled in this subset (so a labeled
+// `break`/`continue` has a well-defined target). Lower the wrapped statement and
+// require it to be exactly one loop.
+function lowerLabeled(node: ts.LabeledStatement): Stmt {
+  const inner: Stmt[] = [];
+  lowerStatement(node.statement, inner);
+  const loopKinds = ["while", "doWhile", "for", "forOf", "forIn"];
+  if (inner.length !== 1 || !loopKinds.includes(inner[0].kind)) {
+    throw new Error(
+      `Only loops can be labeled (v1) — '${node.label.text}:' must label a for/while/do-while loop`,
+    );
+  }
+  return { kind: "labeled", label: node.label.text, body: inner[0] };
+}
+
+// The thrown value. The subset has no Error objects, so `throw new Error(msg)`
+// lowers to throwing the message string (and a bare `new Error()` to `""`); any
+// other `throw` lowers its operand directly (codegen requires a string).
+function lowerThrowValue(expr: ts.Expression): Expr {
+  const inner = skipParens(expr);
+  if (
+    ts.isNewExpression(inner) &&
+    ts.isIdentifier(inner.expression) &&
+    inner.expression.text === "Error"
+  ) {
+    const arg = inner.arguments?.[0];
+    return arg ? lowerExpr(arg) : { kind: "str", value: "" };
+  }
+  return lowerExpr(expr);
+}
+
+// `try { } catch (e) { } finally { }`. TypeScript guarantees at least one of
+// catch/finally is present. The catch binding (if any) must be a simple
+// identifier; its value is bound as a `string` during codegen.
+function lowerTry(node: ts.TryStatement): Stmt {
+  const block: Stmt[] = [];
+  for (const s of node.tryBlock.statements) lowerStatement(s, block);
+
+  let catchName: string | undefined;
+  let catchBody: Stmt[] | undefined;
+  if (node.catchClause) {
+    catchBody = [];
+    for (const s of node.catchClause.block.statements)
+      lowerStatement(s, catchBody);
+    const decl = node.catchClause.variableDeclaration;
+    if (decl) {
+      if (!ts.isIdentifier(decl.name)) {
+        throw new Error("Only simple catch bindings are supported (v1)");
+      }
+      catchName = decl.name.text;
+    }
+  }
+
+  let finallyBody: Stmt[] | undefined;
+  if (node.finallyBlock) {
+    finallyBody = [];
+    for (const s of node.finallyBlock.statements) lowerStatement(s, finallyBody);
+  }
+
+  return { kind: "try", block, catchName, catchBody, finallyBody };
 }
 
 // A block (`{ ... }`) or a single bare statement (`if (c) stmt;`) -> Stmt[].

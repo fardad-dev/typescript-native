@@ -30,6 +30,34 @@
 #include <utility>
 #include <vector>
 
+// A scope guard backing `try { … } finally { … }`. `try`'s `finally` block must
+// run on *every* exit from the protected region — normal completion, an early
+// `return`, or an exception unwinding through it — which is exactly what a C++
+// destructor guarantees. The emitter wraps the protected region in a block with a
+// `tsn_finally_guard` local whose destructor runs the finally body, so codegen
+// needs no C++ `try` for a finally (only for a `catch`). The guard is move-only
+// (C++17 guaranteed copy elision means `tsn_make_finally(...)` never actually
+// copies/moves), and `active` ensures the body runs exactly once. The emitter
+// rejects `return`/`throw`/escaping `break`/`continue` *inside* a finally body,
+// so the destructor-run closure never itself returns or throws.
+template <class F>
+struct tsn_finally_guard {
+  F fn;
+  bool active;
+  explicit tsn_finally_guard(F f) : fn(std::move(f)), active(true) {}
+  tsn_finally_guard(tsn_finally_guard&& o) noexcept
+      : fn(std::move(o.fn)), active(o.active) {
+    o.active = false;
+  }
+  tsn_finally_guard(const tsn_finally_guard&) = delete;
+  tsn_finally_guard& operator=(const tsn_finally_guard&) = delete;
+  ~tsn_finally_guard() { if (active) fn(); }
+};
+template <class F>
+static tsn_finally_guard<F> tsn_make_finally(F f) {
+  return tsn_finally_guard<F>(std::move(f));
+}
+
 // `string` is a ref-counted, immutable string. TypeScript strings are
 // immutable, so a value can be freely shared: copying one bumps a counter
 // and aliases the same heap buffer instead of duplicating the characters.

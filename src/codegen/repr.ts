@@ -257,6 +257,57 @@ class RepAnalyzer {
         if (loopVar) scope.delete(loopVar);
         return;
       }
+      case "doWhile":
+        this.visit(s.cond, scope, fk);
+        this.walkAll(s.body, scope, fk, ret);
+        return;
+      case "forOf": {
+        const it = this.visit(s.iterable, scope, fk);
+        let elemType: Type = "number";
+        if (typeof it.type === "object" && it.type.kind === "array") {
+          elemType = it.type.element;
+        } else if (it.type === "string") {
+          elemType = "string";
+        }
+        scope.set(s.name, elemType);
+        // Array elements / string chars are stored as f64, so a number loop var is
+        // never i64 (demote it so the emitter's `double` declaration stays sound).
+        if (elemType === "number") this.demote(varSlot(fk, s.name));
+        this.walkAll(s.body, scope, fk, ret);
+        scope.delete(s.name);
+        return;
+      }
+      case "forIn":
+        this.visit(s.target, scope, fk);
+        scope.set(s.name, "string"); // for-in keys are always strings
+        this.walkAll(s.body, scope, fk, ret);
+        scope.delete(s.name);
+        return;
+      case "switch":
+        this.visit(s.disc, scope, fk);
+        for (const c of s.cases) {
+          if (c.test) this.visit(c.test, scope, fk);
+          this.walkAll(c.body, scope, fk, ret);
+        }
+        return;
+      case "break":
+      case "continue":
+        return;
+      case "labeled":
+        this.walk(s.body, scope, fk, ret);
+        return;
+      case "throw":
+        this.visit(s.value, scope, fk);
+        return;
+      case "try":
+        this.walkAll(s.block, scope, fk, ret);
+        if (s.catchBody) {
+          if (s.catchName) scope.set(s.catchName, "string");
+          this.walkAll(s.catchBody, scope, fk, ret);
+          if (s.catchName) scope.delete(s.catchName);
+        }
+        if (s.finallyBody) this.walkAll(s.finallyBody, scope, fk, ret);
+        return;
     }
   }
 
