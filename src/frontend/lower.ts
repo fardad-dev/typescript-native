@@ -454,6 +454,33 @@ function lowerExpr(node: ts.Expression): Expr {
   if (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) {
     return { kind: "str", value: node.text };
   }
+  // `` `head${e0}mid${e1}tail` `` desugars to string concatenation:
+  // head + e0 + mid + e1 + tail. The head (a `str`, possibly empty) anchors the
+  // whole chain to `string`, so each interpolated value coerces through the
+  // existing `+`-concatenation path (string/number operands; anything else is a
+  // clean "Cannot concatenate" error, exactly as for `+`). Empty middle/tail
+  // quasis are dropped — the head alone keeps the result string-typed — so the
+  // emitted C++ stays free of redundant `+ ""`.
+  if (ts.isTemplateExpression(node)) {
+    let expr: Expr = { kind: "str", value: node.head.text };
+    for (const span of node.templateSpans) {
+      expr = {
+        kind: "binary",
+        op: "+",
+        left: expr,
+        right: lowerExpr(span.expression),
+      };
+      if (span.literal.text !== "") {
+        expr = {
+          kind: "binary",
+          op: "+",
+          left: expr,
+          right: { kind: "str", value: span.literal.text },
+        };
+      }
+    }
+    return expr;
+  }
   if (node.kind === ts.SyntaxKind.TrueKeyword)
     return { kind: "bool", value: true };
   if (node.kind === ts.SyntaxKind.FalseKeyword)

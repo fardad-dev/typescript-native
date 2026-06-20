@@ -87,7 +87,9 @@ A multi-file program is assembled from per-file `lower` results by `loadProgram`
   a **bare identifier** that isn't a known primitive/`Array` → a `class` instance type).
 - `lowerExpr(node)` — TS `Expression` → IR `Expr` (literals, identifiers, binary, ternary
   (`cond ? a : b`), unary, array/object literals, indexing, member access, calls, `new C(...)`,
-  `this`). Also recognizes the `JSON.*`
+  `this`). A **template literal** (`` `a${x}b` ``) desugars here into a left-folded chain of `+`
+  nodes (head + expr + literal + …) — no IR node of its own; the head anchors the chain to `string`.
+  Also recognizes the `JSON.*`
   builtins (`tryLowerJsonCall`) and the `JSON.parse(text) as T` assertion (the one `as`-expression
   form the subset accepts — a general type assertion is rejected).
 - `lowerBinaryOp(kind)` — operator token → `BinaryOp`.

@@ -137,7 +137,9 @@ Implemented and tested end-to-end:
   preserved (via an IIFE). The **ternary** lowers to the C++ `?:`: its condition is a number/boolean
   (like `if`/`while`) and its two branches must share a type (that's the result type; no union) —
   for a number result the rep follows both branches (i64 only when both are).
-- **Strings:** literals, concatenation, lexicographic comparison, `s.length`, character access
+- **Strings:** literals (`"..."` / no-substitution `` `...` ``), **template-literal interpolation**
+  (`` `a${x}b` `` — desugars to `+`-concatenation, so interpolated values coerce the same operands
+  `+` does: string and number), concatenation, lexicographic comparison, `s.length`, character access
   `s[i]` (→ a one-char string), and methods `substring` / `slice` / `indexOf` / `charAt` /
   `charCodeAt` / `toUpperCase` / `toLowerCase` / `split` (`s.split(sep[, limit])` → `string[]`;
   string separators only — regex is out of subset) (JS `String.prototype` semantics, ASCII).
@@ -513,6 +515,16 @@ pair** (red → green).
       (i64 only when both are; a mixed i64/f64 pair is promoted to `double` by C++, matching the f64 rep).
       Also threaded through `repr.ts` (same `combineRep` rule) and the module `Renamer` (rewrites all
       three sub-expressions). Nested ternaries fall out for free (the false branch is just another `Expr`).
+- [x] **Template-literal interpolation** — `` `a${x}b` ``. Even cheaper than the 3-touch pattern: a
+      pure **desugar in lowering**, with *no* IR node, `emit` case, `repr.ts`, or `Renamer` change. A
+      `ts.TemplateExpression` lowers to a left-folded chain of `+`-concatenations
+      (`head + e0 + mid + e1 + tail`), so it rides the existing string-concat machinery end-to-end —
+      including `repr.ts` and the module `Renamer`, which already handle `binary` nodes. The `head` (a
+      `str`, possibly empty) **anchors the chain to `string`**, so a lone `` `${n}` `` of a number is
+      still a string; empty middle/tail quasis are dropped so the emitted C++ has no redundant `+ ""`.
+      Interpolated values coerce exactly as `+` does (string and number operands) — anything else is the
+      same clean "Cannot concatenate" error, not a new code path. ([src/frontend/lower.ts](src/frontend/lower.ts);
+      no-substitution `` `...` `` literals already lowered as plain strings.)
 
 ### todo
 
@@ -524,8 +536,6 @@ ships with a `tests/cases/*.ts` + `.expected` pair** (red → green), except pro
 **Cheap, self-contained syntax** (each is ~one IR node + one `lower` branch + one `emit` case):
 
 - [ ] **Bitwise `& | ^ ~ << >> >>>` and exponentiation `**`** — today: `Unsupported binary operator`.
-- [ ] **Template-literal interpolation** — `` `a${x}b` ``; only no-substitution backtick strings
-      lower today ([src/frontend/lower.ts](src/frontend/lower.ts)).
 - [ ] **`console.log` with multiple args** — currently exactly one ([src/frontend/lower.ts](src/frontend/lower.ts)).
 
 **Control flow** (all currently `Unsupported statement`, except the C-style `for` which works):
