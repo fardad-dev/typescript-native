@@ -104,8 +104,24 @@ export interface ClassDecl {
   methods: Method[];
 }
 
+// A dependency module (one that is imported by another). It compiles to a
+// memoized `init()` that runs its top-level code once and returns a *record* of
+// its module-level variables — the `let`/`const` declarations in `body` become
+// the record's fields; other statements run for their side effects. A reference
+// to one of these variables (from this module's own functions or from an
+// importer) reads it back through `init()`. Functions and classes are NOT here:
+// they stay top-level (in `Module.functions`/`classes`), called/constructed
+// directly. `index` is the module's position in dependency order.
+export interface DepModule {
+  index: number;
+  body: Stmt[];
+}
+
 export interface Module {
   classes: ClassDecl[];
   functions: Func[];
-  main: Stmt[]; // top-level statements -> body of C++ main()
+  main: Stmt[]; // the ENTRY module's top-level statements -> body of C++ main()
+  // Dependency modules (those imported by others), in dependency order. Empty for
+  // a single-file program — in which case codegen is exactly as before.
+  modules: DepModule[];
 }

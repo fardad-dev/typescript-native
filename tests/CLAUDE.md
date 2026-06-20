@@ -9,9 +9,12 @@ means the source actually compiled and executed correctly.
 ```
 tests/
   e2e.test.ts        # the harness (vitest)
+  typecheck.test.ts  # stage-0 checker: asserts type-erroneous programs are rejected
+  modules.test.ts    # module loader: asserts graph rejections (cycles, collisions, …)
   cases/
-    <name>.ts        # a complete tsn program
+    <name>.ts        # a complete tsn program (the entry)
     <name>.expected  # its exact expected stdout
+    modlib/          # helper modules imported by cases/ (see Multi-file cases)
 ```
 
 ## How the harness works ([e2e.test.ts](e2e.test.ts))
@@ -39,6 +42,23 @@ paths embed the case name, so concurrent runs never collide. (This roughly halve
 - `.expected` must match stdout **exactly, including the trailing newline** — `console.log`
   emits `std::cout << expr << "\n"`, so a single `console.log(4)` expects `"4\n"`.
 - Keep each case focused on one feature; name it after the feature.
+
+## Multi-file (module) cases
+
+The harness's `readdirSync(cases/)` is **non-recursive** and only discovers top-level `*.ts`, so
+a multi-file case is: an entry `cases/<name>.ts` (discovered, with its `.expected`) that
+`import`s helper modules living in the **`cases/modlib/`** subdirectory (not discovered → never run
+as standalone cases, no `.expected` needed). Relative specifiers resolve from the importing file's
+folder, e.g. the entry's `import { add } from "./modlib/math"` → `cases/modlib/math.ts`, and a
+helper's `import { base } from "./base"` → `cases/modlib/base.ts`. The compiled entry's stdout
+(which includes any top-level output from its dependencies, in dependency order) is diffed against
+`<name>.expected` like any other case. The `module-*` cases exercise the model end to end: imported
+functions/classes/consts, transitive chains, dependency-module top-level side effects, same-name
+symbols scoped across modules (`module-scope` / `module-funcname`), and the memoized record with a
+module-private variable read by the module's own function (`module-record`). Structural *rejections*
+(cycles, unsupported import forms) and shape assertions (e.g. a collision is mangled apart, not
+rejected) can't be runnable pairs, so they live in [modules.test.ts](modules.test.ts), which writes
+temp files and asserts `loadProgram`'s behavior.
 
 ## TDD loop (how this project is built)
 

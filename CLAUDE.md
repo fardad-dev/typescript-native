@@ -10,15 +10,15 @@ feature breadth or premature optimization.
 ## The pipeline
 
 ```
-.ts source
+.ts source (entry)
    │  (0) type-check                src/frontend/check.ts  (ts.Program + TypeChecker)
    ▼  (abort on type errors)
-.ts source
-   │  (1) parse                     src/frontend/lower.ts  (ts.createSourceFile)
-   ▼
-TypeScript AST
-   │  (2) lower to our own IR       src/frontend/lower.ts -> src/ir/nodes.ts
-   ▼
+.ts source (entry)
+   │  (1) resolve + parse           src/frontend/modules.ts -> src/frontend/lower.ts
+   ▼     follow imports, then ts.createSourceFile per file
+TypeScript AST (per module)
+   │  (2) lower + merge to our IR   src/frontend/lower.ts -> src/ir/nodes.ts
+   ▼     bundle the module graph into ONE Module
 Internal IR (typed)
    │  (3) codegen                   src/codegen/emit.ts
    ▼
@@ -32,6 +32,13 @@ Stage 0 runs a real `ts.Program` + `TypeChecker` over the source and aborts with
 TypeScript-quality diagnostics on any type error, before we lower or emit — so wrong
 assignment types, undeclared names, bad argument counts/types, and bad property access are
 caught up front rather than miscompiled (see [src/frontend/check.ts](src/frontend/check.ts)).
+Because the checker resolves the whole import graph from disk, cross-module mistakes (importing
+a non-existent or non-exported member, wrong argument types across files) are caught here too.
+
+Stage 1 starts at the entry file and follows `import`s to build the module graph, then lowers
+every reachable file and **bundles** them into one IR `Module` (the backend produces one
+translation unit / one binary). A single-file program is just a one-node graph. See
+[src/frontend/modules.ts](src/frontend/modules.ts) and _Modules_ under Current language support.
 
 C++ is our intermediate language: codegen emits readable C++, and `clang++` does the real
 lowering to machine code. (The compiler used to emit LLVM IR directly; it now targets C++,
@@ -56,7 +63,8 @@ src/
   driver.ts         # orchestrates the pipeline stages (0 -> 4)
   frontend/
     check.ts        # (0) type-check with ts.Program + TypeChecker; abort on errors
-    lower.ts        # (1)(2) parse with `typescript`, lower AST -> internal IR
+    modules.ts      # (1) resolve the import graph, lower each file, merge -> one Module
+    lower.ts        # (1)(2) parse with `typescript`, lower one file's AST -> internal IR
   ir/
     nodes.ts        # internal IR node definitions (typed)
   codegen/
@@ -66,7 +74,9 @@ src/
 tests/
   e2e.test.ts       # harness: compile each case, run binary, diff stdout
   typecheck.test.ts # stage-0 checker: asserts bad programs are rejected
+  modules.test.ts   # module loader: asserts graph rejections (cycles, collisions, …)
   cases/            # *.ts inputs + *.expected stdout (one pair per feature)
+    modlib/         # helper modules imported by cases/ (not discovered as cases)
 ```
 
 Each folder has its own `CLAUDE.md` with module-specific detail.
@@ -91,12 +101,14 @@ npm test            # run the e2e suite once (vitest run)
 npm run test:watch  # re-run on change — the TDD red->green loop
 ```
 
-The suite (currently **68 e2e cases** + a stage-0 type-checker test file, all green)
-auto-discovers every `tests/cases/*.ts`, compiles it to a real native binary, runs it, and
-diffs stdout against the matching `.expected` file. **Every feature gets a `tests/cases/*.ts`
-+ `.expected` pair**, ideally written first (red), then implemented to green. Programs that
-must be *rejected* (type errors) can't be expressed as a case pair, so they live in
-[tests/typecheck.test.ts](tests/typecheck.test.ts). See [tests/CLAUDE.md](tests/CLAUDE.md).
+The suite (currently **78 e2e cases** + a stage-0 type-checker test file + a module-loader test
+file, all green) auto-discovers every `tests/cases/*.ts`, compiles it to a real native binary,
+runs it, and diffs stdout against the matching `.expected` file. **Every feature gets a
+`tests/cases/*.ts` + `.expected` pair**, ideally written first (red), then implemented to green.
+Programs that must be *rejected* (type errors) can't be expressed as a case pair, so they live in
+[tests/typecheck.test.ts](tests/typecheck.test.ts); structural module-graph rejections (cycles,
+name collisions, unsupported import forms) live in [tests/modules.test.ts](tests/modules.test.ts).
+See [tests/CLAUDE.md](tests/CLAUDE.md).
 
 ## Current language support
 
@@ -114,7 +126,10 @@ Implemented and tested end-to-end:
   `< <= > >= === !==` (numbers **and** strings — strings compare lexicographically; `===`/`!==`
   also on arrays/objects/instances, comparing **reference identity** — see below), logical
   `&& || !`, string concatenation (`"a" + b`, numbers coerce), array indexing `a[i]`, member
-  access `obj.field`, array `.length`.
+  access `obj.field`, array `.length`. `&&` / `||` follow **JS semantics — they return one of the
+  operands, not a coerced boolean** (`a || b` → first truthy, `a && b` → first falsy; `0`/`NaN`/`""`
+  are falsy); both-boolean operands keep a boolean result. The operands must share a type (no union
+  result), and short-circuit + single left-evaluation are preserved (via an IIFE).
 - **Strings:** literals, concatenation, lexicographic comparison, `s.length`, character access
   `s[i]` (→ a one-char string), and methods `substring` / `slice` / `indexOf` / `charAt` /
   `charCodeAt` / `toUpperCase` / `toLowerCase` / `split` (`s.split(sep[, limit])` → `string[]`;
@@ -125,7 +140,9 @@ Implemented and tested end-to-end:
   printed recursively (single-line; see _Richer console.log_ in the roadmap for the size caveat).
 - **Variables:** `let` / `const` (initializer required); a type annotation is optional — without
   one the type is **inferred from the initializer**. `var` is **not supported** (errors). Assignment
-  `x = e`, `a[i] = e`, `obj.f = e`, compound `+= -= *= /= %=`, and `i++` / `i--`.
+  `x = e`, `a[i] = e`, `obj.f = e`, compound `+= -= *= /= %=`, and `i++` / `i--`. A **top-level**
+  `let`/`const` is a *module* variable: in the entry it becomes a file-scope global (so a function may
+  read it); in an imported module it becomes a field of that module's record (see _Modules_).
 - **Arrays & objects are reference types** (like classes, and like JS): `let b = a` aliases the
   same value, a mutation through one alias is visible through the other, a callee can mutate an
   array/object **parameter** (visible to the caller), and `===`/`!==` compare **identity** (two
@@ -149,6 +166,31 @@ Implemented and tested end-to-end:
   now use. Access modifiers (`public`/`private`/…) are accepted and ignored. **Deferred** (clean
   `tsnc:` errors): `extends`/`implements`, `static`, get/set accessors, parameter properties, field
   initializers, no-constructor classes, and bare `this` as a value.
+- **Modules:** multi-file programs via `export` on a declaration (`export function`/`class`/`const`/
+  `let`) and named imports `import { a, b } from "./relative/path"` (relative specifiers only, →
+  `<spec>.ts`). The compiler resolves the import graph from the entry, lowers every reachable file,
+  and **bundles** them into one translation unit ([src/frontend/modules.ts](src/frontend/modules.ts)),
+  with each module **scoped independently**:
+  - **Functions and classes** stay top-level C++ symbols; a name reused across modules is **mangled
+    apart** (`tsn_m<idx>_<name>`), a program-unique name kept verbatim. Importers call/construct them
+    directly.
+  - A **dependency module** (one that is imported) compiles to a **memoized `init()`** that runs its
+    top-level **once** and returns a **record (struct) of its module variables**. A reference to such
+    a variable — from the module's own functions *or* from an importer — reads it back as
+    `init().field`. So module-private top-level state is encapsulated (it doesn't leak into a global
+    namespace), and a **function can read its module's variables** (e.g. `export function f() { return
+    x }` where `x` is module-level). `main()` runs each dependency's `init()` **eagerly, in dependency
+    order**, before the entry's own top-level — so a module's top-level side effects happen at import
+    time (ES-module semantics).
+  - The **entry module** keeps its top-level in `main()` with its own variables as file-scope globals
+    (nothing imports the entry). A **single-file program is just an entry**, so its codegen is exactly
+    as before — no records, no perf change.
+
+  The stage-0 TS checker enforces real module semantics (you may only use what you export/import) — so
+  an importer can't reach a module's private variables even though the module's own functions can.
+  **Deferred** (clean `tsnc:` errors): `export default`/default imports, `import * as` namespace
+  imports, import aliasing (`{ a as b }`), re-export statements, package/non-relative specifiers, and
+  circular imports.
 
 ### Representation / behavior notes (read these — they bite)
 
@@ -382,12 +424,44 @@ pair** (red → green).
       assignment types, undeclared names, bad argument counts/types, bad property access — at the
       source level instead of as a late `tsnc:` message or a miscompile. Built over an in-memory copy
       of the source plus a tiny ambient `console` declaration, loading only the **ES2020 lib** (not
-      DOM, so its hundreds of globals can't shadow user names) under `strict: true`. All 68 e2e cases
-      type-check clean under these options (verified empirically); rejection behavior — which can't
+      DOM, so its hundreds of globals can't shadow user names) under `strict: true` (plus `module:
+      ESNext` + `moduleResolution: Bundler`, so it resolves the whole import graph from disk and
+      checks cross-module types — see _Modules_). All 78 e2e cases type-check clean under these
+      options (verified empirically); rejection behavior — which can't
       be a case pair — is covered by [tests/typecheck.test.ts](tests/typecheck.test.ts). Subset-
       specific rejections (e.g. `var`) still happen later in lowering; this stage only enforces
       TypeScript's semantics. Note: lowering still reads annotations directly (it does not yet thread
       the `TypeChecker`'s inferred types through), so the checker is a gate, not yet the type source.
+
+- [x] **Modules (`import` / `export`)** — multi-file programs, with each module **scoped
+      independently**. A stage-1 loader ([src/frontend/modules.ts](src/frontend/modules.ts)) starts at
+      the entry, follows `import`s to build the dependency graph (relative specifiers → `<spec>.ts`),
+      topologically sorts it, lowers every reachable file with the existing `lower`, runs a scope-aware
+      **resolver/renamer** per module, and **bundles** everything into one IR `Module` (the backend is
+      one translation unit / one binary). The scoping model (after a couple of iterations on the
+      design): **functions and classes** stay top-level C++ symbols, mangled apart on a cross-module
+      name collision (`tsn_m<idx>_<name>`) and otherwise kept verbatim; a **dependency module** (one
+      that's imported) compiles to a **memoized `init()`** returning a **record (struct) of its module
+      variables** — a reference to a module variable, from the module's own functions *or* an importer,
+      is rewritten by the resolver into `init().field` (reusing the existing object/member codegen). So
+      module-private state is encapsulated (it never becomes a global), yet a function **can** read its
+      module's variables. `main()` runs each dependency's `init()` **eagerly in dependency order**
+      before the entry's top-level (ES-module side-effect timing). The **entry** keeps its top-level in
+      `main()` with its own variables as **file-scope globals** (promoted so functions can read them);
+      a **single-file program is just an entry**, so its codegen — and the prime-sieve benchmark — is
+      unchanged. The stage-0 TS checker (now `module: ESNext` + `moduleResolution: Bundler`) resolves
+      the graph from disk and enforces real module semantics (use-of-non-exported, missing members,
+      cross-file type mismatches), so an importer can't reach a module's private variables even though
+      the module's own functions can. Reserved C++ identifiers (e.g. an entry variable/function named
+      `main`) are mangled too. The number-rep pass ([src/codegen/repr.ts](src/codegen/repr.ts)) gained
+      **global rep slots** (entry globals keep the i64 fast path) and analyzes dependency `init` bodies.
+      Shipped alongside: **JS-semantics `&&`/`||`** (return an operand, not a coerced boolean; truthy
+      `||` / falsy `&&`; short-circuit + single left-eval via an IIFE; both-boolean stays boolean) —
+      needed for the `x || fallback` idiom. **Deferred** (clean `tsnc:` errors): `export default`/
+      default imports, `import * as` namespace imports, import aliasing (`{ a as b }`), re-export
+      statements, non-relative specifiers, and circular imports. Helper modules for the e2e suite live
+      in `tests/cases/modlib/` (a subdirectory, so the non-recursive harness doesn't run them as
+      standalone cases); structural rejections are in [tests/modules.test.ts](tests/modules.test.ts).
 
 ### Later
 
@@ -396,8 +470,9 @@ pair** (red → green).
       `private`/`public`/`protected`/`readonly` visibility, `static` members, get/set accessors,
       parameter properties, field initializers (default member init), and bare `this` as a value
       (via `std::enable_shared_from_this`, so `let b = this` / passing `this` around works).
-- [ ] **Closures, modules, generics** — first-class function values, `import`/`export`, and
-      type parameters.
+- [ ] **Closures, generics** — first-class function values and type parameters. (`import`/`export`
+      modules shipped — see _Done_; a module variable is already usable inside that module's function
+      bodies, via the module record.)
 
 ## will never support
 

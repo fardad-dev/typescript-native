@@ -54,6 +54,13 @@ Soundness rests on the rep table never declaring an `i64` slot that can receive 
 the authority on types, so a divergence can only make a rep more conservative, never unsound.
 Accepted imprecision: integer wraparound past 2^63.
 
+**Globals + module bodies.** A direct top-level `let`/`const` in the entry is a *global* with its
+own rep slot, keyed by name (`globalSlot` / `RepTable.globalRep`) rather than a function scope, so a
+function reading it and the global's declaration agree on i64/f64. `analyze` also walks each
+dependency module's `init` body under a `$dep<idx>` key (matching the emitter), so nested locals get
+reps and a float argument passed from a module's top-level demotes the callee's parameter. Dependency
+*module variables* are record (object) fields = f64, reached via member access, so they need no slot.
+
 ## The `Emitter` class
 
 - **Module-level:** `sigs` (function signatures, collected first so calls can reference
@@ -61,10 +68,16 @@ Accepted imprecision: integer wraparound past 2^63.
   shape) + `structFields` (struct name → fields, for `tsn_inspect`).
 - **Per-function scratch (reset by `resetForFunction`):** `body` (emitted statement lines),
   `vars` (name → `Type`), `curReturn`, `funcKey` (rep-lookup scope), `currentClass`, `indent`.
-- Output shape: `#include`s → `tsn_str` + runtime helpers → inspect prelude (scalars + array-
-  template fwd decl) → class/struct forward decls → per-type inspect fwd decls → object struct defs
-  → class struct defs → array-template + per-type inspect defs → out-of-line class method/ctor defs
-  → function prototypes → function definitions → `int main()` (top-level statements + `return 0`).
+- **Module-level state (cont.):** `globals` (name → `Type`, the entry's promoted top-level vars) +
+  `globalDecls` (their namespace-scope declaration lines).
+- Output shape: `#include`s → `tsn_str` + runtime helpers (incl. `tsn_truthy` for `&&`/`||`) → inspect
+  prelude (scalars + array-template fwd decl) → class/struct forward decls → per-type inspect fwd decls
+  → object struct defs → class struct defs → array-template + per-type inspect defs → **module-level
+  global decls** → out-of-line class method/ctor defs → **dependency `init()` prototypes + defs** →
+  function prototypes → function definitions → `int main()`.
+- **Emission order matters:** `main` and the dependency `init()`s are emitted **before** the
+  function/class bodies, because emitting them populates `this.globals` (entry vars) and registers the
+  synthetic `tsn_modN_init` signatures (dependency record types) that those bodies reference.
 
 ## Conventions (match these)
 
@@ -86,6 +99,10 @@ Accepted imprecision: integer wraparound past 2^63.
 - `cppStringLiteral` encodes JS strings as C++ literals (escape `"`/`\`/controls; other bytes
   as 3-digit octal `\ooo`, which is bounded — unlike `\x`).
 - `emitCall(e, asStatement)` — a `void` call is valid only in statement position.
+- `&&` / `||` follow JS: both-boolean → the plain `(l && r)` boolean; otherwise (operands of the
+  same non-boolean type) they **return an operand** via an IIFE
+  (`([&]{ auto _t = (L); return tsn_truthy(_t) ? _t : (R); }())` for `||`), which keeps short-circuit
+  and evaluates `L` once. `tsn_truthy` (prelude) gives JS truthiness (0/NaN/"" falsy, null ref falsy).
 - Helpers: `cppType`/`retType`/`structName`, `sameType` (structural, order-independent for
   objects), `displayType` (error messages), `isArray`/`isObject`/`isAggregate`.
 
@@ -102,6 +119,30 @@ instances are all reference types now, the boundary is uniform and simple:
   is no longer any mutation-through-param to reject.
 - **Returns:** `retSlotType` returns a reference type by value — a `shared_ptr`, i.e. the shared
   reference, not a deep copy. `return xs;` hands back the same array the caller can then alias.
+
+## Modules (entry globals + dependency records)
+
+The loader ([../frontend/modules.ts](../frontend/modules.ts)) hands the emitter a `Module` whose
+top-level is split into the **entry** (`mod.main`) and **dependency modules** (`mod.modules`):
+
+- **Entry top-level → `main()` with promoted globals.** `emitMain` runs `emitTopLevel`: a *direct*
+  top-level `let`/`const` is **promoted to a file-scope global** (`emitGlobalLet`) — declared in
+  `globalDecls` (`<slotType> name;`, honoring its `globalRep`) and *assigned* in `main` — so a
+  separately-compiled function body can read it (`this.vars` miss → `this.globals` fallback in the
+  `var` / lvalue cases). Nested `let`s (inside a top-level loop/`if`) stay true locals.
+- **Dependency module → memoized `init()` returning a record.** `emitDepInit` compiles a
+  `DepModule` to `std::shared_ptr<tsn_ObjN> tsn_modN_init()` with `static rec; if (rec) return rec;
+  rec = make_shared<…>(); <body>; return rec;`. The body's direct `let`s become record-field
+  assignments (`rec->field = …`, through `f64SlotCode` since record fields are object-struct fields
+  = f64); other statements run for side effects. It registers a **synthetic signature**
+  `tsn_modN_init : () -> { fields }` (grown field-by-field, so a later statement reading an earlier
+  field resolves), so the loader's rewrite of a module-variable reference to `member(call(initN),
+  field)` type-checks via the ordinary object/member path.
+- **Eager init.** `main` calls every `tsn_modN_init()` (dependency order) *before* the entry's
+  top-level — a module's top-level side effects run at import time. `init()` is memoized, so later
+  reads just return the cached record.
+- A **single-file program** has no `mod.modules`, so none of this fires — codegen is exactly the
+  pre-modules shape (entry top-level in `main`, its own vars as globals).
 
 ## Classes
 

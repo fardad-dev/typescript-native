@@ -27,6 +27,14 @@ export function lower(fileName: string, source: string): Module {
   const functions: Func[] = [];
   const main: Stmt[] = [];
   for (const stmt of sf.statements) {
+    // `import`/`export` declarations are handled by the module loader
+    // (src/frontend/modules.ts): imports drove which files to include, and an
+    // `export` modifier on a declaration is otherwise ignored. We skip the
+    // statements here so they don't fall through to the "unsupported" throw. A
+    // bare `export {...}` / re-export is rejected by the loader before we get here.
+    if (ts.isImportDeclaration(stmt) || ts.isExportDeclaration(stmt)) {
+      continue;
+    }
     if (ts.isClassDeclaration(stmt)) {
       classes.push(lowerClass(stmt));
       continue;
@@ -40,7 +48,9 @@ export function lower(fileName: string, source: string): Module {
     }
     lowerStatement(stmt, main);
   }
-  return { classes, functions, main };
+  // A single lowered file has no dependency modules of its own; the module loader
+  // (modules.ts) assembles cross-file programs and fills in `modules`.
+  return { classes, functions, main, modules: [] };
 }
 
 // Lower a typed parameter list (function, method, or constructor). Each param

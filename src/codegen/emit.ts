@@ -32,6 +32,7 @@ import {
   Param,
   ClassDecl,
   Method,
+  DepModule,
 } from "../ir/nodes";
 import { analyze, RepTable, Rep, litRep, combineRep, MAIN_KEY } from "./repr";
 
@@ -133,6 +134,15 @@ class Emitter {
   // Representation table (number i64/f64), inferred up front by repr.ts.
   private reps!: RepTable;
 
+  // Module-level globals: each direct top-level `let`/`const` in `main` is
+  // promoted to a file-scope global so function/method bodies can reference it
+  // (top-level locals can't be seen from a separate C++ function). `globals` maps
+  // the (program-unique) name to its type; `globalDecls` are the namespace-scope
+  // declarations. Populated while emitting `main` (which runs before the function
+  // and class bodies that read it).
+  private globals = new Map<string, Type>();
+  private globalDecls: string[] = [];
+
   // Per-function scratch, reset by resetForFunction().
   private body: string[] = [];
   private vars = new Map<string, Type>();
@@ -163,13 +173,20 @@ class Emitter {
     }
 
     // Emit bodies first — this populates structDefs as object types are seen.
-    // Class struct definitions are built before their out-of-line method/ctor
-    // bodies, and both before functions/main; all populate structDefs.
+    // `main` is emitted BEFORE the function/class bodies: it promotes top-level
+    // `let`/`const` to file-scope globals (populating `this.globals` + the
+    // declarations), which the function and method bodies then reference. Struct
+    // definitions still come before their out-of-line method/ctor bodies; all
+    // populate structDefs.
     const classStructs = mod.classes.map((c) => this.emitClassStruct(c));
-    const classDefs = mod.classes.flatMap((c) => this.emitClassDefs(c));
     const protos = mod.functions.map((fn) => this.prototype(fn));
+    // Dependency module inits BEFORE main/functions: each registers a synthetic
+    // `tsn_modN_init` signature (returning its exports record) that main and the
+    // function/method bodies reference when reading a module variable.
+    const depInits = mod.modules.map((dm) => this.emitDepInit(dm));
+    const mainDef = this.emitMain(mod.main, mod.modules); // populates this.globals
+    const classDefs = mod.classes.flatMap((c) => this.emitClassDefs(c));
     const defs = mod.functions.map((fn) => this.emitFunction(fn));
-    const mainDef = this.emitMain(mod.main);
     // Forward-declare every class and object struct so any type can reference any
     // other (or itself) through `std::shared_ptr<…>` (a pointer to an incomplete
     // type is fine). With reference-typed aggregates, struct *members* are also
@@ -272,6 +289,16 @@ class Emitter {
       `static inline double tsn_imod(long long a, long long b) {`,
       `  return b ? (double)(a % b) : NAN;`,
       `}`,
+      ``,
+      // JS truthiness, used by `||`/`&&` (which return an operand, not a coerced
+      // bool). 0 and NaN are falsy numbers; "" is a falsy string; a null reference
+      // (only a not-yet-initialized global) is falsy, every live object/array/
+      // instance truthy.
+      `static inline bool tsn_truthy(double v) { return v != 0.0 && !std::isnan(v); }`,
+      `static inline bool tsn_truthy(long long v) { return v != 0; }`,
+      `static inline bool tsn_truthy(bool b) { return b; }`,
+      `static inline bool tsn_truthy(const tsn_str& s) { return s.size() != 0; }`,
+      `template <class T> static inline bool tsn_truthy(const std::shared_ptr<T>& p) { return (bool)p; }`,
       ``,
       // String methods, matching JS String.prototype semantics. Indices are JS
       // numbers (doubles): NaN (the sentinel an omitted optional arg lowers to)
@@ -449,6 +476,17 @@ class Emitter {
       ...this.arrayInspectDef(),
       ``,
       ...(inspectDefs.length ? [inspectDefs.join("\n\n"), ``] : []),
+      // Module-level globals (promoted top-level `let`/`const`) — declared after
+      // the struct/class definitions and before the function/method bodies and
+      // main that read them. A shared_ptr global only needs a forward decl, but
+      // these come after the full definitions, so any type is fine here.
+      ...(this.globalDecls.length
+        ? [`// module-level globals`, ...this.globalDecls, ``]
+        : []),
+      // Dependency module init prototypes, then their definitions — both before
+      // the function/method bodies and main that call `tsn_modN_init()`.
+      ...(depInits.length ? [...depInits.map((d) => d.proto), ``] : []),
+      ...(depInits.length ? [depInits.map((d) => d.def).join("\n\n"), ``] : []),
       ...(classDefs.length ? [classDefs.join("\n\n"), ``] : []),
       ...(protos.length ? [...protos, ``] : []),
       defs.join("\n\n"),
@@ -744,11 +782,114 @@ class Emitter {
     return e.kind === "this" ? this.thisValue() : this.emitExpr(e);
   }
 
-  private emitMain(stmts: Stmt[]): string {
+  private emitMain(stmts: Stmt[], deps: DepModule[]): string {
     // top-level `return` is rejected during lowering
     this.resetForFunction("void", MAIN_KEY);
-    for (const s of stmts) this.emitStmt(s);
+    // Run each dependency's init() eagerly, in dependency order, before the
+    // entry's own top-level — so a module's top-level side effects happen at
+    // "import time" (matching ES module semantics). init() is memoized, so a
+    // later module-variable read just returns the cached record.
+    for (const d of deps) this.push(`${this.depInitName(d)}();`);
+    for (const s of stmts) this.emitTopLevel(s);
     return [`int main() {`, ...this.body, `  return 0;`, `}`].join("\n");
+  }
+
+  // --- dependency modules (records + memoized init) -----------------------
+  //
+  // A dependency module compiles to a memoized `init()` that runs its top-level
+  // once and returns a record (an object struct) of its module variables. A
+  // reference to such a variable was rewritten by the loader into a
+  // `member`-on-`init()` call, so reading it reuses the object/member codegen; we
+  // just have to emit the init and register its synthetic signature so those
+  // member accesses type-check.
+  private depInitName(d: DepModule): string {
+    return `tsn_mod${d.index}_init`;
+  }
+
+  private emitDepInit(d: DepModule): { proto: string; def: string } {
+    const fn = this.depInitName(d);
+    // funcKey for nested-local reps (matches repr.ts's `$dep<idx>` key).
+    this.resetForFunction("void", `$dep${d.index}`);
+    // Build the record type incrementally: after each top-level `let`, register
+    // (a growing) signature `fn: () -> { fields... }` so a later statement that
+    // reads an earlier field resolves through it.
+    const fields: Field[] = [];
+    for (const s of d.body) {
+      if (s.kind === "let") {
+        const init = this.emitExpr(s.init);
+        if (s.type !== undefined && !sameType(s.type, init.type)) {
+          throw new Error(
+            `Type '${displayType(init.type)}' is not assignable to '${displayType(s.type)}'`,
+          );
+        }
+        fields.push({ name: s.name, type: init.type });
+        this.sigs.set(fn, { params: [], ret: { kind: "object", fields: [...fields] } });
+        // Record fields are object fields (f64 for numbers), so cast an i64 init.
+        this.push(`rec->${s.name} = ${this.f64SlotCode(init)};`);
+      } else {
+        this.emitStmt(s);
+      }
+    }
+    const recordType: ObjectType = { kind: "object", fields };
+    this.sigs.set(fn, { params: [], ret: recordType });
+    const ptr = this.cppType(recordType); // std::shared_ptr<tsn_ObjN>
+    const struct = this.structName(recordType);
+    const def = [
+      `${ptr} ${fn}() {`,
+      `  static ${ptr} rec;`,
+      `  if (rec) return rec;`, // memoized — runs the body exactly once
+      `  rec = std::make_shared<${struct}>();`,
+      ...this.body,
+      `  return rec;`,
+      `}`,
+    ].join("\n");
+    return { proto: `${ptr} ${fn}();`, def };
+  }
+
+  // A top-level statement of `main`. A direct `let`/`const` is promoted to a
+  // file-scope global (declared at namespace scope, assigned here) so it is
+  // visible to function/method bodies, which are separate C++ functions and can't
+  // see `main`'s locals. Every other statement — including a nested `let` inside
+  // a top-level loop/`if` — is emitted normally (those stay true locals).
+  private emitTopLevel(s: Stmt): void {
+    if (s.kind === "let") {
+      this.emitGlobalLet(s);
+      return;
+    }
+    this.emitStmt(s);
+  }
+
+  private emitGlobalLet(stmt: {
+    kind: "let";
+    name: string;
+    type?: Type;
+    init: Expr;
+  }): void {
+    // Empty array literal: take the element type from the annotation (as locals).
+    if (stmt.init.kind === "array" && stmt.init.elements.length === 0) {
+      if (!stmt.type || !isArray(stmt.type)) {
+        throw new Error("Empty array literal needs an array type annotation");
+      }
+      this.globals.set(stmt.name, stmt.type);
+      this.globalDecls.push(`${this.cppType(stmt.type)} ${stmt.name};`);
+      this.push(
+        `${stmt.name} = std::make_shared<${this.vecType(stmt.type)}>();`,
+      );
+      return;
+    }
+    const init = this.emitExpr(stmt.init);
+    if (stmt.type !== undefined && !sameType(stmt.type, init.type)) {
+      throw new Error(
+        `Type '${displayType(init.type)}' is not assignable to '${displayType(stmt.type)}'`,
+      );
+    }
+    this.globals.set(stmt.name, init.type);
+    // The global's C++ type follows its inferred number rep (a safe-integer global
+    // never assigned a fraction stays `long long`); an i64 initializer widens
+    // harmlessly into a demoted (double) global.
+    const declType = this.slotType(init.type, this.reps.globalRep(stmt.name));
+    this.globalDecls.push(`${declType} ${stmt.name};`);
+    this.push(`${stmt.name} = ${init.code};`);
   }
 
   // --- emission helpers ---------------------------------------------------
@@ -836,7 +977,8 @@ class Emitter {
   private emitLValue(target: Expr): Value {
     switch (target.kind) {
       case "var": {
-        const type = this.vars.get(target.name);
+        // Locals shadow globals; fall back to a module-level global otherwise.
+        const type = this.vars.get(target.name) ?? this.globals.get(target.name);
         if (!type)
           throw new Error(
             `Cannot assign to undeclared variable '${target.name}'`,
@@ -995,11 +1137,22 @@ class Emitter {
       case "str":
         return { code: `tsn_str(${cppStringLiteral(e.value)})`, type: "string" };
       case "var": {
-        const type = this.vars.get(e.name);
-        if (!type) throw new Error(`Unknown variable: ${e.name}`);
-        const rep =
-          type === "number" ? this.reps.varRep(this.funcKey, e.name) : undefined;
-        return { code: e.name, type, rep };
+        // A local binding shadows a same-named global, so check `vars` first.
+        const local = this.vars.get(e.name);
+        if (local !== undefined) {
+          const rep =
+            local === "number" ? this.reps.varRep(this.funcKey, e.name) : undefined;
+          return { code: e.name, type: local, rep };
+        }
+        // Otherwise it may be a module-level global (a promoted top-level var),
+        // visible here even from inside a function/method body.
+        const global = this.globals.get(e.name);
+        if (global !== undefined) {
+          const rep =
+            global === "number" ? this.reps.globalRep(e.name) : undefined;
+          return { code: e.name, type: global, rep };
+        }
+        throw new Error(`Unknown variable: ${e.name}`);
       }
       case "binary":
         return this.emitBinary(e);
@@ -1273,11 +1426,32 @@ class Emitter {
       // contents are `!==`, and an alias (`let b = a`) is `===`.
       return { code, type: "boolean" };
     }
-    // logical && ||
-    if (l.type !== "boolean" || r.type !== "boolean") {
-      throw new Error(`Operator '${e.op}' expects booleans`);
+    // logical && || — JS semantics: the result is one of the *operands*, not a
+    // coerced boolean. Both-boolean keeps the simple boolean result (and stays a
+    // usable C++ condition); `false`/`true` are already the operands there.
+    if (l.type === "boolean" && r.type === "boolean") {
+      return { code, type: "boolean" };
     }
-    return { code, type: "boolean" };
+    // Otherwise the operands must share a type, and that's the result type: `||`
+    // yields the first truthy operand, `&&` the first falsy one. An immediately-
+    // invoked lambda evaluates the left operand exactly once (binding it to `_t`)
+    // and the right only on the branch that needs it — preserving short-circuit
+    // and avoiding double-evaluating a side-effecting left operand.
+    if (!sameType(l.type, r.type)) {
+      throw new Error(
+        `Operator '${e.op}' needs operands of the same type, got '${displayType(l.type)}' and '${displayType(r.type)}'`,
+      );
+    }
+    const ternary =
+      e.op === "||"
+        ? `tsn_truthy(_t) ? _t : (${r.code})`
+        : `tsn_truthy(_t) ? (${r.code}) : _t`;
+    const iife = `([&]() { auto _t = (${l.code}); return ${ternary}; }())`;
+    const rep =
+      l.type === "number"
+        ? combineRep(l.rep ?? "f64", r.rep ?? "f64")
+        : undefined;
+    return { code: iife, type: l.type, rep };
   }
 
   // Emit a function call. In statement position a void call is allowed; in value

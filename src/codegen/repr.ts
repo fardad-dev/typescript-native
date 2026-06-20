@@ -44,6 +44,10 @@ export function combineRep(a: Rep, b: Rep): Rep {
 export interface RepTable {
   varRep(funcKey: string, name: string): Rep;
   retRep(funcName: string): Rep;
+  // Rep of a module-level (global) variable — a direct top-level `let`/`const`,
+  // promoted to a file-scope global so functions can reference it. Keyed by the
+  // (already program-unique) variable name, not by a function scope.
+  globalRep(name: string): Rep;
 }
 
 export function analyze(mod: Module): RepTable {
@@ -64,11 +68,27 @@ class RepAnalyzer {
   private repOf = new Map<string, Rep>();
   private changed = false;
 
+  // Module-level globals: the direct top-level `let`/`const` statements in `main`
+  // (promoted to file-scope globals so functions can reference them). Tracked by
+  // node identity (`globalNodes`) for the declaration site and by name
+  // (`globalSet`) for resolving references — a reference is a global only when it
+  // is NOT shadowed by a local binding (so `globalSet` is checked after `scope`).
+  // `globalTypes` is the inferred type of each, built during the `main` walk.
+  private globalNodes = new Set<Stmt>();
+  private globalSet = new Set<string>();
+  private globalTypes = new Map<string, Type>();
+
   constructor(private mod: Module) {
     for (const fn of mod.functions) {
       this.sigs.set(fn.name, { params: fn.params, ret: fn.returnType });
     }
     for (const cls of mod.classes) this.classes.set(cls.name, cls);
+    for (const s of mod.main) {
+      if (s.kind === "let") {
+        this.globalNodes.add(s);
+        this.globalSet.add(s.name);
+      }
+    }
   }
 
   run(): RepTable {
@@ -100,12 +120,21 @@ class RepAnalyzer {
         this.currentClass = undefined;
       }
       this.walkAll(this.mod.main, new Map(), MAIN_KEY, "void");
+      // Dependency module bodies run inside their own `init()` — analyze each
+      // under its own scope key (matching the emitter's `$dep<idx>`), so nested
+      // locals get reps and a float argument passed to a function from a module's
+      // top-level demotes the callee's parameter. The module variables themselves
+      // are record fields (f64), reached via member access, so they need no slot.
+      for (const dm of this.mod.modules) {
+        this.walkAll(dm.body, new Map(), `$dep${dm.index}`, "void");
+      }
     } while (this.changed && ++guard < 100000);
 
     const repOf = this.repOf;
     return {
       varRep: (fk, name) => repOf.get(varSlot(fk, name)) ?? "i64",
       retRep: (fn) => repOf.get(retSlot(fn)) ?? "i64",
+      globalRep: (name) => repOf.get(globalSlot(name)) ?? "i64",
     };
   }
 
@@ -143,17 +172,35 @@ class RepAnalyzer {
         // An annotation is authoritative for the type (e.g. empty `[]` or a
         // declared `: number`); otherwise the type is inferred from the init.
         const type = s.type !== undefined ? s.type : (init.type as Type);
-        scope.set(s.name, type);
-        if (type === "number" && init.rep === "f64") {
-          this.demote(varSlot(fk, s.name));
+        // A direct top-level `let` is a global (file-scope), not a local: record
+        // its type and demote its global slot, but do NOT add it to the local
+        // scope (so a same-named function-local stays a distinct local slot).
+        if (this.globalNodes.has(s)) {
+          this.globalTypes.set(s.name, type);
+          if (type === "number" && init.rep === "f64") {
+            this.demote(globalSlot(s.name));
+          }
+        } else {
+          scope.set(s.name, type);
+          if (type === "number" && init.rep === "f64") {
+            this.demote(varSlot(fk, s.name));
+          }
         }
         return;
       }
       case "assign": {
         const val = this.visit(s.value, scope, fk);
         if (s.target.kind === "var") {
-          if (scope.get(s.target.name) === "number" && val.rep === "f64") {
-            this.demote(varSlot(fk, s.target.name));
+          const name = s.target.name;
+          if (scope.get(name) === "number" && val.rep === "f64") {
+            this.demote(varSlot(fk, name));
+          } else if (
+            !scope.has(name) &&
+            this.globalTypes.get(name) === "number" &&
+            val.rep === "f64"
+          ) {
+            // Assigning a fraction to a (non-shadowed) global demotes its slot.
+            this.demote(globalSlot(name));
           }
         } else {
           // index/member target — object fields and array elements are f64, so
@@ -239,11 +286,22 @@ class RepAnalyzer {
         return { type: { kind: "class", name: e.className }, rep: "f64" };
       }
       case "var": {
-        const t = scope.get(e.name) ?? "number";
-        return {
-          type: t,
-          rep: t === "number" ? this.getRep(varSlot(fk, e.name)) : "f64",
-        };
+        // A local binding shadows a same-named global, so check `scope` first.
+        if (scope.has(e.name)) {
+          const t = scope.get(e.name)!;
+          return {
+            type: t,
+            rep: t === "number" ? this.getRep(varSlot(fk, e.name)) : "f64",
+          };
+        }
+        if (this.globalSet.has(e.name)) {
+          const t = this.globalTypes.get(e.name) ?? "number";
+          return {
+            type: t,
+            rep: t === "number" ? this.getRep(globalSlot(e.name)) : "f64",
+          };
+        }
+        return { type: "number", rep: this.getRep(varSlot(fk, e.name)) };
       }
       case "unary": {
         const v = this.visit(e.operand, scope, fk);
@@ -381,6 +439,12 @@ class RepAnalyzer {
 
 function varSlot(funcKey: string, name: string): string {
   return `${funcKey}::${name}`;
+}
+// Slot for a module-level global. Globals have program-unique names (the loader
+// mangles cross-module collisions), so the name alone keys the slot; the `$g::`
+// prefix keeps it distinct from any function-scoped `funcKey::name` slot.
+function globalSlot(name: string): string {
+  return `$g::${name}`;
 }
 function retSlot(funcName: string): string {
   return `${funcName}::$ret`;

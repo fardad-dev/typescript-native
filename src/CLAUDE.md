@@ -5,13 +5,15 @@ The compiler is a straight pipeline. Data flows one direction; each stage has on
 ```
 index.ts      CLI (commander): parse args -> Options -> compile()
    ▼
-driver.ts     compile(): read source -> typeCheck() -> lower() -> emit() -> buildExecutable()
+driver.ts     compile(): read source -> typeCheck() -> loadProgram() -> emit() -> buildExecutable()
    ▼
-frontend/check.ts   (0) ts.Program + TypeChecker; abort on type errors
+frontend/check.ts   (0) ts.Program + TypeChecker; abort on type errors (whole import graph)
    ▼
-frontend/lower.ts   (1) parse with `typescript`  (2) lower AST -> IR     ──┐ produces
-   ▼                                                                       │
-ir/nodes.ts         the typed IR — the contract between lower and emit  ◄──┘
+frontend/modules.ts (1) resolve the import graph, lower each file, merge -> one Module  ──┐
+   ▲   uses lower() per file                                                              │ produces
+frontend/lower.ts   (1) parse with `typescript`  (2) lower one file's AST -> IR           │
+   ▼                                                                                      │
+ir/nodes.ts         the typed IR — the contract between lower and emit  ◄─────────────────┘
    ▼
 codegen/emit.ts     (3) IR -> C++ source text (the .cpp)                 ◄── consumes IR
    ▼
@@ -19,11 +21,15 @@ backend/clang.ts    (4) clang++ .cpp -> native executable
 ```
 
 - [index.ts](index.ts) — entry; only CLI concerns. Defers all work to `driver.compile`.
-- [driver.ts](driver.ts) — `compile(opts)` glues the stages (type-check → lower → emit → build);
+- [driver.ts](driver.ts) — `compile(opts)` glues the stages (type-check → load+lower → emit → build);
   owns where the `.cpp` is written.
 - [frontend/check.ts](frontend/check.ts) — (0) semantic type-check with `ts.Program` + `TypeChecker`;
-  throws TypeScript diagnostics before lowering. See [frontend/CLAUDE.md](frontend/CLAUDE.md).
-- [frontend/lower.ts](frontend/lower.ts) — TypeScript AST → our IR. See [frontend/CLAUDE.md](frontend/CLAUDE.md).
+  throws TypeScript diagnostics before lowering. Resolves the whole import graph (cross-module
+  checking). See [frontend/CLAUDE.md](frontend/CLAUDE.md).
+- [frontend/modules.ts](frontend/modules.ts) — (1) module loader/linker: resolves the `import` graph
+  from the entry, lowers every reachable file, and merges into one IR `Module` (bundling). See
+  [frontend/CLAUDE.md](frontend/CLAUDE.md).
+- [frontend/lower.ts](frontend/lower.ts) — one file's TypeScript AST → our IR. See [frontend/CLAUDE.md](frontend/CLAUDE.md).
 - [ir/nodes.ts](ir/nodes.ts) — IR node definitions. See [ir/CLAUDE.md](ir/CLAUDE.md).
 - [codegen/emit.ts](codegen/emit.ts) — IR → C++ source. See [codegen/CLAUDE.md](codegen/CLAUDE.md).
 - [codegen/repr.ts](codegen/repr.ts) — number-representation pass (`i64`/`f64`) the emitter runs

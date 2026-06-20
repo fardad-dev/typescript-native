@@ -4,7 +4,7 @@ import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import { typeCheck } from "./frontend/check";
-import { lower } from "./frontend/lower";
+import { loadProgram } from "./frontend/modules";
 import { emit } from "./codegen/emit";
 import { buildExecutable, buildExecutableAsync } from "./backend/clang";
 
@@ -19,7 +19,10 @@ export interface Options {
 function emitCppFile(opts: Options): string {
   const source = fs.readFileSync(opts.input, "utf8");
   typeCheck(opts.input, source); // stage 0: abort on TypeScript type errors
-  const mod = lower(opts.input, source); // stages 1 + 2: parse + lower to IR
+  // Stages 1 + 2: resolve the import graph from the entry, lower every reachable
+  // file, and merge into one IR Module (a single-file program is just a graph of
+  // one). See src/frontend/modules.ts.
+  const mod = loadProgram(opts.input);
   const cpp = emit(mod); // stage 3: IR -> C++ source
 
   const cppPath = opts.emitCpp

@@ -30,6 +30,13 @@ const OPTIONS: ts.CompilerOptions = {
   noEmit: true,
   strict: true,
   skipLibCheck: true,
+  // Multi-file programs: resolve relative `import`s (`./x` -> `x.ts`) so the
+  // checker pulls in and type-checks the whole module graph from disk. Bundler
+  // resolution accepts the extensionless TS convention; allowImportingTsExtensions
+  // (legal under noEmit) also accepts an explicit `./x.ts`.
+  module: ts.ModuleKind.ESNext,
+  moduleResolution: ts.ModuleResolutionKind.Bundler,
+  allowImportingTsExtensions: true,
 };
 
 // Type-check `source` (already read for `fileName`). Throws on the first batch of
