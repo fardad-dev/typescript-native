@@ -724,7 +724,12 @@ class Emitter {
   }
 
   private emitMain(stmts: Stmt[], deps: DepModule[]): string {
-    // top-level `return` is rejected during lowering
+    // top-level `return` is rejected during lowering. **Top-level `await`** (only
+    // legal when the entry is a module — stage 0 enforces that) makes the entry's
+    // top-level a coroutine: see emitTopLevelCoroutine.
+    if (stmts.some(stmtContainsAwait)) {
+      return this.emitTopLevelCoroutine(stmts, deps);
+    }
     this.resetForFunction("void", MAIN_KEY);
     // Run each dependency's init() eagerly, in dependency order, before the
     // entry's own top-level — so a module's top-level side effects happen at
@@ -740,6 +745,33 @@ class Emitter {
     return [`int main() {`, ...this.body, ...drain, `  return 0;`, `}`].join("\n");
   }
 
+  // The entry top-level contains `await`. Emit it into a coroutine
+  // `tsn_promise<tsn_unit> tsn_top_level()` (so `await` is a real `co_await`), and
+  // a thin `main()` that runs the dependency inits, *starts* the top-level
+  // coroutine (it runs synchronously until its first await), then drains the
+  // microtask queue (the event loop runs the rest). Promoted globals stay
+  // file-scope (declared at namespace scope, assigned inside the coroutine), and
+  // the coroutine uses MAIN_KEY so its number-rep slots match repr.ts.
+  private emitTopLevelCoroutine(stmts: Stmt[], deps: DepModule[]): string {
+    this.resetForFunction({ kind: "promise" }, MAIN_KEY); // Promise<void> coroutine
+    this.curAsync = true;
+    for (const s of stmts) this.emitTopLevel(s);
+    this.emitAsyncVoidTail(); // co_return tsn_unit{};
+    const coDef = [
+      `tsn_promise<tsn_unit> tsn_top_level() {`,
+      ...this.body,
+      `}`,
+    ].join("\n");
+    const mainLines = [
+      ...deps.map((d) => `  ${this.depInitName(d)}();`),
+      `  tsn_top_level();`,
+      `  tsn_run_microtasks();`,
+    ];
+    return [coDef, ``, `int main() {`, ...mainLines, `  return 0;`, `}`].join(
+      "\n",
+    );
+  }
+
   // --- dependency modules (records + memoized init) -----------------------
   //
   // A dependency module compiles to a memoized `init()` that runs its top-level
@@ -753,6 +785,14 @@ class Emitter {
   }
 
   private emitDepInit(d: DepModule): { proto: string; def: string } {
+    // Top-level await in an *imported* module would make its init() a coroutine
+    // and force every importer (transitively, up to main) to await it — the full
+    // async-module-graph semantics. Out of subset; only the entry may use it.
+    if (d.body.some(stmtContainsAwait)) {
+      throw new Error(
+        "Top-level 'await' in an imported module is not supported (v1) — only the entry module may use top-level await",
+      );
+    }
     const fn = this.depInitName(d);
     // funcKey for nested-local reps (matches repr.ts's `$dep<idx>` key).
     this.resetForFunction("void", `$dep${d.index}`);
@@ -1808,16 +1848,18 @@ class Emitter {
 
   // Emit an `await`. Returns the C++ `co_await …` expression and the awaited
   // (resolved) type — `"void"` for a Promise<void> (only valid as a statement).
-  // Rejects `await` outside an async function (incl. top-level await, which would
-  // need main() itself to be a coroutine — out of subset).
+  // Valid wherever `curAsync` is set: an async function/method, or the entry's
+  // top-level coroutine (emitTopLevelCoroutine). Otherwise rejected.
   private emitAwait(e: { expr: Expr }): {
     code: string;
     valueType: RetType;
     rep?: Rep;
   } {
     if (!this.curAsync) {
+      // Reachable only for await in a non-async function/method or an imported
+      // module's top level — stage 0 rejects the former; emitDepInit the latter.
       throw new Error(
-        "'await' is only valid inside an async function (top-level await is not supported (v1))",
+        "'await' is only valid inside an async function or the entry module's top level",
       );
     }
     const inner = this.emitExpr(e.expr);
@@ -2914,6 +2956,67 @@ function containsAwait(e: Expr): boolean {
       return e.init ? containsAwait(e.init) : false;
     default:
       return false; // num / bool / str / var / this / mathConst / mapNew
+  }
+}
+
+// Does a statement (or anything nested within it) contain an `await`? Used to
+// detect **top-level await** in the entry's top-level statements — including
+// inside a top-level loop/if/try (function bodies are hoisted out of `main`, so
+// there's nothing to recurse *into* that we shouldn't).
+function stmtContainsAwait(s: Stmt): boolean {
+  switch (s.kind) {
+    case "let":
+      return containsAwait(s.init);
+    case "log":
+      return containsAwait(s.arg);
+    case "return":
+      return s.value ? containsAwait(s.value) : false;
+    case "exprStmt":
+      return containsAwait(s.expr);
+    case "assign":
+      return containsAwait(s.target) || containsAwait(s.value);
+    case "if":
+      return (
+        containsAwait(s.cond) ||
+        s.then.some(stmtContainsAwait) ||
+        (s.else?.some(stmtContainsAwait) ?? false)
+      );
+    case "while":
+    case "doWhile":
+      return containsAwait(s.cond) || s.body.some(stmtContainsAwait);
+    case "for":
+      return (
+        (s.init ? stmtContainsAwait(s.init) : false) ||
+        (s.cond ? containsAwait(s.cond) : false) ||
+        (s.update ? stmtContainsAwait(s.update) : false) ||
+        s.body.some(stmtContainsAwait)
+      );
+    case "forOf":
+      return containsAwait(s.iterable) || s.body.some(stmtContainsAwait);
+    case "forIn":
+      return containsAwait(s.target) || s.body.some(stmtContainsAwait);
+    case "switch":
+      return (
+        containsAwait(s.disc) ||
+        s.cases.some(
+          (c) =>
+            (c.test ? containsAwait(c.test) : false) ||
+            c.body.some(stmtContainsAwait),
+        )
+      );
+    case "labeled":
+      return stmtContainsAwait(s.body);
+    case "throw":
+      return containsAwait(s.value);
+    case "try":
+      return (
+        s.block.some(stmtContainsAwait) ||
+        (s.catchBody?.some(stmtContainsAwait) ?? false) ||
+        (s.finallyBody?.some(stmtContainsAwait) ?? false)
+      );
+    case "break":
+    case "continue":
+      return false;
   }
 }
 

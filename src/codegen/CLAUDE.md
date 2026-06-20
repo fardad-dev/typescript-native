@@ -341,9 +341,17 @@ are internal coroutine handles. Ordering matches Node/V8 byte-for-byte (verified
   satisfy the fall-off-the-end path.
 - **`await` → `co_await`** (`emitAwait`). On a `Promise<T>` it's `co_await (p)` yielding `T`
   (f64 for numbers); on a non-promise it wraps in `tsn_resolve(v)` so the one-tick deferral still
-  happens (JS `await 5`). Rejected outside an async function (incl. **top-level await** — `main`
-  isn't a coroutine). A void-promise await is statement-only (`emitStmt`'s `exprStmt` routes an
-  `await` node through `emitAwait`); used as a value it's a clean error.
+  happens (JS `await 5`). Valid inside any async function/method **and at the entry's top level**
+  (see the next bullet); a void-promise await is statement-only (`emitStmt`'s `exprStmt` routes an
+  `await` node through `emitAwait`), used as a value it's a clean error.
+- **Top-level `await`.** When the entry's top-level statements contain an `await` (`stmtContainsAwait`),
+  `emitMain` routes to `emitTopLevelCoroutine`: the whole top-level becomes a coroutine
+  `tsn_promise<tsn_unit> tsn_top_level()` (`curAsync = true`, `funcKey = MAIN_KEY` so rep slots match
+  `repr.ts`), and `main()` runs the dependency inits, *starts* `tsn_top_level()` (it runs to its first
+  await), then `tsn_run_microtasks()`. Promoted globals stay file-scope (declared at namespace scope,
+  assigned inside the coroutine). Gated on an actual top-level `await`, so non-TLA `main()` is
+  byte-identical. Top-level `await` in an **imported** module is rejected in `emitDepInit` (its init()
+  isn't a coroutine — the full async-module-graph is out of subset).
 - **`Promise.resolve` / `Promise.all`** (`promiseResolve` / `promiseAll` nodes) → `tsn_resolve(v)`
   (identity if `v` is already a promise) / `tsn_all(ps)` (a runtime coroutine that awaits each input
   in order → a `T[]`). `Promise.reject`/`race`/`any`/`allSettled` and `new Promise(executor)` are

@@ -233,12 +233,15 @@ Implemented and tested end-to-end:
   `throw` inside an async function rejects its promise; `await`ing a rejected promise re-throws
   the string (caught by an ordinary `try`/`catch`, with `finally` still running). No closures are
   needed — the only continuations are internal coroutine handles, and `.then`/`new Promise(executor)`
-  aren't in the subset. **Subset divergence:** `await` may not appear inside a non-boolean `&&`/`||`
-  operand or `Array.fill`'s index args (those lower to a C++ lambda body, where `co_await` can't go)
-  — assign the awaited value to a variable first (a clean `tsnc:` error). **Deferred** (clean
-  `tsnc:` errors): `new Promise(executor)` and `Promise.reject`/`race`/`any`/`allSettled` (need
-  closures / a richer model), top-level `await` (would need `main` to be a coroutine), and
-  `for await` (no async iterables).
+  aren't in the subset. **Top-level `await`** is supported in the **entry** module (which, as TS
+  requires for top-level await, must be a module — have an `import`/`export`): the entry's whole
+  top-level becomes a `tsn_top_level()` coroutine that `main()` starts and then drains. **Subset
+  divergence:** `await` may not appear inside a non-boolean `&&`/`||` operand or `Array.fill`'s index
+  args (those lower to a C++ lambda body, where `co_await` can't go) — assign the awaited value to a
+  variable first (a clean `tsnc:` error). **Deferred** (clean `tsnc:` errors): `new Promise(executor)`
+  and `Promise.reject`/`race`/`any`/`allSettled` (need closures / a richer model), top-level `await`
+  in an **imported** module (would make the whole module graph async), and `for await` (no async
+  iterables).
 - **Classes:** `class C { f: T; constructor(...) {…}; method(...): R {…} }`, `new C(...)`,
   `this.field` / `this.method()` (read + write), instances in variables / params / returns / arrays.
   Instances are **reference types** (`new` is shared; `let b = a` aliases, so a mutation through one
@@ -672,9 +675,13 @@ pair** (red → green).
       byte-identical (the microtask drain is gated on a module actually using async). **Subset
       divergence:** `await` can't appear inside a non-boolean `&&`/`||` operand or `Array.fill`'s index
       args (they lower to a C++ lambda body, where `co_await` is illegal) — a clean `tsnc:` error asks
-      you to bind the awaited value first. **Deferred** (clean `tsnc:` errors): `new Promise(executor)`,
-      `Promise.reject`/`race`/`any`/`allSettled` (closures / richer model), top-level `await` (`main`
-      isn't a coroutine), and `for await` (no async iterables).
+      you to bind the awaited value first. **Top-level `await`** is supported in the **entry** module
+      (TS requires the entry be a module): its whole top-level is emitted as a `tsn_top_level()`
+      coroutine that `main()` starts and then drains (gated on the top-level actually containing an
+      `await`, so non-TLA programs stay byte-identical; promoted globals stay file-scope, assigned
+      inside the coroutine). **Deferred** (clean `tsnc:` errors): `new Promise(executor)`,
+      `Promise.reject`/`race`/`any`/`allSettled` (closures / richer model), top-level `await` in an
+      **imported** module (would make the whole module graph async), and `for await` (no async iterables).
 
 ### todo
 
