@@ -321,6 +321,16 @@ class RepAnalyzer {
         if (e.op === "!") return { type: "boolean", rep: "f64" };
         return { type: "number", rep: v.rep }; // -x / +x preserve the rep
       }
+      case "ternary": {
+        // Result type is the (shared) branch type; for a number result the rep
+        // is i64 only when both branches are (mirrors `+`/`-`/`*`).
+        this.visit(e.cond, scope, fk);
+        const a = this.visit(e.whenTrue, scope, fk);
+        const b = this.visit(e.whenFalse, scope, fk);
+        const rep =
+          a.type === "number" ? combineRep(a.rep, b.rep) : "f64";
+        return { type: a.type, rep };
+      }
       case "binary": {
         const l = this.visit(e.left, scope, fk);
         const r = this.visit(e.right, scope, fk);

@@ -377,6 +377,11 @@ class Renamer {
       case "unary":
         e.operand = this.expr(e.operand, locals);
         return e;
+      case "ternary":
+        e.cond = this.expr(e.cond, locals);
+        e.whenTrue = this.expr(e.whenTrue, locals);
+        e.whenFalse = this.expr(e.whenFalse, locals);
+        return e;
       case "array":
         e.elements = e.elements.map((el) => this.expr(el, locals));
         return e;

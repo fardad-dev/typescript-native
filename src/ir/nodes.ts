@@ -41,6 +41,9 @@ export type Expr =
   | { kind: "str"; value: string }
   | { kind: "var"; name: string }
   | { kind: "binary"; op: BinaryOp; left: Expr; right: Expr }
+  // `cond ? whenTrue : whenFalse`. The two branches must share a type (no union
+  // result in the subset), and that's the result type; `cond` is a number/boolean.
+  | { kind: "ternary"; cond: Expr; whenTrue: Expr; whenFalse: Expr }
   // `!e` (boolean) and unary `-e` / `+e` (number).
   | { kind: "unary"; op: "!" | "-" | "+"; operand: Expr }
   | { kind: "array"; elements: Expr[] }

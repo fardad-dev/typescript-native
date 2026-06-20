@@ -85,8 +85,9 @@ A multi-file program is assembled from per-file `lower` results by `loadProgram`
   call, the annotation supplies the parse target type (→ a `jsonParse` node).
 - `lowerType(node)` — TS `TypeNode` → IR `Type` (keywords, `T[]`, `Array<T>`, object type literals;
   a **bare identifier** that isn't a known primitive/`Array` → a `class` instance type).
-- `lowerExpr(node)` — TS `Expression` → IR `Expr` (literals, identifiers, binary, array/object
-  literals, indexing, member access, calls, `new C(...)`, `this`). Also recognizes the `JSON.*`
+- `lowerExpr(node)` — TS `Expression` → IR `Expr` (literals, identifiers, binary, ternary
+  (`cond ? a : b`), unary, array/object literals, indexing, member access, calls, `new C(...)`,
+  `this`). Also recognizes the `JSON.*`
   builtins (`tryLowerJsonCall`) and the `JSON.parse(text) as T` assertion (the one `as`-expression
   form the subset accepts — a general type assertion is rejected).
 - `lowerBinaryOp(kind)` — operator token → `BinaryOp`.

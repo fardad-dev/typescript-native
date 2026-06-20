@@ -129,11 +129,14 @@ Implemented and tested end-to-end:
 - **Operators:** arithmetic `+ - * / %`, unary `-` / `+` (`-x`, `-5`), comparison
   `< <= > >= === !==` (numbers **and** strings — strings compare lexicographically; `===`/`!==`
   also on arrays/objects/instances, comparing **reference identity** — see below), logical
-  `&& || !`, string concatenation (`"a" + b`, numbers coerce), array indexing `a[i]`, member
-  access `obj.field`, array `.length`. `&&` / `||` follow **JS semantics — they return one of the
-  operands, not a coerced boolean** (`a || b` → first truthy, `a && b` → first falsy; `0`/`NaN`/`""`
-  are falsy); both-boolean operands keep a boolean result. The operands must share a type (no union
-  result), and short-circuit + single left-evaluation are preserved (via an IIFE).
+  `&& || !`, the ternary conditional `cond ? a : b`, string concatenation (`"a" + b`, numbers
+  coerce), array indexing `a[i]`, member access `obj.field`, array `.length`. `&&` / `||` follow
+  **JS semantics — they return one of the operands, not a coerced boolean** (`a || b` → first truthy,
+  `a && b` → first falsy; `0`/`NaN`/`""` are falsy); both-boolean operands keep a boolean result. The
+  operands must share a type (no union result), and short-circuit + single left-evaluation are
+  preserved (via an IIFE). The **ternary** lowers to the C++ `?:`: its condition is a number/boolean
+  (like `if`/`while`) and its two branches must share a type (that's the result type; no union) —
+  for a number result the rep follows both branches (i64 only when both are).
 - **Strings:** literals, concatenation, lexicographic comparison, `s.length`, character access
   `s[i]` (→ a one-char string), and methods `substring` / `slice` / `indexOf` / `charAt` /
   `charCodeAt` / `toUpperCase` / `toLowerCase` / `split` (`s.split(sep[, limit])` → `string[]`;
@@ -499,6 +502,17 @@ pair** (red → green).
       the subset, so malformed JSON or a value that doesn't match `T` prints to stderr and exits
       non-zero (`tsn_json_fail`) — the closest analog to an uncaught `SyntaxError`. **Deferred** (clean
       errors): `stringify`'s `replacer`/`space` args, `parse`'s `reviver` arg, and class targets.
+- [x] **Ternary `? :`** — the conditional expression, lowering to the C++ `?:`. The textbook
+      ~3-touch feature: one IR node (`ternary { cond, whenTrue, whenFalse }`), one `lower` branch
+      (`ts.isConditionalExpression`), one `emit` case. The condition reuses the existing `condition()`
+      helper (number/boolean, like `if`/`while`); the two branches must **share a type** — that's the
+      result type (no union in the subset; a mismatch is a clean `tsnc:` error, so `cond ? xs : (a === b)`
+      with `number[]`/`boolean` branches is rejected rather than miscompiled). Reference-typed branches
+      (arrays/objects/instances → `shared_ptr`, strings → `tsn_str`) work because C++'s `?:` has a common
+      type for matching branches. For a **number** result the rep follows both branches via `combineRep`
+      (i64 only when both are; a mixed i64/f64 pair is promoted to `double` by C++, matching the f64 rep).
+      Also threaded through `repr.ts` (same `combineRep` rule) and the module `Renamer` (rewrites all
+      three sub-expressions). Nested ternaries fall out for free (the false branch is just another `Expr`).
 
 ### todo
 
@@ -509,7 +523,6 @@ ships with a `tests/cases/*.ts` + `.expected` pair** (red → green), except pro
 
 **Cheap, self-contained syntax** (each is ~one IR node + one `lower` branch + one `emit` case):
 
-- [ ] **Ternary `? :`** — conditional expressions (today: `Unsupported expression`).
 - [ ] **Bitwise `& | ^ ~ << >> >>>` and exponentiation `**`** — today: `Unsupported binary operator`.
 - [ ] **Template-literal interpolation** — `` `a${x}b` ``; only no-substitution backtick strings
       lower today ([src/frontend/lower.ts](src/frontend/lower.ts)).

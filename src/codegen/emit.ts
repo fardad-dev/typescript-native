@@ -978,6 +978,30 @@ class Emitter {
           throw new Error(`Operator '${e.op}' expects a number`);
         return { code: `(${e.op}${v.code})`, type: "number", rep: v.rep };
       }
+      case "ternary": {
+        // `cond ? a : b` -> the C++ ternary. The condition must be a number or
+        // boolean (like `if`/`while`); the branches must share a type, and that
+        // type is the result. For a number result the rep follows both branches
+        // (i64 only when both are) — a mixed pair is promoted to double by C++,
+        // matching the f64 rep.
+        const cond = this.condition(e.cond);
+        const a = this.emitExpr(e.whenTrue);
+        const b = this.emitExpr(e.whenFalse);
+        if (!sameType(a.type, b.type)) {
+          throw new Error(
+            `Ternary branches must have the same type, got '${displayType(a.type)}' and '${displayType(b.type)}'`,
+          );
+        }
+        const rep =
+          a.type === "number"
+            ? combineRep(a.rep ?? "f64", b.rep ?? "f64")
+            : undefined;
+        return {
+          code: `(${cond} ? ${a.code} : ${b.code})`,
+          type: a.type,
+          rep,
+        };
+      }
       case "array": {
         if (e.elements.length === 0) {
           throw new Error(

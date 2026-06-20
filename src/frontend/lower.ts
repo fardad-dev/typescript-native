@@ -567,6 +567,14 @@ function lowerExpr(node: ts.Expression): Expr {
       right: lowerExpr(node.right),
     };
   }
+  if (ts.isConditionalExpression(node)) {
+    return {
+      kind: "ternary",
+      cond: lowerExpr(node.condition),
+      whenTrue: lowerExpr(node.whenTrue),
+      whenFalse: lowerExpr(node.whenFalse),
+    };
+  }
   throw new Error(`Unsupported expression: ${ts.SyntaxKind[node.kind]}`);
 }
 
