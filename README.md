@@ -1,4 +1,4 @@
-# tsnc
+# typescript native compiler tsn-compiler
 
 An **ahead-of-time (AOT) compiler** that turns a subset of **TypeScript** into a standalone
 **native executable** — the way C++ or Rust do. There's no Node, V8, or JIT at runtime: the
@@ -29,20 +29,20 @@ Run it without installing anything via `npx` (use the package name, `tsn-compile
 npx tsn-compiler <file.ts> [-o <output>] [--emit-cpp]
 ```
 
-Or install it globally — the command it installs is `tsnc`:
+Or install it globally — the command it installs is `tsn-compiler`:
 
 ```bash
 npm install -g tsn-compiler
-tsnc <file.ts>
+tsn-compiler <file.ts>
 ```
 
 ### Options
 
-| Option                | Description                                                       |
-| --------------------- | ----------------------------------------------------------------- |
-| `-o, --output <path>` | Output executable path. Defaults to the source file's basename.   |
-| `--emit-cpp`          | Also write the generated C++ to `<output>.cpp` for inspection.    |
-| `-h, --help`          | Show help.                                                        |
+| Option                | Description                                                     |
+| --------------------- | --------------------------------------------------------------- |
+| `-o, --output <path>` | Output executable path. Defaults to the source file's basename. |
+| `--emit-cpp`          | Also write the generated C++ to `<output>.cpp` for inspection.  |
+| `-h, --help`          | Show help.                                                      |
 
 ## Quick start
 

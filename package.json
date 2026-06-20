@@ -1,6 +1,6 @@
 {
   "name": "tsn-compiler",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "AOT compiler: a TypeScript subset -> LLVM IR -> native executable",
   "license": "MIT",
   "author": "Fardad Mohammadi",
@@ -21,7 +21,7 @@
     "url": "https://github.com/fardad-dev/typescript-native/issues"
   },
   "bin": {
-    "tsnc": "dist/index.js"
+    "tsn-compiler": "dist/index.js"
   },
   "files": [
     "dist"
@@ -31,7 +31,7 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "tsnc": "node dist/index.js",
+    "tsn-compiler": "node dist/index.js",
     "bench": "node benchmark/run.mjs",
     "bench:words": "node benchmark/sort-words.mjs",
     "bench:leaderboard": "node benchmark/leaderboard.mjs",
