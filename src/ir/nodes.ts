@@ -14,7 +14,12 @@ export type Type =
   | { kind: "object"; fields: Field[] }
   // An instance of a named class. Unlike arrays/objects (value types), a class
   // instance is a *reference* type — see codegen (compiles to std::shared_ptr<C>).
-  | { kind: "class"; name: string };
+  | { kind: "class"; name: string }
+  // `Map<K, V>` / `Set<T>` — reference types backed by an insertion-ordered
+  // tsn_map / tsn_set (see codegen). Keys/values/elements may be any value type;
+  // numbers are stored in the f64 rep (like array elements / object fields).
+  | { kind: "map"; key: Type; value: Type }
+  | { kind: "set"; element: Type };
 
 export type BinaryOp =
   // arithmetic (number -> number)
@@ -60,6 +65,17 @@ export type Expr =
   | { kind: "this" }
   // `JSON.stringify(arg)` — serialize any value to a JSON string.
   | { kind: "jsonStringify"; arg: Expr }
+  // `Math.<fn>(args)` — a builtin math call (e.g. `Math.floor(x)`, `Math.pow(a, b)`,
+  // `Math.min(...)`). Recognized in lowering (like `JSON.*`), not a method call; the
+  // result is always a `number` (f64). `fn` is the method name (`floor`, `min`, …).
+  | { kind: "mathCall"; fn: string; args: Expr[] }
+  // `Math.<name>` — a builtin math constant (`Math.PI`, `Math.E`, …). A `number`.
+  | { kind: "mathConst"; name: string }
+  // `new Map<K, V>()` — construct an empty map (entries are added via `.set`).
+  | { kind: "mapNew"; key: Type; value: Type }
+  // `new Set<T>()` / `new Set<T>(arr)` — construct a set, optionally seeded from
+  // an array `init` (the only iterable form the subset supports).
+  | { kind: "setNew"; element: Type; init?: Expr }
   // `JSON.parse(text) as T` (or a `T`-annotated target) — parse a JSON string into
   // a value of a statically-known type `T`. JSON.parse is `any` in TypeScript, so
   // the subset requires the target type up front (it can't lower an untyped value).

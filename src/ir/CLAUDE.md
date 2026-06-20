@@ -7,19 +7,24 @@ is added or changed.
 
 ## The definitions
 
-- **`Type`** — `"number" | "boolean" | "string"` plus two aggregate shapes and a class instance:
+- **`Type`** — `"number" | "boolean" | "string"` plus aggregate shapes, a class instance, and the
+  Map/Set containers:
   - `{ kind: "array"; element: Type }`
   - `{ kind: "object"; fields: Field[] }` where `Field = { name; type }`
-  - `{ kind: "class"; name: string }` — a named class instance. Codegen now compiles **all three**
-    composite shapes (array, object, class) to `std::shared_ptr<…>` reference types — the `Type`
-    union doesn't encode value-vs-reference; that's a codegen decision.
+  - `{ kind: "class"; name: string }` — a named class instance.
+  - `{ kind: "map"; key: Type; value: Type }` / `{ kind: "set"; element: Type }` — `Map<K, V>` /
+    `Set<T>`. Codegen compiles **all** of these composite shapes (array, object, class, map, set) to
+    `std::shared_ptr<…>` reference types — the `Type` union doesn't encode value-vs-reference; that's
+    a codegen decision.
 - **`BinaryOp`** — `"+" | "-" | "*" | "/" | "%"`.
 - **`Expr`** (discriminated union) — `num`, `bool`, `str`, `var`, `binary`, `ternary`
   (`cond ? whenTrue : whenFalse`; branches share a type = the result type), `unary`, `array`,
-  `index`, `object`, `member` (covers `obj.field` and `arr.length`), `call`, `methodCall`, `new`
-  (`new C(args)`), `this`, `jsonStringify` (`JSON.stringify(arg)`), `jsonParse`
+  `index`, `object`, `member` (covers `obj.field`, `arr.length`, `map/set.size`), `call`,
+  `methodCall`, `new` (`new C(args)`), `this`, `jsonStringify` (`JSON.stringify(arg)`), `jsonParse`
   (`{ text; type }` — the parse target type, since `JSON.parse` is `any` and the subset needs a
-  concrete type; carried from a `JSON.parse(text) as T` assertion or an annotated target).
+  concrete type; carried from a `JSON.parse(text) as T` assertion or an annotated target),
+  `mathCall` (`{ fn; args }` — a `Math.<fn>(...)` builtin) / `mathConst` (`{ name }` — `Math.PI`, …),
+  and `mapNew` (`{ key; value }`) / `setNew` (`{ element; init? }` — `new Set<T>(arr?)`).
 - **`Stmt`** — `let`, `log`, `return`, `exprStmt` (a bare expression evaluated for effect),
   `assign`, and the control-flow statements: `if`, `while`, `for`, `doWhile`, `forOf`
   (`{ name; iterable; body }`), `forIn` (`{ name; target; body }`), `switch` (`{ disc; cases }`
@@ -42,9 +47,9 @@ is added or changed.
   used by codegen. Type *equality* is structural and order-independent, but the stored layout
   follows the object literal.
 - `member` is intentionally generic (`{ obj, name }`); codegen resolves it to an array/string
-  `length`, an object field load, or a class field load based on the value's type. Likewise
-  `methodCall` dispatches on the receiver type (string/array helper vs instance method).
-- **Arrays, objects and class instances are all *reference* types** in codegen (each a
+  `length`, a Map/Set `size`, an object field load, or a class field load based on the value's type.
+  Likewise `methodCall` dispatches on the receiver type (string/array/map/set helper vs instance method).
+- **Arrays, objects, class instances, and Maps/Sets are all *reference* types** in codegen (each a
   `std::shared_ptr<…>`): aliasing, shared mutation, mutable params, and identity `===`/`!==`. `this`
   is only valid as `this.field` / `this.method()` (bare `this` as a value isn't modeled yet). The
   `class` `Type` carries just the name; the layout/methods live in the `ClassDecl` (looked up by

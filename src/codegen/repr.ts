@@ -266,6 +266,8 @@ class RepAnalyzer {
         let elemType: Type = "number";
         if (typeof it.type === "object" && it.type.kind === "array") {
           elemType = it.type.element;
+        } else if (typeof it.type === "object" && it.type.kind === "set") {
+          elemType = it.type.element;
         } else if (it.type === "string") {
           elemType = "string";
         }
@@ -426,6 +428,14 @@ class RepAnalyzer {
         if (e.name === "length" && arrayOrString) {
           return { type: "number", rep: "i64" }; // .size() is a non-negative integer
         }
+        // Map/Set `.size` is also a non-negative integer.
+        if (
+          e.name === "size" &&
+          typeof obj.type === "object" &&
+          (obj.type.kind === "map" || obj.type.kind === "set")
+        ) {
+          return { type: "number", rep: "i64" };
+        }
         if (typeof obj.type === "object" && obj.type.kind === "object") {
           const field = obj.type.fields.find((f) => f.name === e.name);
           if (field) return { type: field.type, rep: "f64" };
@@ -473,6 +483,45 @@ class RepAnalyzer {
           });
           return { type: method ? method.returnType : "number", rep: "f64" };
         }
+        // Map methods: report result types so slot inference is accurate (`get`
+        // is the value type, `keys`/`values` arrays, `has`/`delete` boolean, `set`
+        // the map itself). Numbers stay f64 (map values are stored as f64).
+        if (typeof recv.type === "object" && recv.type.kind === "map") {
+          e.args.forEach((a) => this.visit(a, scope, fk));
+          const m = recv.type;
+          switch (e.method) {
+            case "get":
+              return { type: m.value, rep: "f64" };
+            case "keys":
+              return { type: { kind: "array", element: m.key }, rep: "f64" };
+            case "values":
+              return { type: { kind: "array", element: m.value }, rep: "f64" };
+            case "has":
+            case "delete":
+              return { type: "boolean", rep: "f64" };
+            case "set":
+              return { type: m, rep: "f64" };
+            default: // clear (void) — type unused for slots
+              return { type: "number", rep: "f64" };
+          }
+        }
+        // Set methods: `values`/`keys` arrays, `has`/`delete` boolean, `add` the set.
+        if (typeof recv.type === "object" && recv.type.kind === "set") {
+          e.args.forEach((a) => this.visit(a, scope, fk));
+          const elem = recv.type.element;
+          switch (e.method) {
+            case "values":
+            case "keys":
+              return { type: { kind: "array", element: elem }, rep: "f64" };
+            case "has":
+            case "delete":
+              return { type: "boolean", rep: "f64" };
+            case "add":
+              return { type: recv.type, rep: "f64" };
+            default: // clear (void)
+              return { type: "number", rep: "f64" };
+          }
+        }
         // Array methods: dispatch on the receiver type so the result type matches
         // the emitter (e.g. array `slice` is an array, not a string). Number
         // results stay f64, like every other method's number return.
@@ -481,12 +530,18 @@ class RepAnalyzer {
           const elem = recv.type.element;
           switch (e.method) {
             case "pop":
+            case "shift":
               return { type: elem, rep: "f64" };
             case "slice":
+            case "reverse":
+            case "fill":
+            case "concat":
               return { type: recv.type, rep: "f64" };
             case "join":
               return { type: "string", rep: "f64" };
-            // push (new length) / indexOf (-1 or index) -> number.
+            case "includes":
+              return { type: "boolean", rep: "f64" };
+            // push / unshift (length), indexOf / lastIndexOf (-1 or index) -> number.
             default:
               return { type: "number", rep: "f64" };
           }
@@ -498,18 +553,42 @@ class RepAnalyzer {
           case "charAt":
           case "substring":
           case "slice":
-          case "join":
+          case "repeat":
+          case "trim":
+          case "trimStart":
+          case "trimEnd":
+          case "padStart":
+          case "padEnd":
+          case "replace":
+          case "replaceAll":
+          case "concat":
             return { type: "string", rep: "f64" };
+          case "includes":
+          case "startsWith":
+          case "endsWith":
+            return { type: "boolean", rep: "f64" };
           case "split":
             return { type: { kind: "array", element: "string" }, rep: "f64" };
           default:
-            // String charCodeAt / indexOf -> number (can be NaN/-1, kept f64).
+            // charCodeAt / indexOf / lastIndexOf -> number (can be NaN/-1, f64).
             return { type: "number", rep: "f64" };
         }
       }
       case "jsonStringify":
         this.visit(e.arg, scope, fk);
         return { type: "string", rep: "f64" };
+      case "mathCall":
+        // Visit args so nested calls (`Math.floor(f(x))`) drive arg→param
+        // demotion; the result is always an f64 number (Math is double math).
+        e.args.forEach((a) => this.visit(a, scope, fk));
+        return { type: "number", rep: "f64" };
+      case "mathConst":
+        return { type: "number", rep: "f64" };
+      case "mapNew":
+        return { type: { kind: "map", key: e.key, value: e.value }, rep: "f64" };
+      case "setNew":
+        if (e.init) this.visit(e.init, scope, fk);
+        return { type: { kind: "set", element: e.element }, rep: "f64" };
       case "jsonParse":
         // JSON numbers parse to doubles, so a JSON.parse value is always f64 (the
         // annotated/asserted target type may be number, but it's never i64-rep).

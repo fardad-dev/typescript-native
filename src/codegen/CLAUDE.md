@@ -8,8 +8,10 @@ real lowering — no SSA temporaries or pointer bookkeeping here.
 ## The runtime header (`cpp/tsn_runtime.h`)
 
 The program-**independent** C++ — `tsn_str`, the JS-semantics numeric/string/array helpers
-(`tsn_mod`, `tsn_substring`, `tsn_push`, …), the scalar + array-template `tsn_inspect` overloads,
-and the JSON runtime (`tsn_json` + `tsn_json_parse`, the `tsn_json_as_*` accessors, and the scalar +
+(`tsn_mod`, `tsn_substring`, `tsn_push`, `tsn_str_includes`, `tsn_trim`, `tsn_array_reverse`, …),
+the `tsn_math_*` helpers (where Math diverges from `<cmath>`), the `tsn_map`/`tsn_set` container
+templates, the scalar + array/map/set-template `tsn_inspect` overloads, and the JSON runtime
+(`tsn_json` + `tsn_json_parse`, the `tsn_json_as_*` accessors, and the scalar +
 array-template `tsn_json_stringify`) — lives as **real, editable C++** in
 [cpp/tsn_runtime.h](cpp/tsn_runtime.h), not as a string in `emit.ts`. Every emitted `.cpp` is just
 `#include "<abs>/tsn_runtime.h"` on top, followed by the program-**dependent** code `emit` generates
@@ -41,6 +43,8 @@ field names, the user's functions, `main`).
 | `T[]`               | `std::shared_ptr<std::vector<T>>` | **reference** type (`vecType` = the pointee `std::vector<T>`): literals `make_shared`, `let b = a` aliases, `===` is identity. `.length` → `(a)->size()` (i64); index derefs: `(*(a))[i]` (cast to `std::size_t`); methods run on `*recv`: `push`→`tsn_push` (new length, f64), `pop`→`tsn_pop` (element; empty → `T()`), `slice`→`make_shared(tsn_array_slice(...))` (new array), `indexOf`→`tsn_array_index_of` (f64, `==` on `T`), `join`→`tsn_join` (`string[]`/`number[]` → `tsn_str`) |
 | `{ ... }`           | `std::shared_ptr<struct>` | **reference** type: `structName()` dedupes the pointee struct by field shape; literals `make_shared<struct>(struct{...})`, field access `obj->f`, number fields use the f64 rep |
 | class `C`           | `std::shared_ptr<C>` | **reference** type: `struct C { fields; ctor; methods; }`, instance is a shared_ptr — `new` → `make_shared`, `.field`/`.method()` via `->`. See *Classes* below |
+| `Map<K, V>`         | `std::shared_ptr<tsn_map<Kc, Vc>>` | **reference** type (`mapPointee`): an insertion-ordered `tsn_map` (runtime). `new Map<K,V>()` → `make_shared`; methods (`set`/`get`/`has`/`del`/`clear`/`keys`/`values`) via `->`; `.size` like `.length` (i64). Keys/values use the f64 rep. See *Math / Map / Set* below |
+| `Set<T>`            | `std::shared_ptr<tsn_set<Tc>>` | **reference** type (`setPointee`): an insertion-ordered `tsn_set`. `new Set<T>(arr?)` → `make_shared` (the array seeds it); `add`/`has`/`del`/`clear`/`values` via `->`; iterable by `for…of`; `.size` (i64) |
 
 Arrays, objects and class instances are now **all reference types** (`std::shared_ptr<…>`), so JS
 semantics hold uniformly: copy/assign aliases, mutation through one alias is visible through the
@@ -211,8 +215,10 @@ mutations), `===` is `shared_ptr::operator==` (identity), and the refcount frees
 - **Fixed scalar overloads** (`inspectPrelude`): `tsn_inspect(double|long long|bool|const tsn_str&)`
   + a `tsn_quote` (single-quotes a string for *nested* contexts). Quote/escape chars are built from
   their byte values (`(char)39`, `(char)92`) so the generated C++ has **no backslashes**.
-- **Array template** (`arrayInspectDef`): `tsn_inspect(const shared_ptr<vector<T>>&)` → `[ e0, e1 ]`,
-  recursing on each element.
+- **Array / Map / Set templates** (in the runtime header): `tsn_inspect(const shared_ptr<vector<T>>&)`
+  → `[ e0, e1 ]`, `tsn_inspect(const shared_ptr<tsn_map<K,V>>&)` → `Map(n) { k => v, ... }`, and
+  `tsn_inspect(const shared_ptr<tsn_set<T>>&)` → `Set(n) { e0, ... }`, each recursing on its
+  element/key/value (object/class elements resolve via ADL at the instantiation point, like arrays).
 - **Per-struct / per-class overloads** (`aggregateInspectDefs` / `inspectBody`): one function per
   generated object struct (`{ k: v, ... }`) and per class (`Name { k: v, ... }`), knowing the field
   names (struct fields recorded in `structFields` during `structName`).
@@ -246,6 +252,33 @@ carries the program-independent halves; codegen emits the program-dependent shap
 - **Errors.** No exceptions in the subset, so a malformed parse or a value that doesn't match the
   asserted type calls `tsn_json_fail` (stderr + `exit(1)`) — the closest analog to an uncaught JS
   `SyntaxError`.
+
+## Math / Map / Set (stdlib breadth)
+
+- **`Math.*`** (`emitMathCall` / `emitMathConst`, from the `mathCall`/`mathConst` IR nodes). Always
+  `number`-typed and the **f64 rep** (Math is double math), so `repr.ts` reports both as f64 and the
+  emitter casts every argument to `double` (`static_cast`) to pick the floating `<cmath>` overload.
+  `MATH_UNARY_STD` maps the straight-through functions; `round`/`sign`/`min`/`max`/`random` use a
+  `tsn_math_*` helper (JS divergences — half-to-+∞ rounding, NaN propagation); `min`/`max`/`hypot`
+  are **folded** over the variadic args; constants emit as exact double literals (`MATH_CONST`), not
+  `M_PI`, so the output matches Node byte-for-byte.
+- **Broader string/array methods** are just more `case`s in `emitStringMethod` / the array branch of
+  `emitMethodCall`, each calling a `tsn_*` runtime helper. The two in-place-then-return-the-array
+  methods (`reverse`, `fill`) emit an **IIFE that takes the receiver by value** (a refcount bump,
+  evaluated once) and returns it, so they stay chainable; `concat` folds `tsn_array_concat` and wraps
+  in a fresh `make_shared` (new identity); a value/search arg is `f64SlotCode`-cast so template
+  deduction sees one element type. `repr.ts` learned each method's return type.
+- **`Map`/`Set`** (`emitMapMethod` / `emitSetMethod`, constructed by the `mapNew`/`setNew` IR nodes;
+  `mapPointee`/`setPointee` give the `tsn_map<Kc,Vc>` / `tsn_set<Tc>` pointee, keys/values/elements
+  in the f64 rep). They're reference types, so `cppType` wraps them in `shared_ptr` and `===`/`for…of`
+  (Set) / `.size` reuse the array machinery. `set`/`add` return the receiver via the same by-value
+  IIFE (chainable); `get` returns the value type (`tsn_map::get` yields the value **default** on a
+  miss — the no-`undefined` divergence, which the transparent `!` non-null assertion in lowering lets
+  type-check); `clear` is statement-only (`asStatement` guard). Per-type `tsn_inspect` isn't needed —
+  the `tsn_map`/`tsn_set` inspect overloads are **templates in the runtime header** (they recurse on
+  K/V/T, resolving object/class elements by ADL like the array template). `JSON.stringify` of a
+  Map/Set is a clean `tsnc:` error (no overload — Node would print `{}`); `assertJsonType` likewise
+  rejects a Map/Set `JSON.parse` target.
 
 ## Control flow (loops, switch, break/continue, try)
 
@@ -293,10 +326,12 @@ Type errors (wrong assignment/argument/return types, undeclared names, bad prope
 caught earlier by the stage-0 `ts.Program` type checker ([../frontend/check.ts](../frontend/check.ts))
 and never reach codegen. The emitter still throws a clear `Error` (→ `tsnc: <message>`) for
 constructs the subset doesn't lower: string concatenation of incompatible types, arithmetic on
-aggregates, indexing a non-array, an empty array literal with no annotation, void-as-value, an
-**unknown class** (`new X` / a `: X` annotation with no class `X`), an **unknown method/field** on a
-class, a **`JSON.parse` target that is a class type** (`assertJsonType`), and **bare `this`** used as
-a value. (`console.log` of an array/object/instance is now supported — see *Printing* — and
-`===`/`!==` on arrays/objects is reference identity, not an error.) Lowering ([../frontend/lower.ts](../frontend/lower.ts))
+aggregates, indexing a non-array, an empty array literal with no annotation, void-as-value (incl.
+`Map`/`Set.clear()` as a value), an **unknown class** (`new X` / a `: X` annotation with no class
+`X`), an **unknown method/field** on a class/Map/Set, a **`JSON.parse`/`JSON.stringify` target that
+is a class/Map/Set type** (`assertJsonType` / the `jsonStringify` guard), `Map.forEach`/`entries`
+and `for…of` over a Map (need closures / tuples), and **bare `this`** used as a value.
+(`console.log` of an array/object/instance/Map/Set is supported — see *Printing* — and `===`/`!==`
+on reference types is identity, not an error.) Lowering ([../frontend/lower.ts](../frontend/lower.ts))
 adds two more: a bare `JSON.parse(x)` with no target type, and a general `as T` assertion (only
 `JSON.parse(text) as T` is accepted).

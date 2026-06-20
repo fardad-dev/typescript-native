@@ -105,7 +105,7 @@ npm test            # run the e2e suite once (vitest run)
 npm run test:watch  # re-run on change — the TDD red->green loop
 ```
 
-The suite (currently **92 e2e cases** + a stage-0 type-checker test file + a module-loader test
+The suite (currently **104 e2e cases** + a stage-0 type-checker test file + a module-loader test
 file, all green) auto-discovers every `tests/cases/*.ts`, compiles it to a real native binary,
 runs it, and diffs stdout against the matching `.expected` file. **Every feature gets a
 `tests/cases/*.ts` + `.expected` pair**, ideally written first (red), then implemented to green.
@@ -140,9 +140,12 @@ Implemented and tested end-to-end:
 - **Strings:** literals (`"..."` / no-substitution `` `...` ``), **template-literal interpolation**
   (`` `a${x}b` `` — desugars to `+`-concatenation, so interpolated values coerce the same operands
   `+` does: string and number), concatenation, lexicographic comparison, `s.length`, character access
-  `s[i]` (→ a one-char string), and methods `substring` / `slice` / `indexOf` / `charAt` /
-  `charCodeAt` / `toUpperCase` / `toLowerCase` / `split` (`s.split(sep[, limit])` → `string[]`;
-  string separators only — regex is out of subset) (JS `String.prototype` semantics, ASCII).
+  `s[i]` (→ a one-char string), and methods `substring` / `slice` / `indexOf` / `lastIndexOf` /
+  `charAt` / `charCodeAt` / `toUpperCase` / `toLowerCase` / `split` (`s.split(sep[, limit])` →
+  `string[]`; string separators only — regex is out of subset) / `includes` / `startsWith` /
+  `endsWith` / `repeat` / `trim` / `trimStart` / `trimEnd` / `padStart` / `padEnd` / `replace` /
+  `replaceAll` (string search + literal replacement only — no regex / `$`-patterns / function args) /
+  `concat` (JS `String.prototype` semantics, ASCII).
 - **`console.log(x)`** for any value, JS-style (matches Node's `console.log`): numbers shortest-
   round-trip, booleans `true`/`false`, top-level strings bare; arrays `[ 1, 2 ]`, objects
   `{ k: v }`, class instances `Name { k: v }`, with nested strings quoted (`'x'`) and aggregates
@@ -168,13 +171,36 @@ Implemented and tested end-to-end:
   array/object **parameter** (visible to the caller), and `===`/`!==` compare **identity** (two
   distinct literals with equal contents are `!==`). They compile to `std::shared_ptr<…>`.
 - **Arrays:** literals (incl. empty `[]` with an annotation); `xs.push(v)` (returns the new
-  `length`, usable as a value); `xs.pop()` → the removed last element (empty array → the element
-  type's default, since the subset has no `undefined`); `xs.slice(start?, end?)` → a *new* array
-  (negatives count from the end); `xs.indexOf(v[, from])` → `number` (`-1` if absent; element
-  `===`, so object/array-element arrays are rejected; class elements compare by identity); and
+  `length`, usable as a value); `xs.pop()` / `xs.shift()` → the removed last/first element (empty
+  array → the element type's default, since the subset has no `undefined`); `xs.unshift(...items)` →
+  the new `length`; `xs.slice(start?, end?)` → a *new* array (negatives count from the end);
+  `xs.concat(...arrays)` → a *new* array (array operands only); `xs.indexOf` / `xs.lastIndexOf`
+  (`v[, from]`) → `number` (`-1` if absent) and `xs.includes(v[, from])` → `boolean` — all by element
+  `===`, so object/array-element arrays are rejected (class elements compare by identity);
+  `xs.reverse()` / `xs.fill(v[, start, end])` mutate in place and return the array; and
   `xs.join(sep?)` → `string` (separator defaults to `","`; `string[]` and `number[]`).
+- **`Math.*`:** functions `abs` `floor` `ceil` `round` `trunc` `sign` `sqrt` `cbrt` `exp` `log`
+  `log2` `log10` `sin` `cos` `tan` `asin` `acos` `atan` `sinh` `cosh` `tanh` `pow` `atan2`
+  `min`/`max`/`hypot` (variadic) `random`, and constants `PI` `E` `LN2` `LN10` `LOG2E` `LOG10E`
+  `SQRT2` `SQRT1_2`. Recognized as builtins in lowering (like `JSON.*`), always `number`-typed and
+  always the f64 rep. Most map straight to `<cmath>`; JS-divergent ones use a `tsn_math_*` helper
+  (`round` rounds half toward +∞; `min`/`max` propagate `NaN`; `sign`/`random`). Constants are
+  emitted as exact double literals (byte-for-byte with Node).
+- **`Map<K, V>` / `Set<T>`** — reference types (insertion-ordered, like JS), backed by `tsn_map` /
+  `tsn_set` in the runtime. Construct `new Map<K, V>()` / `new Set<T>()` / `new Set<T>(arr)` (the
+  type arguments are required, or take them from an annotated target — `const m: Map<K, V> = new
+  Map()`; `new Map(entries)` needs tuples and is out of subset). Map methods: `set` (chainable),
+  `get`, `has`, `delete`, `clear`, `keys()` → `K[]`, `values()` → `V[]`, `.size`. Set methods: `add`
+  (chainable), `has`, `delete`, `clear`, `values()`/`keys()` → `T[]`, `.size`. Iterate a **Set**
+  directly with `for…of`; iterate a Map via `for…of` over `.keys()`/`.values()`. `===`/`!==` are
+  identity; `console.log` prints `Map(2) { 'a' => 1 }` / `Set(3) { 1, 2, 3 }` (Node format).
+  **Subset divergences:** `Map.get` of a *missing* key returns the value type's default (no
+  `undefined` — pair with `.has`; use `!` so `get` of a present key type-checks), a `NaN` number key
+  won't match (operator-`==` semantics). **Deferred** (clean `tsnc:` errors): `forEach`
+  (needs first-class functions), `entries`/`for…of` over a Map (need tuples), `JSON.stringify` of a
+  Map/Set, and `new Map(entries)`.
 - **Control flow:** `if` / `else`, `while`, `do…while`, `for (init; cond; update)`,
-  **`for…of`** (over an array's elements or a string's characters), **`for…in`** (over the *keys* —
+  **`for…of`** (over an array's elements, a string's characters, or a Set's elements), **`for…in`** (over the *keys* —
   array/string indices as strings, or an object/instance's field names), and **`switch` / `case` /
   `default`** (JS `===` matching with **fall-through**; `default` may sit anywhere). **`break` /
   `continue`** target the innermost loop/switch, or an enclosing **labeled** loop (`outer: for (…) {
@@ -239,6 +265,8 @@ tsn types map onto C++ types (see [src/codegen/CLAUDE.md](src/codegen/CLAUDE.md)
 | `T[]`     | `std::shared_ptr<std::vector<T>>` | **reference** type: heap vector, shared on copy/assign (aliasing, shared mutation, identity `===`); `.length` → `->size()`, index `(*a)[i]`, methods → `tsn_*` helpers on `*a` |
 | `{ ... }` | `std::shared_ptr<struct>` | **reference** type: heap struct (one per distinct field shape), shared on copy/assign; field access `obj->f`                                       |
 | class `C` | `std::shared_ptr<C>`    | **reference** type: `new C()` is heap + ref-counted; copy/assign aliases (shared mutation, identity via `==`); `struct C { fields; ctor; methods; }` |
+| `Map<K, V>` | `std::shared_ptr<tsn_map<K, V>>` | **reference** type: insertion-ordered `tsn_map` (runtime), shared on copy/assign; methods via `->`; `.size` → `->size()` (i64). Keys/values use the f64 rep |
+| `Set<T>` | `std::shared_ptr<tsn_set<T>>` | **reference** type: insertion-ordered `tsn_set`; iterable by `for…of`; methods via `->`; `.size` (i64) |
 
 - **`number` is f64, but integer-valued numbers use a 64-bit integer representation.** A
   pre-pass ([src/codegen/repr.ts](src/codegen/repr.ts)) infers, per variable / parameter / return,
@@ -303,7 +331,7 @@ Not yet supported:
 | Literal / enum       | `"a" \| "b"`, `enum E {}`     | No literal types or enums.                            |
 | Intersection         | `A & B`                       | No type composition.                                  |
 | Function type        | `(x: number) => number`       | No first-class function values / closures.            |
-| Generic / type param | `Map<K, V>`, `<T>(x: T) => T` | Only the built-in `Array<T>` is special-cased.        |
+| Generic / type param | `<T>(x: T) => T`, `Promise<T>` | Only built-in `Array<T>` / `Map<K, V>` / `Set<T>` are special-cased; user generics aren't. |
 | `null` / `undefined` | `string \| null`              | No nullable types; no optional (`x?:`) fields/params. |
 
 ## Conventions
@@ -565,6 +593,37 @@ pair** (red → green).
         runs from a destructor. The `-Werror=return-type` build survives `return`-in-every-`case`
         switches (clang proves the `goto` dispatch never falls through), and clang's only gripe is a
         harmless `-Wparentheses-equality` (the pre-existing fully-parenthesized `(a == b)` style).
+- [x] **`Math.*`, `Map` / `Set`, broader string/array methods** — the stdlib-breadth item, in one
+      pass across all four files (`lower` → `repr.ts` → `emit` → the runtime header) plus the module
+      `Renamer`. Three parts:
+      - **`Math.*`** — functions (`floor`/`ceil`/`round`/`trunc`/`sign`/`abs`/`sqrt`/`cbrt`/`exp`/
+        `log`/`log2`/`log10`/trig + `pow`/`atan2`/variadic `min`/`max`/`hypot`/`random`) and constants
+        (`PI`/`E`/`LN2`/…). Recognized as builtins in lowering exactly like `JSON.*` (two IR nodes:
+        `mathCall`, `mathConst`); the result is always a `number` in the **f64 rep**, so `repr.ts`
+        stays simple. Most map straight to `<cmath>`; the JS-divergent ones use a small `tsn_math_*`
+        helper (`round` half-to-+∞, NaN-propagating `min`/`max`, `sign`, `random`). Constants emit as
+        exact double literals (byte-for-byte with Node — no `M_PI` dependency).
+      - **Broader string/array methods** — purely additive (no IR/lower change — they were already
+        `methodCall`s): string `includes`/`startsWith`/`endsWith`/`lastIndexOf`/`repeat`/`trim`(`Start`/
+        `End`)/`padStart`/`padEnd`/`replace`/`replaceAll`/`concat`, and array `includes`/`lastIndexOf`/
+        `reverse`/`fill`/`concat`/`shift`/`unshift`. New `tsn_*` runtime helpers + dispatch cases +
+        `repr.ts` return types. The callback-based methods (`map`/`filter`/`reduce`/`forEach`/`sort`)
+        stay out — they need first-class functions. (Bumped the stage-0 lib ES2020→ES2021 just for
+        `String.prototype.replaceAll`; still no DOM.)
+      - **`Map<K, V>` / `Set<T>`** — the keystone-ish part. Two new `Type` variants (`map`/`set`) +
+        two `Expr` nodes (`mapNew`/`setNew`), threaded everywhere a `Type`/`Expr` is switched on
+        (`cppType`/`sameType`/`displayType`, the `Renamer.type`, `repr.ts`). They're **reference
+        types** (`std::shared_ptr<tsn_map/tsn_set>`), so aliasing / shared mutation / identity `===`
+        fall out exactly like arrays. The runtime `tsn_map`/`tsn_set` are insertion-ordered with
+        linear lookup by `operator==` (clarity over a hashed structure — matches JS SameValueZero for
+        the common cases). The interesting constraint was that **`Map.get` is `V | undefined`** in TS,
+        which the no-union/no-`undefined` subset can't represent: get returns `V` and yields the value
+        type's **default** on a miss (the user opted into this divergence), and a transparent
+        **non-null assertion `!`** (lowered as identity — no runtime effect) lets `map.get(k)!`
+        type-check. `console.log` matches Node (`Map(2) { 'a' => 1 }` / `Set(3) { 1, 2, 3 }`); `for…of`
+        iterates a Set directly (a Map iterates entries = tuples → clean error; use `.keys()`/
+        `.values()`, which return arrays). Deferred (clean `tsnc:` errors): `forEach` (no closures),
+        `entries`/`for…of`-over-Map (no tuples), `JSON.stringify` of a Map/Set, `new Map(entries)`.
 
 ### todo
 
@@ -584,9 +643,12 @@ ships with a `tests/cases/*.ts` + `.expected` pair** (red → green), except pro
 needed **`for await`** and **labeling a non-loop** (both currently clean `tsnc:` errors), which
 wait on async and a block/labeled-block representation respectively.
 
-**Builtins / stdlib:**
+**Builtins / stdlib** — `Math.*`, `Map`/`Set`, and broader (non-callback) string/array methods are
+done (see _Done_). Still open:
 
-- [ ] **`Math.*`, `Map` / `Set`, broader string/array methods**.
+- [ ] **Callback array methods** — `map` / `filter` / `reduce` / `forEach` / `some` / `every` /
+      `sort`(comparator) / `find` / `findIndex`. Blocked on closures / first-class functions (see
+      _Later_); `Map.forEach` / `Set.forEach` wait on the same.
 
 ### Blocked on the type system
 

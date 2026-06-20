@@ -449,6 +449,17 @@ class Renamer {
       case "jsonStringify":
         e.arg = this.expr(e.arg, locals);
         return e;
+      case "mathCall":
+        e.args = e.args.map((a) => this.expr(a, locals));
+        return e;
+      case "mapNew":
+        this.type(e.key); // resolve any class type-ref in the key/value type
+        this.type(e.value);
+        return e;
+      case "setNew":
+        this.type(e.element);
+        if (e.init) e.init = this.expr(e.init, locals);
+        return e;
       case "jsonParse":
         e.text = this.expr(e.text, locals);
         this.type(e.type); // resolve any class type-ref (codegen rejects it later)
@@ -462,6 +473,10 @@ class Renamer {
     if (typeof t !== "object") return; // primitive keyword
     if (t.kind === "class") t.name = this.symName(t.name);
     else if (t.kind === "array") this.type(t.element);
+    else if (t.kind === "map") {
+      this.type(t.key);
+      this.type(t.value);
+    } else if (t.kind === "set") this.type(t.element);
     else for (const f of t.fields) this.type(f.type);
   }
 }

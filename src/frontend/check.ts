@@ -9,8 +9,9 @@
 //
 // We build the Program over an in-memory copy of the source (the driver already
 // read it) plus a tiny ambient declaration of `console`. We deliberately load
-// only the ES2020 lib — NOT the DOM lib — so the hundreds of DOM globals can't
+// only the ES2021 lib — NOT the DOM lib — so the hundreds of DOM globals can't
 // shadow a user's top-level names; `console` is the one global the subset needs.
+// (ES2021 over ES2020 just to get `String.prototype.replaceAll`; still no DOM.)
 
 import * as ts from "typescript";
 
@@ -24,8 +25,8 @@ const GLOBALS_SOURCE = `declare var console: { log(...data: any[]): void; };\n`;
 // are intentionally left off (not part of `strict`), since focused example
 // programs routinely leave a binding unused.
 const OPTIONS: ts.CompilerOptions = {
-  target: ts.ScriptTarget.ES2020,
-  lib: ["lib.es2020.d.ts"],
+  target: ts.ScriptTarget.ES2021,
+  lib: ["lib.es2021.d.ts"],
   types: [],
   noEmit: true,
   strict: true,

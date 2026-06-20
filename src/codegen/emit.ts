@@ -71,12 +71,20 @@ const EQUALITY = new Set<BinaryOp>(["===", "!=="]);
 type ArrayType = { kind: "array"; element: Type };
 type ObjectType = { kind: "object"; fields: Field[] };
 type ClassType = { kind: "class"; name: string };
+type MapType = { kind: "map"; key: Type; value: Type };
+type SetType = { kind: "set"; element: Type };
 
 function isArray(t: Type): t is ArrayType {
   return typeof t === "object" && t.kind === "array";
 }
 function isObject(t: Type): t is ObjectType {
   return typeof t === "object" && t.kind === "object";
+}
+function isMap(t: Type): t is MapType {
+  return typeof t === "object" && t.kind === "map";
+}
+function isSet(t: Type): t is SetType {
+  return typeof t === "object" && t.kind === "set";
 }
 // A class instance is a *reference* type, deliberately NOT an "aggregate": those
 // (array/object) are value types passed by const& and read-only, whereas an
@@ -92,6 +100,8 @@ function displayType(t: RetType): string {
   if (t === "void") return "void";
   if (isClass(t)) return t.name;
   if (isArray(t)) return `${displayType(t.element)}[]`;
+  if (isMap(t)) return `Map<${displayType(t.key)}, ${displayType(t.value)}>`;
+  if (isSet(t)) return `Set<${displayType(t.element)}>`;
   if (isObject(t)) {
     return `{ ${t.fields.map((f) => `${f.name}: ${displayType(f.type)}`).join("; ")} }`;
   }
@@ -102,6 +112,13 @@ function sameType(a: Type, b: Type): boolean {
   // Class instances are nominal: equal iff they name the same class.
   if (isClass(a) || isClass(b))
     return isClass(a) && isClass(b) && a.name === b.name;
+  // Map/Set: equal iff their key/value/element types match (structural).
+  if (isMap(a) || isMap(b))
+    return (
+      isMap(a) && isMap(b) && sameType(a.key, b.key) && sameType(a.value, b.value)
+    );
+  if (isSet(a) || isSet(b))
+    return isSet(a) && isSet(b) && sameType(a.element, b.element);
   if (isArray(a) && isArray(b)) return sameType(a.element, b.element);
   if (isObject(a) && isObject(b)) {
     if (a.fields.length !== b.fields.length) return false;
@@ -300,6 +317,8 @@ class Emitter {
     if (isArray(t)) return `std::shared_ptr<${this.vecType(t)}>`;
     if (isObject(t)) return `std::shared_ptr<${this.structName(t)}>`;
     if (isClass(t)) return `std::shared_ptr<${t.name}>`; // reference-typed instance
+    if (isMap(t)) return `std::shared_ptr<${this.mapPointee(t)}>`;
+    if (isSet(t)) return `std::shared_ptr<${this.setPointee(t)}>`;
     if (t === "number") return "double"; // f64 rep — the default for nested aggregates
     if (t === "boolean") return "bool";
     return "tsn_str"; // string — a ref-counted immutable string (see prelude)
@@ -309,6 +328,16 @@ class Emitter {
   // `make_shared` and slice results. `cppType` wraps this in a `shared_ptr`.
   private vecType(t: ArrayType): string {
     return `std::vector<${this.cppType(t.element)}>`;
+  }
+
+  // The pointee tsn_map / tsn_set type for a Map/Set reference. Keys, values, and
+  // elements use the f64 number rep (`cppType(number)` = `double`), like array
+  // elements; `cppType` wraps these in a `shared_ptr`.
+  private mapPointee(t: MapType): string {
+    return `tsn_map<${this.cppType(t.key)}, ${this.cppType(t.value)}>`;
+  }
+  private setPointee(t: SetType): string {
+    return `tsn_set<${this.cppType(t.element)}>`;
   }
 
   // C++ type for a number with a known representation.
@@ -1166,6 +1195,12 @@ class Emitter {
       elemType = iter.type.element;
       sizeExpr = `${it}->size()`;
       elemCode = `(*${it})[${i}]`;
+    } else if (isSet(iter.type)) {
+      // Iterate a Set's elements in insertion order (a Map iterates entries =
+      // tuples, which the subset can't represent — use .keys()/.values()).
+      elemType = iter.type.element;
+      sizeExpr = `${it}->size()`;
+      elemCode = `${it}->at(${i})`;
     } else if (iter.type === "string") {
       elemType = "string";
       sizeExpr = `${it}.size()`;
@@ -1524,6 +1559,19 @@ class Emitter {
           const kind = isArray(obj.type) ? "Arrays" : "Strings";
           throw new Error(`${kind} have no property '${e.name}'`);
         }
+        // `map.size` / `set.size` — the entry/element count (a non-negative i64).
+        if (isMap(obj.type) || isSet(obj.type)) {
+          if (e.name === "size") {
+            return {
+              code: `static_cast<long long>((${obj.code})->size())`,
+              type: "number",
+              rep: "i64",
+            };
+          }
+          throw new Error(
+            `${isMap(obj.type) ? "Maps" : "Sets"} have no property '${e.name}'`,
+          );
+        }
         // `obj.field` — object fields use the f64 rep. The object is a shared_ptr,
         // so access through `->`.
         if (isObject(obj.type)) {
@@ -1580,13 +1628,151 @@ class Emitter {
       }
       case "jsonStringify": {
         // Any value type serializes — overload resolution on tsn_json_stringify
-        // picks the scalar / array-template / generated per-type overload.
+        // picks the scalar / array-template / generated per-type overload. Map/Set
+        // have no JSON form here (Node serializes them as `{}`); reject cleanly
+        // rather than emit a C++ overload error.
         const v = this.emitExpr(e.arg);
+        if (isMap(v.type) || isSet(v.type)) {
+          throw new Error(
+            `JSON.stringify of a ${isMap(v.type) ? "Map" : "Set"} is not supported (v1)`,
+          );
+        }
         return { code: `tsn_json_stringify(${v.code})`, type: "string" };
       }
       case "jsonParse":
         return this.emitJsonParse(e);
+      case "mathCall":
+        return this.emitMathCall(e);
+      case "mathConst":
+        return this.emitMathConst(e.name);
+      case "mapNew": {
+        const t: MapType = { kind: "map", key: e.key, value: e.value };
+        return {
+          code: `std::make_shared<${this.mapPointee(t)}>()`,
+          type: t,
+        };
+      }
+      case "setNew": {
+        const t: SetType = { kind: "set", element: e.element };
+        if (e.init) {
+          const init = this.emitExpr(e.init);
+          if (!isArray(init.type) || !sameType(init.type.element, e.element)) {
+            throw new Error(
+              `new Set<${displayType(e.element)}> initializer must be a '${displayType(e.element)}[]', got '${displayType(init.type)}'`,
+            );
+          }
+          // Seed from the array's elements (deref the shared_ptr to the vector).
+          return {
+            code: `std::make_shared<${this.setPointee(t)}>(*(${init.code}))`,
+            type: t,
+          };
+        }
+        return {
+          code: `std::make_shared<${this.setPointee(t)}>()`,
+          type: t,
+        };
+      }
     }
+  }
+
+  // --- Math.* -------------------------------------------------------------
+  //
+  // `Math.<fn>(...)` is a builtin (recognized in lowering), always `number`-typed
+  // and always the f64 rep — Math is double math. Most functions map straight to
+  // <cmath>; the JS-divergent ones (round half-to-+∞, NaN-propagating min/max,
+  // sign, random) use a `tsn_math_*` runtime helper. Every argument is forced to
+  // `double` (`static_cast`) so an i64-rep operand picks the floating overload.
+
+  // Unary `Math.<fn>` that maps straight to a <cmath> function.
+  private static readonly MATH_UNARY_STD: Record<string, string> = {
+    abs: "std::fabs", floor: "std::floor", ceil: "std::ceil",
+    trunc: "std::trunc", sqrt: "std::sqrt", cbrt: "std::cbrt",
+    exp: "std::exp", log: "std::log", log2: "std::log2", log10: "std::log10",
+    sin: "std::sin", cos: "std::cos", tan: "std::tan",
+    asin: "std::asin", acos: "std::acos", atan: "std::atan",
+    sinh: "std::sinh", cosh: "std::cosh", tanh: "std::tanh",
+  };
+
+  // The exact double-literal value of each Math constant (the shortest round-trip
+  // spelling JS uses, so clang parses it to the identical double — byte-for-byte
+  // with Node). Emitting literals avoids depending on <cmath>'s M_PI being defined.
+  private static readonly MATH_CONST: Record<string, string> = {
+    PI: "3.141592653589793",
+    E: "2.718281828459045",
+    LN2: "0.6931471805599453",
+    LN10: "2.302585092994046",
+    LOG2E: "1.4426950408889634",
+    LOG10E: "0.4342944819032518",
+    SQRT2: "1.4142135623730951",
+    SQRT1_2: "0.7071067811865476",
+  };
+
+  private emitMathConst(name: string): Value {
+    const code = Emitter.MATH_CONST[name];
+    if (code === undefined)
+      throw new Error(`Unsupported Math constant 'Math.${name}'`);
+    return { code, type: "number", rep: "f64" };
+  }
+
+  private emitMathCall(e: { fn: string; args: Expr[] }): Value {
+    const fn = e.fn;
+    const vals = e.args.map((a) => this.emitExpr(a));
+    for (const v of vals) {
+      if (v.type !== "number")
+        throw new Error(`'Math.${fn}' arguments must be numbers`);
+    }
+    // Force every argument to double, so an i64-rep operand selects the floating
+    // <cmath> overload (and integer literals don't pick an integral overload).
+    const ds = vals.map((v) => `static_cast<double>(${v.code})`);
+    const num = (code: string): Value => ({ code, type: "number", rep: "f64" });
+    const arity = (n: number) => {
+      if (vals.length !== n)
+        throw new Error(
+          `'Math.${fn}' expects ${n} argument(s), got ${vals.length}`,
+        );
+    };
+
+    const std = Emitter.MATH_UNARY_STD[fn];
+    if (std) {
+      arity(1);
+      return num(`${std}(${ds[0]})`);
+    }
+    switch (fn) {
+      case "round":
+        arity(1);
+        return num(`tsn_math_round(${ds[0]})`);
+      case "sign":
+        arity(1);
+        return num(`tsn_math_sign(${ds[0]})`);
+      case "pow":
+        arity(2);
+        return num(`std::pow(${ds[0]}, ${ds[1]})`);
+      case "atan2":
+        arity(2);
+        return num(`std::atan2(${ds[0]}, ${ds[1]})`);
+      case "min":
+      case "max": {
+        // Fold the (variadic) args with a NaN-propagating binary helper. With no
+        // args JS yields +Infinity (min) / -Infinity (max).
+        if (ds.length === 0) return num(fn === "min" ? "INFINITY" : "-INFINITY");
+        const helper = fn === "min" ? "tsn_math_min" : "tsn_math_max";
+        let acc = ds[0];
+        for (let i = 1; i < ds.length; i++) acc = `${helper}(${acc}, ${ds[i]})`;
+        return num(acc);
+      }
+      case "hypot": {
+        // hypot(a,b,c) == hypot(hypot(a,b),c); hypot(x) == |x|; hypot() == 0.
+        if (ds.length === 0) return num("0.0");
+        if (ds.length === 1) return num(`std::fabs(${ds[0]})`);
+        let acc = `std::hypot(${ds[0]}, ${ds[1]})`;
+        for (let i = 2; i < ds.length; i++) acc = `std::hypot(${acc}, ${ds[i]})`;
+        return num(acc);
+      }
+      case "random":
+        arity(0);
+        return num("tsn_math_random()");
+    }
+    throw new Error(`Unsupported Math function 'Math.${fn}'`);
   }
 
   // --- JSON.parse ---------------------------------------------------------
@@ -1617,6 +1803,11 @@ class Emitter {
     if (isClass(t)) {
       throw new Error(
         `JSON.parse target type may not be a class ('${t.name}') — use an object type like { ... }`,
+      );
+    }
+    if (isMap(t) || isSet(t)) {
+      throw new Error(
+        `JSON.parse target type may not be a ${isMap(t) ? "Map" : "Set"} — use an object/array type`,
       );
     }
     if (isArray(t)) {
@@ -1963,13 +2154,296 @@ class Emitter {
           }
           return { code: `tsn_join(${vecRecv}, ${sep})`, type: "string" };
         }
+        case "includes":
+        case "lastIndexOf": {
+          // Membership / last-position via element `==` (so aggregate elements,
+          // which have no equality, are rejected — class elements use identity).
+          if (e.args.length < 1 || e.args.length > 2) {
+            throw new Error(
+              `'${e.method}' expects 1-2 argument(s), got ${e.args.length}`,
+            );
+          }
+          if (isAggregate(elem)) {
+            throw new Error(
+              `'${e.method}' is not supported on '${displayType(recv.type)}' (elements have no equality)`,
+            );
+          }
+          const search = this.emitExpr(e.args[0]);
+          if (!sameType(search.type, elem)) {
+            throw new Error(
+              `'${e.method}' search type '${displayType(search.type)}' does not match element type '${displayType(elem)}'`,
+            );
+          }
+          let from = "NAN";
+          if (e.args.length === 2) {
+            const f = this.emitExpr(e.args[1]);
+            if (f.type !== "number") {
+              throw new Error(`'${e.method}' fromIndex must be a number`);
+            }
+            from = f.code;
+          }
+          const helper =
+            e.method === "includes"
+              ? "tsn_array_includes"
+              : "tsn_array_last_index_of";
+          return {
+            code: `${helper}(${vecRecv}, ${this.f64SlotCode(search)}, ${from})`,
+            type: e.method === "includes" ? "boolean" : "number",
+          };
+        }
+        case "reverse": {
+          if (e.args.length !== 0) {
+            throw new Error(
+              `'reverse' expects 0 arguments, got ${e.args.length}`,
+            );
+          }
+          // Mutates in place and returns the SAME array reference (chainable /
+          // usable as a value). The IIFE takes the receiver by value (a refcount
+          // bump) so the receiver expression is evaluated exactly once.
+          return {
+            code: `([](auto _tsn_r){ tsn_array_reverse(*_tsn_r); return _tsn_r; }(${recv.code}))`,
+            type: recv.type,
+          };
+        }
+        case "fill": {
+          if (e.args.length < 1 || e.args.length > 3) {
+            throw new Error(
+              `'fill' expects 1-3 argument(s), got ${e.args.length}`,
+            );
+          }
+          const val = this.emitExpr(e.args[0]);
+          if (!sameType(val.type, elem)) {
+            throw new Error(
+              `Cannot fill '${displayType(recv.type)}' with '${displayType(val.type)}'`,
+            );
+          }
+          const nums = e.args.slice(1).map((a) => this.emitExpr(a));
+          for (const n of nums) {
+            if (n.type !== "number") {
+              throw new Error("'fill' start/end must be numbers");
+            }
+          }
+          const start = nums[0]?.code ?? "NAN";
+          const end = nums[1]?.code ?? "NAN";
+          // `[&]` captures any locals referenced by start/end; the receiver and
+          // value pass as by-value args (evaluated once). Returns the array.
+          return {
+            code: `([&](auto _tsn_r, auto _tsn_x){ tsn_array_fill(*_tsn_r, _tsn_x, ${start}, ${end}); return _tsn_r; }(${recv.code}, ${this.f64SlotCode(val)}))`,
+            type: recv.type,
+          };
+        }
+        case "shift": {
+          if (e.args.length !== 0) {
+            throw new Error(`'shift' expects 0 arguments, got ${e.args.length}`);
+          }
+          // Removes and returns the first element (empty -> element default).
+          return { code: `tsn_array_shift(${vecRecv})`, type: elem };
+        }
+        case "unshift": {
+          if (e.args.length < 1) {
+            throw new Error("'unshift' expects at least 1 argument");
+          }
+          const items = e.args.map((a) => {
+            const v = this.emitExpr(a);
+            if (!sameType(v.type, elem)) {
+              throw new Error(
+                `Cannot unshift '${displayType(v.type)}' onto '${displayType(recv.type)}'`,
+              );
+            }
+            return this.f64SlotCode(v);
+          });
+          // Pass the prepended items as a vector so 0..n args work; returns length.
+          const vec = this.vecType(recv.type);
+          return {
+            code: `tsn_array_unshift(${vecRecv}, ${vec}{${items.join(", ")}})`,
+            type: "number",
+          };
+        }
+        case "concat": {
+          // Array operands only (element-value args aren't supported); each must
+          // share the receiver's type. 0 args -> a fresh shallow copy (new identity).
+          let acc = vecRecv;
+          for (const a of e.args) {
+            const arg = this.emitExpr(a);
+            if (!sameType(arg.type, recv.type)) {
+              throw new Error(
+                `'concat' expects '${displayType(recv.type)}' argument(s), got '${displayType(arg.type)}'`,
+              );
+            }
+            acc = `tsn_array_concat(${acc}, *(${arg.code}))`;
+          }
+          const vec = this.vecType(recv.type);
+          return { code: `std::make_shared<${vec}>(${acc})`, type: recv.type };
+        }
         default:
           throw new Error(`Unsupported array method '${e.method}'`);
       }
     }
+    if (isMap(recv.type)) return this.emitMapMethod(recv, e, asStatement);
+    if (isSet(recv.type)) return this.emitSetMethod(recv, e, asStatement);
     throw new Error(
       `Type '${displayType(recv.type)}' has no method '${e.method}'`,
     );
+  }
+
+  // Emit a Map method call. `set` returns the map (chainable) via an IIFE that
+  // takes the receiver by value so it's evaluated once; `get` returns the value
+  // type (a missing key yields the value default — see tsn_map::get); `keys` /
+  // `values` return arrays; `has` / `delete` booleans; `clear` is statement-only.
+  private emitMapMethod(
+    recv: Value,
+    e: { method: string; args: Expr[] },
+    asStatement: boolean,
+  ): { code: string; type: RetType } {
+    const t = recv.type as MapType;
+    const { key, value } = t;
+    const arity = (n: number) => {
+      if (e.args.length !== n) {
+        throw new Error(
+          `'Map.${e.method}' expects ${n} argument(s), got ${e.args.length}`,
+        );
+      }
+    };
+    // Emit + type-check the first argument as a key, returning its (f64-cast) code.
+    const keyArg = (): string => {
+      const k = this.emitExpr(e.args[0]);
+      if (!sameType(k.type, key)) {
+        throw new Error(
+          `'Map.${e.method}' key type '${displayType(k.type)}' does not match '${displayType(key)}'`,
+        );
+      }
+      return this.f64SlotCode(k);
+    };
+    switch (e.method) {
+      case "set": {
+        arity(2);
+        const k = this.emitExpr(e.args[0]);
+        if (!sameType(k.type, key)) {
+          throw new Error(
+            `'Map.set' key type '${displayType(k.type)}' does not match '${displayType(key)}'`,
+          );
+        }
+        const v = this.emitExpr(e.args[1]);
+        if (!sameType(v.type, value)) {
+          throw new Error(
+            `'Map.set' value type '${displayType(v.type)}' does not match '${displayType(value)}'`,
+          );
+        }
+        return {
+          code: `([](auto _tsn_m, auto _tsn_k, auto _tsn_v){ _tsn_m->set(_tsn_k, _tsn_v); return _tsn_m; }(${recv.code}, ${this.f64SlotCode(k)}, ${this.f64SlotCode(v)}))`,
+          type: t,
+        };
+      }
+      case "get":
+        arity(1);
+        return { code: `(${recv.code})->get(${keyArg()})`, type: value };
+      case "has":
+        arity(1);
+        return { code: `(${recv.code})->has(${keyArg()})`, type: "boolean" };
+      case "delete":
+        arity(1);
+        return { code: `(${recv.code})->del(${keyArg()})`, type: "boolean" };
+      case "clear":
+        arity(0);
+        if (!asStatement) {
+          throw new Error("'Map.clear' returns void and cannot be used as a value");
+        }
+        return { code: `(${recv.code})->clear()`, type: "void" };
+      case "keys":
+        arity(0);
+        return {
+          code: `(${recv.code})->keys()`,
+          type: { kind: "array", element: key },
+        };
+      case "values":
+        arity(0);
+        return {
+          code: `(${recv.code})->values()`,
+          type: { kind: "array", element: value },
+        };
+      case "forEach":
+        throw new Error(
+          "'Map.forEach' is not supported (v1) — no first-class functions; iterate for…of over .keys()/.values()",
+        );
+      case "entries":
+        throw new Error(
+          "'Map.entries' is not supported (v1) — tuples are out of subset; iterate .keys()/.values()",
+        );
+      default:
+        throw new Error(`Map has no method '${e.method}'`);
+    }
+  }
+
+  // Emit a Set method call. `add` returns the set (chainable, IIFE-evaluated once);
+  // `has` / `delete` booleans; `values` / `keys` the elements as an array; `clear`
+  // is statement-only. forEach/entries are rejected (callbacks / tuples).
+  private emitSetMethod(
+    recv: Value,
+    e: { method: string; args: Expr[] },
+    asStatement: boolean,
+  ): { code: string; type: RetType } {
+    const t = recv.type as SetType;
+    const elem = t.element;
+    const arity = (n: number) => {
+      if (e.args.length !== n) {
+        throw new Error(
+          `'Set.${e.method}' expects ${n} argument(s), got ${e.args.length}`,
+        );
+      }
+    };
+    const elemArg = (): string => {
+      const x = this.emitExpr(e.args[0]);
+      if (!sameType(x.type, elem)) {
+        throw new Error(
+          `'Set.${e.method}' value type '${displayType(x.type)}' does not match '${displayType(elem)}'`,
+        );
+      }
+      return this.f64SlotCode(x);
+    };
+    switch (e.method) {
+      case "add": {
+        arity(1);
+        const x = this.emitExpr(e.args[0]);
+        if (!sameType(x.type, elem)) {
+          throw new Error(
+            `'Set.add' value type '${displayType(x.type)}' does not match '${displayType(elem)}'`,
+          );
+        }
+        return {
+          code: `([](auto _tsn_s, auto _tsn_x){ _tsn_s->add(_tsn_x); return _tsn_s; }(${recv.code}, ${this.f64SlotCode(x)}))`,
+          type: t,
+        };
+      }
+      case "has":
+        arity(1);
+        return { code: `(${recv.code})->has(${elemArg()})`, type: "boolean" };
+      case "delete":
+        arity(1);
+        return { code: `(${recv.code})->del(${elemArg()})`, type: "boolean" };
+      case "clear":
+        arity(0);
+        if (!asStatement) {
+          throw new Error("'Set.clear' returns void and cannot be used as a value");
+        }
+        return { code: `(${recv.code})->clear()`, type: "void" };
+      case "values":
+      case "keys":
+        arity(0);
+        return {
+          code: `(${recv.code})->values()`,
+          type: { kind: "array", element: elem },
+        };
+      case "forEach":
+        throw new Error(
+          "'Set.forEach' is not supported (v1) — no first-class functions; iterate with for…of",
+        );
+      case "entries":
+        throw new Error(
+          "'Set.entries' is not supported (v1) — tuples are out of subset; iterate with for…of",
+        );
+      default:
+        throw new Error(`Set has no method '${e.method}'`);
+    }
   }
 
   // Emit an instance method call: `(recv)->method(args)`. The method is resolved
@@ -2093,6 +2567,117 @@ class Emitter {
           code: `tsn_index_of(${s}, ${argv[0].code}, ${from})`,
           type: "number",
         };
+      }
+      case "lastIndexOf": {
+        if (argv.length < 1 || argv.length > 2) {
+          throw new Error(
+            `'lastIndexOf' expects 1-2 argument(s), got ${argv.length}`,
+          );
+        }
+        if (argv[0].type !== "string") {
+          throw new Error("'lastIndexOf' search argument must be a string");
+        }
+        if (argv.length === 2 && argv[1].type !== "number") {
+          throw new Error("'lastIndexOf' fromIndex must be a number");
+        }
+        const from = argv.length === 2 ? argv[1].code : "NAN";
+        return {
+          code: `tsn_last_index_of(${s}, ${argv[0].code}, ${from})`,
+          type: "number",
+        };
+      }
+      case "includes":
+      case "startsWith":
+      case "endsWith": {
+        // A string search + optional numeric position; returns a boolean.
+        if (argv.length < 1 || argv.length > 2) {
+          throw new Error(
+            `'${e.method}' expects 1-2 argument(s), got ${argv.length}`,
+          );
+        }
+        if (argv[0].type !== "string") {
+          throw new Error(`'${e.method}' search argument must be a string`);
+        }
+        if (argv.length === 2 && argv[1].type !== "number") {
+          throw new Error(`'${e.method}' position must be a number`);
+        }
+        const pos = argv.length === 2 ? argv[1].code : "NAN";
+        const helper =
+          e.method === "includes"
+            ? "tsn_str_includes"
+            : e.method === "startsWith"
+              ? "tsn_starts_with"
+              : "tsn_ends_with";
+        return { code: `${helper}(${s}, ${argv[0].code}, ${pos})`, type: "boolean" };
+      }
+      case "repeat": {
+        const [n] = numArgs(1, 1);
+        return { code: `tsn_repeat(${s}, ${n})`, type: "string" };
+      }
+      case "trim":
+        numArgs(0, 0);
+        return { code: `tsn_trim(${s})`, type: "string" };
+      case "trimStart":
+        numArgs(0, 0);
+        return { code: `tsn_trim_start(${s})`, type: "string" };
+      case "trimEnd":
+        numArgs(0, 0);
+        return { code: `tsn_trim_end(${s})`, type: "string" };
+      case "padStart":
+      case "padEnd": {
+        // `padStart(targetLength, padString = " ")`.
+        if (argv.length < 1 || argv.length > 2) {
+          throw new Error(
+            `'${e.method}' expects 1-2 argument(s), got ${argv.length}`,
+          );
+        }
+        if (argv[0].type !== "number") {
+          throw new Error(`'${e.method}' target length must be a number`);
+        }
+        let pad = `" "`;
+        if (argv.length === 2) {
+          if (argv[1].type !== "string") {
+            throw new Error(`'${e.method}' pad argument must be a string`);
+          }
+          pad = argv[1].code;
+        }
+        const helper = e.method === "padStart" ? "tsn_pad_start" : "tsn_pad_end";
+        return {
+          code: `${helper}(${s}, ${argv[0].code}, ${pad})`,
+          type: "string",
+        };
+      }
+      case "replace":
+      case "replaceAll": {
+        // String search + string replacement only (regex / function args are out
+        // of subset). `replace` hits the first match; `replaceAll` every match.
+        if (argv.length !== 2) {
+          throw new Error(
+            `'${e.method}' expects 2 argument(s), got ${argv.length}`,
+          );
+        }
+        if (argv[0].type !== "string" || argv[1].type !== "string") {
+          throw new Error(
+            `'${e.method}' arguments must be strings (regex / function args are out of subset)`,
+          );
+        }
+        const helper = e.method === "replace" ? "tsn_replace" : "tsn_replace_all";
+        return {
+          code: `${helper}(${s}, ${argv[0].code}, ${argv[1].code})`,
+          type: "string",
+        };
+      }
+      case "concat": {
+        // Fold into +-concatenation; every operand must already be a string
+        // (TypeScript's String.concat signature rejects non-string args).
+        for (const a of argv) {
+          if (a.type !== "string") {
+            throw new Error("'concat' arguments must be strings");
+          }
+        }
+        let acc = s;
+        for (const a of argv) acc = `(${acc} + ${a.code})`;
+        return { code: acc, type: "string" };
       }
       default:
         throw new Error(`Unsupported string method '${e.method}'`);

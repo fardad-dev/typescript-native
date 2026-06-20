@@ -86,20 +86,31 @@ A multi-file program is assembled from per-file `lower` results by `loadProgram`
 - `lowerVarDecl(decl)` — a single `let`/`const` binding; initializer is required. Also the home of
   the `const x: T = JSON.parse(text)` idiom: when annotated and the initializer is a `JSON.parse`
   call, the annotation supplies the parse target type (→ a `jsonParse` node).
-- `lowerType(node)` — TS `TypeNode` → IR `Type` (keywords, `T[]`, `Array<T>`, object type literals;
-  a **bare identifier** that isn't a known primitive/`Array` → a `class` instance type).
+- `lowerType(node)` — TS `TypeNode` → IR `Type` (keywords, `T[]`, `Array<T>`, `Map<K, V>` / `Set<T>`,
+  object type literals; a **bare identifier** that isn't a known primitive/built-in → a `class`
+  instance type).
 - `lowerExpr(node)` — TS `Expression` → IR `Expr` (literals, identifiers, binary, ternary
   (`cond ? a : b`), unary, array/object literals, indexing, member access, calls, `new C(...)`,
-  `this`). A **template literal** (`` `a${x}b` ``) desugars here into a left-folded chain of `+`
-  nodes (head + expr + literal + …) — no IR node of its own; the head anchors the chain to `string`.
-  Also recognizes the `JSON.*`
+  `this`, and the **non-null assertion `e!`** — lowered transparently as `lowerExpr(e)`, since it
+  only narrows the static type; this lets `map.get(k)!` type-check). A **template literal**
+  (`` `a${x}b` ``) desugars here into a left-folded chain of `+` nodes (head + expr + literal + …) —
+  no IR node of its own; the head anchors the chain to `string`. Also recognizes the `JSON.*`
   builtins (`tryLowerJsonCall`) and the `JSON.parse(text) as T` assertion (the one `as`-expression
-  form the subset accepts — a general type assertion is rejected).
+  form the subset accepts — a general type assertion is rejected), the `Math.*` builtins
+  (`tryLowerMathCall` / `lowerMathConst`, intercepted before the generic method/member path), and
+  `new Map<K, V>()` / `new Set<T>(arr?)` (`lowerNewMap` / `lowerNewSet`, intercepted before the
+  generic `new C(...)` path).
 - `lowerBinaryOp(kind)` — operator token → `BinaryOp`.
 - `isConsoleLog(expr)` — recognizes the `console.log` callee.
 - `tryLowerJsonCall(node)` / `isJsonParseCall(node)` / `jsonParseNode(call, type)` — recognize and
   lower the `JSON.stringify` / `JSON.parse` builtins. `JSON.stringify(x)` lowers directly; a bare
   `JSON.parse(x)` (no `as T` / annotation, so no target type) is a clear error.
+- `tryLowerMathCall(node)` / `lowerMathConst(name)` — recognize `Math.<fn>(...)` (→ a `mathCall`
+  node) and `Math.<name>` (→ a `mathConst`); an unknown function/constant is a clear error.
+- `lowerNewMap(node)` / `lowerNewSet(node)` / `setNewNode(element, args)` — lower `new Map<K, V>()`
+  and `new Set<T>(arr?)`. Type arguments are required on `new`, OR supplied by an annotated target
+  (`const m: Map<K, V> = new Map()`), which `lowerVarDecl` special-cases (alongside the `JSON.parse`
+  idiom). `new Map(entries)` (entries iterable) is rejected — it needs tuples.
 
 ## Conventions / gotchas
 
@@ -114,9 +125,10 @@ A multi-file program is assembled from per-file `lower` results by `loadProgram`
   `lowerType` recurses with no scalar-field check, so `{ pts: number[] }`, `{ inner: { x: number } }`,
   `number[][]`, and `{ x: number }[]` all lower to the right nested `Type`.
 - **Class type-refs are open:** `lowerType` maps any bare identifier that isn't a known
-  primitive/`Array` to `{ kind: "class", name }` *without* checking the class exists — the emitter
-  validates that (and reports `Unknown class: X`). Generic refs (with type arguments) still fall
-  through to the "Unsupported type annotation" throw, so e.g. `Map<K, V>` keeps its clear error.
+  primitive/built-in to `{ kind: "class", name }` *without* checking the class exists — the emitter
+  validates that (and reports `Unknown class: X`). The built-in generics `Array<T>` / `Map<K, V>` /
+  `Set<T>` are special-cased; any **other** generic ref (with type arguments) still falls through to
+  the "Unsupported type annotation" throw, so e.g. a user `Box<T>` keeps its clear error.
 - **String values come pre-decoded:** use `node.text` for string/template literals (TS already
   resolved escapes); codegen re-encodes them as C++ string literals.
 - **Fail loud:** any unsupported syntax throws `Error("Unsupported ... ")`. Keep messages

@@ -19,6 +19,7 @@
 // single translation unit raises no ODR concerns.
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <cctype>
 #include <charconv>
@@ -210,6 +211,123 @@ static tsn_str tsn_to_lower(std::string s) {
   return s;
 }
 
+// JS String.prototype.includes / startsWith / endsWith — substring membership
+// and prefix/suffix tests (string searches only; regex is out of subset).
+static bool tsn_str_includes(const std::string& s, const std::string& sub, double fromD) {
+  long long from = std::isnan(fromD) ? 0 : (long long)fromD;
+  if (from < 0) from = 0;
+  if (from > (long long)s.size()) return sub.empty();
+  return s.find(sub, (std::size_t)from) != std::string::npos;
+}
+static bool tsn_starts_with(const std::string& s, const std::string& sub, double posD) {
+  long long pos = std::isnan(posD) ? 0 : (long long)posD;
+  if (pos < 0) pos = 0;
+  if (pos + (long long)sub.size() > (long long)s.size()) return false;
+  return s.compare((std::size_t)pos, sub.size(), sub) == 0;
+}
+static bool tsn_ends_with(const std::string& s, const std::string& sub, double endD) {
+  long long end = std::isnan(endD) ? (long long)s.size() : (long long)endD;
+  if (end < 0) end = 0;
+  if (end > (long long)s.size()) end = (long long)s.size();
+  if ((long long)sub.size() > end) return false;
+  return s.compare((std::size_t)(end - (long long)sub.size()), sub.size(), sub) == 0;
+}
+
+// JS String.prototype.lastIndexOf: last position of `sub` at/before fromIndex
+// (NaN = end). Returns -1 if absent.
+static double tsn_last_index_of(const std::string& s, const std::string& sub, double fromD) {
+  std::size_t from = std::isnan(fromD) ? std::string::npos
+                   : (fromD < 0 ? 0 : (std::size_t)fromD);
+  std::size_t pos = s.rfind(sub, from);
+  return pos == std::string::npos ? -1.0 : (double)pos;
+}
+
+// JS String.prototype.repeat. JS throws RangeError on a negative / non-finite
+// count; the subset has no exceptions, so the count is truncated toward zero and
+// a count <= 0 (or NaN) yields the empty string.
+static tsn_str tsn_repeat(const std::string& s, double countD) {
+  if (std::isnan(countD) || countD <= 0.0) return std::string();
+  long long count = (long long)countD;
+  std::string out;
+  out.reserve(s.size() * (std::size_t)count);
+  for (long long i = 0; i < count; ++i) out += s;
+  return out;
+}
+
+// JS String.prototype.trim / trimStart / trimEnd — strip leading/trailing ASCII
+// whitespace. (JS also trims some Unicode spaces / BOM; ASCII covers the subset.)
+static bool tsn_is_ws(char c) {
+  return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\v' || c == '\f';
+}
+static tsn_str tsn_trim_start(const std::string& s) {
+  std::size_t i = 0;
+  while (i < s.size() && tsn_is_ws(s[i])) ++i;
+  return s.substr(i);
+}
+static tsn_str tsn_trim_end(const std::string& s) {
+  std::size_t n = s.size();
+  while (n > 0 && tsn_is_ws(s[n - 1])) --n;
+  return s.substr(0, n);
+}
+static tsn_str tsn_trim(const std::string& s) {
+  std::size_t i = 0, n = s.size();
+  while (i < n && tsn_is_ws(s[i])) ++i;
+  while (n > i && tsn_is_ws(s[n - 1])) --n;
+  return s.substr(i, n - i);
+}
+
+// JS String.prototype.padStart / padEnd: pad with `pad` (repeated, then
+// truncated) until the length reaches `target`. A target <= the current length,
+// or an empty pad, returns the string unchanged.
+static tsn_str tsn_pad_start(const std::string& s, double targetD, const std::string& pad) {
+  long long target = std::isnan(targetD) ? 0 : (long long)targetD;
+  if (target <= (long long)s.size() || pad.empty()) return s;
+  std::size_t need = (std::size_t)target - s.size();
+  std::string fill;
+  while (fill.size() < need) fill += pad;
+  fill.resize(need);
+  return fill + s;
+}
+static tsn_str tsn_pad_end(const std::string& s, double targetD, const std::string& pad) {
+  long long target = std::isnan(targetD) ? 0 : (long long)targetD;
+  if (target <= (long long)s.size() || pad.empty()) return s;
+  std::size_t need = (std::size_t)target - s.size();
+  std::string fill;
+  while (fill.size() < need) fill += pad;
+  fill.resize(need);
+  return s + fill;
+}
+
+// JS String.prototype.replace with a STRING search (regex is out of subset):
+// replaces only the FIRST occurrence. The replacement is literal — JS's `$&` /
+// `$1` substitution patterns are not expanded. An empty search matches at index 0.
+static tsn_str tsn_replace(const std::string& s, const std::string& search, const std::string& repl) {
+  if (search.empty()) return repl + s;
+  std::size_t pos = s.find(search);
+  if (pos == std::string::npos) return s;
+  return s.substr(0, pos) + repl + s.substr(pos + search.size());
+}
+// JS String.prototype.replaceAll: every non-overlapping occurrence. An empty
+// search inserts the replacement between every character (and at both ends),
+// matching JS (`"ab".replaceAll("", "-") === "-a-b-"`).
+static tsn_str tsn_replace_all(const std::string& s, const std::string& search, const std::string& repl) {
+  if (search.empty()) {
+    std::string out = repl;
+    for (char c : s) { out += c; out += repl; }
+    return out;
+  }
+  std::string out;
+  std::size_t start = 0;
+  while (true) {
+    std::size_t pos = s.find(search, start);
+    if (pos == std::string::npos) { out += s.substr(start); break; }
+    out += s.substr(start, pos - start);
+    out += repl;
+    start = pos + search.size();
+  }
+  return out;
+}
+
 // JS String.prototype.split with a STRING separator (regex is outside the
 // subset). Mirrors JS edge cases: an empty separator splits into single
 // characters; a separator that never matches yields a one-element array of
@@ -306,6 +424,207 @@ static double tsn_array_index_of(const std::vector<T>& v, const T& x, double fro
   return -1.0;
 }
 
+// JS Array.prototype.includes: membership test via operator== (so number NaN
+// won't match NaN — a minor divergence from JS's SameValueZero). fromIndex
+// (NaN = 0) may be negative (counts from the end).
+template <class T>
+static bool tsn_array_includes(const std::vector<T>& v, const T& x, double fromD) {
+  long long len = (long long)v.size();
+  long long from = std::isnan(fromD) ? 0 : (long long)fromD;
+  if (from < 0) { from = len + from; if (from < 0) from = 0; }
+  for (long long i = from; i < len; ++i)
+    if (v[(std::size_t)i] == x) return true;
+  return false;
+}
+
+// JS Array.prototype.lastIndexOf: last index where the element == x, searching
+// backward from fromIndex (NaN = last). Negative fromIndex counts from the end.
+template <class T>
+static double tsn_array_last_index_of(const std::vector<T>& v, const T& x, double fromD) {
+  long long len = (long long)v.size();
+  long long from = std::isnan(fromD) ? len - 1 : (long long)fromD;
+  if (from < 0) from = len + from;
+  if (from >= len) from = len - 1;
+  for (long long i = from; i >= 0; --i)
+    if (v[(std::size_t)i] == x) return (double)i;
+  return -1.0;
+}
+
+// JS Array.prototype.reverse: reverse in place. Codegen returns the array
+// reference (the same shared_ptr) so `a.reverse()` can be chained / used as a value.
+template <class T>
+static void tsn_array_reverse(std::vector<T>& v) {
+  std::reverse(v.begin(), v.end());
+}
+
+// JS Array.prototype.fill: set [start, end) to x in place. Negatives count from
+// the end; an omitted (NaN) start/end defaults to 0 / length. Codegen returns the
+// array reference.
+template <class T>
+static void tsn_array_fill(std::vector<T>& v, const T& x, double startD, double endD) {
+  long long len = (long long)v.size();
+  long long start = std::isnan(startD) ? 0 : (long long)startD;
+  long long end = std::isnan(endD) ? len : (long long)endD;
+  if (start < 0) start = len + start;
+  if (end < 0) end = len + end;
+  if (start < 0) start = 0;
+  if (end < 0) end = 0;
+  if (start > len) start = len;
+  if (end > len) end = len;
+  for (long long i = start; i < end; ++i) v[(std::size_t)i] = x;
+}
+
+// JS Array.prototype.concat (array operands): a new vector = a then b. Codegen
+// folds a multi-argument concat into nested calls and wraps the result in a fresh
+// shared_ptr (a shallow copy with a new identity, matching JS).
+template <class T>
+static std::vector<T> tsn_array_concat(const std::vector<T>& a, const std::vector<T>& b) {
+  std::vector<T> out;
+  out.reserve(a.size() + b.size());
+  out.insert(out.end(), a.begin(), a.end());
+  out.insert(out.end(), b.begin(), b.end());
+  return out;
+}
+
+// JS Array.prototype.shift: remove and return the first element. Like pop, an
+// empty array yields the element type's default (the subset has no `undefined`).
+template <class T>
+static T tsn_array_shift(std::vector<T>& v) {
+  if (v.empty()) return T();
+  T x = std::move(v.front());
+  v.erase(v.begin());
+  return x;
+}
+
+// JS Array.prototype.unshift: prepend `items` (in order) and return the new
+// length. Codegen passes the arguments as a small vector so 0..n args work.
+template <class T>
+static double tsn_array_unshift(std::vector<T>& v, std::vector<T> items) {
+  v.insert(v.begin(), items.begin(), items.end());
+  return (double)v.size();
+}
+
+// --- Math.* helpers (only where JS diverges from <cmath>) ----------------
+//
+// Most Math functions map straight to <cmath> in generated code; these cover the
+// cases where JS semantics differ. Every argument is already a double at the call
+// site (codegen casts), and every result is a JS `number` (f64).
+
+// JS Math.round rounds half toward +Infinity (Math.round(-2.5) === -2), unlike
+// std::round (half away from zero). floor(x + 0.5) gives the JS rule; NaN and
+// ±Infinity pass straight through (floor of them is themselves).
+static inline double tsn_math_round(double x) {
+  if (std::isnan(x) || std::isinf(x)) return x;
+  return std::floor(x + 0.5);
+}
+
+// JS Math.sign: 1 / -1 for positive / negative, the (signed) zero for ±0, and
+// NaN for NaN. <cmath> has no sign function.
+static inline double tsn_math_sign(double x) {
+  if (std::isnan(x)) return x;
+  if (x > 0.0) return 1.0;
+  if (x < 0.0) return -1.0;
+  return x;  // preserves +0 / -0
+}
+
+// JS Math.min / Math.max: if ANY argument is NaN the result is NaN (std::fmin /
+// std::fmax would skip a NaN). Codegen folds the variadic argument list with
+// these binary helpers (Math.min() / Math.max() with no args -> ±Infinity).
+static inline double tsn_math_min(double a, double b) {
+  if (std::isnan(a) || std::isnan(b)) return NAN;
+  return a < b ? a : b;
+}
+static inline double tsn_math_max(double a, double b) {
+  if (std::isnan(a) || std::isnan(b)) return NAN;
+  return a > b ? a : b;
+}
+
+// Math.random(): a double in [0, 1). Uses the C library PRNG (unseeded, so the
+// sequence is deterministic across runs) — adequate for a learning compiler, and
+// unlike JS there is no cryptographic guarantee.
+static inline double tsn_math_random() {
+  return (double)std::rand() / ((double)RAND_MAX + 1.0);
+}
+
+// --- Map / Set ----------------------------------------------------------
+//
+// JS Map and Set are *insertion-ordered* and compare keys/elements by
+// SameValueZero (≈ identity for objects, value for primitives). These model that
+// with a plain ordered vector and linear lookup using the same `operator==` the
+// arrays use (so tsn_str compares by value, numbers by value, shared_ptr objects
+// by identity). Linear scan is O(n) per op — clarity over a hashed structure, in
+// keeping with this learning compiler. Both are held behind a std::shared_ptr in
+// generated code, so they are reference types (alias, shared mutation, identity
+// `===`). Subset divergences: a NaN number key won't match (operator== semantics),
+// and a missing `get` yields the value type's default (there is no `undefined`).
+
+template <class K, class V>
+struct tsn_map {
+  std::vector<std::pair<K, V>> entries;  // insertion order
+  std::size_t size() const { return entries.size(); }
+  std::size_t find(const K& k) const {
+    for (std::size_t i = 0; i < entries.size(); ++i)
+      if (entries[i].first == k) return i;
+    return (std::size_t)-1;
+  }
+  bool has(const K& k) const { return find(k) != (std::size_t)-1; }
+  void set(const K& k, const V& v) {
+    std::size_t i = find(k);
+    if (i == (std::size_t)-1) entries.emplace_back(k, v);
+    else entries[i].second = v;
+  }
+  // JS Map.get returns `undefined` for a missing key; the subset has no
+  // `undefined`, so a miss yields the value type's default (0 / "" / false / null).
+  V get(const K& k) const {
+    std::size_t i = find(k);
+    return i == (std::size_t)-1 ? V() : entries[i].second;
+  }
+  bool del(const K& k) {
+    std::size_t i = find(k);
+    if (i == (std::size_t)-1) return false;
+    entries.erase(entries.begin() + i);
+    return true;
+  }
+  void clear() { entries.clear(); }
+  std::shared_ptr<std::vector<K>> keys() const {
+    auto out = std::make_shared<std::vector<K>>();
+    for (const auto& kv : entries) out->push_back(kv.first);
+    return out;
+  }
+  std::shared_ptr<std::vector<V>> values() const {
+    auto out = std::make_shared<std::vector<V>>();
+    for (const auto& kv : entries) out->push_back(kv.second);
+    return out;
+  }
+};
+
+template <class T>
+struct tsn_set {
+  std::vector<T> items;  // insertion order, unique by ==
+  tsn_set() {}
+  tsn_set(const std::vector<T>& v) { for (const T& x : v) add(x); }
+  std::size_t size() const { return items.size(); }
+  std::size_t find(const T& x) const {
+    for (std::size_t i = 0; i < items.size(); ++i)
+      if (items[i] == x) return i;
+    return (std::size_t)-1;
+  }
+  bool has(const T& x) const { return find(x) != (std::size_t)-1; }
+  void add(const T& x) { if (!has(x)) items.push_back(x); }
+  bool del(const T& x) {
+    std::size_t i = find(x);
+    if (i == (std::size_t)-1) return false;
+    items.erase(items.begin() + i);
+    return true;
+  }
+  void clear() { items.clear(); }
+  const T& at(std::size_t i) const { return items[i]; }
+  // Set.keys() and Set.values() are both the elements in insertion order.
+  std::shared_ptr<std::vector<T>> values() const {
+    return std::make_shared<std::vector<T>>(items);
+  }
+};
+
 // --- JS-style value printing (console.log) ------------------------------
 //
 // console.log routes booleans, arrays, objects and class instances through
@@ -356,6 +675,38 @@ static std::string tsn_inspect(const std::shared_ptr<std::vector<T>>& a) {
     out += tsn_inspect((*a)[i]);
   }
   out += " ]";
+  return out;
+}
+
+// Map / Set printing, matching Node: `Map(2) { 'a' => 1, 'b' => 2 }`,
+// `Set(3) { 1, 2, 3 }` (empty: `Map(0) {}` / `Set(0) {}`). Keys/values/elements
+// recurse through tsn_inspect (object/class elements resolve via ADL, like arrays).
+template <class K, class V>
+static std::string tsn_inspect(const std::shared_ptr<tsn_map<K, V>>& m) {
+  std::size_t n = m ? m->entries.size() : 0;
+  std::string out = "Map(" + std::to_string(n) + ")";
+  if (n == 0) return out + " {}";
+  out += " { ";
+  for (std::size_t i = 0; i < n; ++i) {
+    if (i) out += ", ";
+    out += tsn_inspect(m->entries[i].first);
+    out += " => ";
+    out += tsn_inspect(m->entries[i].second);
+  }
+  out += " }";
+  return out;
+}
+template <class T>
+static std::string tsn_inspect(const std::shared_ptr<tsn_set<T>>& s) {
+  std::size_t n = s ? s->items.size() : 0;
+  std::string out = "Set(" + std::to_string(n) + ")";
+  if (n == 0) return out + " {}";
+  out += " { ";
+  for (std::size_t i = 0; i < n; ++i) {
+    if (i) out += ", ";
+    out += tsn_inspect(s->items[i]);
+  }
+  out += " }";
   return out;
 }
 

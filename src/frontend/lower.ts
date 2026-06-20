@@ -539,6 +539,40 @@ function lowerVarDecl(decl: ts.VariableDeclaration): Stmt {
       init: jsonParseNode(initNode, type),
     };
   }
+  // `const m: Map<K, V> = new Map()` / `const s: Set<T> = new Set(arr)` — the
+  // annotation supplies the element types when `new Map()`/`new Set()` is written
+  // without type arguments (TypeScript would infer them from the annotation).
+  if (
+    type !== undefined &&
+    typeof type === "object" &&
+    (type.kind === "map" || type.kind === "set") &&
+    ts.isNewExpression(initNode) &&
+    ts.isIdentifier(initNode.expression) &&
+    !initNode.typeArguments
+  ) {
+    const ctor = initNode.expression.text;
+    if (ctor === "Map" && type.kind === "map") {
+      if (initNode.arguments && initNode.arguments.length > 0) {
+        throw new Error(
+          "new Map(entries) is not supported (v1) — construct `new Map()` and .set() entries",
+        );
+      }
+      return {
+        kind: "let",
+        name: decl.name.text,
+        type,
+        init: { kind: "mapNew", key: type.key, value: type.value },
+      };
+    }
+    if (ctor === "Set" && type.kind === "set") {
+      return {
+        kind: "let",
+        name: decl.name.text,
+        type,
+        init: setNewNode(type.element, initNode.arguments),
+      };
+    }
+  }
   return {
     kind: "let",
     name: decl.name.text,
@@ -583,6 +617,17 @@ function lowerType(node: ts.TypeNode): Type {
     // `Array<T>`
     if (n === "Array" && node.typeArguments?.length === 1) {
       return { kind: "array", element: lowerType(node.typeArguments[0]) };
+    }
+    // `Map<K, V>` / `Set<T>` — reference-typed containers (see codegen).
+    if (n === "Map" && node.typeArguments?.length === 2) {
+      return {
+        kind: "map",
+        key: lowerType(node.typeArguments[0]),
+        value: lowerType(node.typeArguments[1]),
+      };
+    }
+    if (n === "Set" && node.typeArguments?.length === 1) {
+      return { kind: "set", element: lowerType(node.typeArguments[0]) };
     }
     // A bare identifier that isn't a known primitive/built-in is treated as a
     // class instance type (`let p: Point`). The emitter validates the class
@@ -640,13 +685,21 @@ function lowerExpr(node: ts.Expression): Expr {
     if (!ts.isIdentifier(node.expression)) {
       throw new Error("'new' requires a class name (v1)");
     }
+    const ctor = node.expression.text;
+    // `new Map<K, V>()` / `new Set<T>(...)` are builtins, not class instances.
+    if (ctor === "Map") return lowerNewMap(node);
+    if (ctor === "Set") return lowerNewSet(node);
     return {
       kind: "new",
-      className: node.expression.text,
+      className: ctor,
       args: node.arguments ? node.arguments.map(lowerExpr) : [],
     };
   }
   if (ts.isParenthesizedExpression(node)) return lowerExpr(node.expression);
+  // `e!` (non-null assertion) only narrows the *static* type (drops null/undefined)
+  // — no runtime effect — so it lowers transparently. This is what lets the common
+  // `map.get(k)!` idiom type-check (Map.get is `V | undefined`) and still lower.
+  if (ts.isNonNullExpression(node)) return lowerExpr(node.expression);
   // `e as T` — only supported as the type carrier for `JSON.parse(text) as T`
   // (JSON.parse is `any`, so the assertion supplies the value's static type). A
   // general type assertion has no representation in the typed subset.
@@ -692,6 +745,12 @@ function lowerExpr(node: ts.Expression): Expr {
   }
   // Both `obj.field` and `arr.length`; resolved by type during codegen.
   if (ts.isPropertyAccessExpression(node)) {
+    // `Math.PI` / `Math.E` / … are builtin constants, not member access on a
+    // value (`Math` is not a runtime object in the subset). A `Math.<fn>` not in
+    // call position would be a bare function reference (no first-class functions).
+    if (ts.isIdentifier(node.expression) && node.expression.text === "Math") {
+      return lowerMathConst(node.name.text);
+    }
     return {
       kind: "member",
       obj: lowerExpr(node.expression),
@@ -699,10 +758,12 @@ function lowerExpr(node: ts.Expression): Expr {
     };
   }
   if (ts.isCallExpression(node)) {
-    // `JSON.stringify(x)` / `JSON.parse(x)` are builtins, not method calls —
-    // intercept before the generic `recv.method(args)` path.
+    // `JSON.stringify(x)` / `JSON.parse(x)` and `Math.<fn>(...)` are builtins, not
+    // method calls — intercept before the generic `recv.method(args)` path.
     const json = tryLowerJsonCall(node);
     if (json) return json;
+    const math = tryLowerMathCall(node);
+    if (math) return math;
     // `recv.method(args)` -> methodCall (e.g. xs.push(v)).
     if (ts.isPropertyAccessExpression(node.expression)) {
       return {
@@ -852,4 +913,101 @@ function tryLowerJsonCall(node: ts.CallExpression): Expr | null {
     );
   }
   throw new Error(`Unsupported JSON method 'JSON.${method}' (v1)`);
+}
+
+// The `Math.<fn>(...)` functions the subset supports (all `number -> number`).
+// Most map straight to <cmath>; the JS-divergent ones (round, sign, min/max, …)
+// use a small `tsn_math_*` helper in the runtime (see emit.ts / tsn_runtime.h).
+const MATH_FUNCTIONS = new Set([
+  // unary
+  "abs", "floor", "ceil", "round", "trunc", "sign", "sqrt", "cbrt",
+  "exp", "log", "log2", "log10", "sin", "cos", "tan",
+  "asin", "acos", "atan", "sinh", "cosh", "tanh",
+  // binary
+  "pow", "atan2",
+  // variadic
+  "min", "max", "hypot",
+  // no args
+  "random",
+]);
+
+// The `Math.<name>` constants the subset supports (all `number`).
+const MATH_CONSTANTS = new Set([
+  "PI", "E", "LN2", "LN10", "LOG2E", "LOG10E", "SQRT2", "SQRT1_2",
+]);
+
+// Recognize a `Math.<fn>(...)` builtin call. Returns a `mathCall` node, or null
+// for a non-Math call (it falls through to the normal method/function lowering).
+// An unknown `Math.<fn>` is a clear error (rather than a member/method miscompile).
+function tryLowerMathCall(node: ts.CallExpression): Expr | null {
+  const callee = node.expression;
+  if (
+    !ts.isPropertyAccessExpression(callee) ||
+    !ts.isIdentifier(callee.expression) ||
+    callee.expression.text !== "Math"
+  ) {
+    return null;
+  }
+  const fn = callee.name.text;
+  if (!MATH_FUNCTIONS.has(fn)) {
+    throw new Error(`Unsupported Math function 'Math.${fn}' (v1)`);
+  }
+  return { kind: "mathCall", fn, args: node.arguments.map(lowerExpr) };
+}
+
+// Lower a `Math.<name>` constant reference to a `mathConst` node. An unknown name
+// is a clear error (a bare `Math.<fn>` reference — no first-class functions — too).
+function lowerMathConst(name: string): Expr {
+  if (!MATH_CONSTANTS.has(name)) {
+    throw new Error(
+      `Unsupported Math member 'Math.${name}' (v1) — Math methods must be called`,
+    );
+  }
+  return { kind: "mathConst", name };
+}
+
+// `new Map<K, V>()` — the subset constructs only an *empty* map (entries are
+// added via `.set`); the `new Map(entries)` iterable form needs tuples (out of
+// subset). Type arguments are required here (the annotated-target form
+// `const m: Map<K, V> = new Map()` is handled in lowerVarDecl).
+function lowerNewMap(node: ts.NewExpression): Expr {
+  const ta = node.typeArguments;
+  if (!ta || ta.length !== 2) {
+    throw new Error(
+      "new Map requires explicit type arguments (v1) — write `new Map<K, V>()`",
+    );
+  }
+  if (node.arguments && node.arguments.length > 0) {
+    throw new Error(
+      "new Map(entries) is not supported (v1) — construct `new Map<K, V>()` and .set() entries",
+    );
+  }
+  return { kind: "mapNew", key: lowerType(ta[0]), value: lowerType(ta[1]) };
+}
+
+// `new Set<T>()` / `new Set<T>(arr)`. Type arguments are required (the annotated
+// form is handled in lowerVarDecl). An optional single argument seeds the set and
+// must be a `T[]` (an array is the only iterable the subset supports).
+function lowerNewSet(node: ts.NewExpression): Expr {
+  const ta = node.typeArguments;
+  if (!ta || ta.length !== 1) {
+    throw new Error(
+      "new Set requires an explicit type argument (v1) — write `new Set<T>()`",
+    );
+  }
+  return setNewNode(lowerType(ta[0]), node.arguments);
+}
+
+// Build a `setNew` node from an element type and the constructor arguments (an
+// optional array initializer). More than one argument is rejected.
+function setNewNode(
+  element: Type,
+  args?: ts.NodeArray<ts.Expression>,
+): Expr {
+  if (args && args.length > 1) {
+    throw new Error("new Set expects at most one argument (an array) (v1)");
+  }
+  const init =
+    args && args.length === 1 ? lowerExpr(args[0]) : undefined;
+  return { kind: "setNew", element, init };
 }
