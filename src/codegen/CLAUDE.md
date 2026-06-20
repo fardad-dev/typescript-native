@@ -5,6 +5,30 @@ text**. `emit(mod): string` returns the full `.cpp`. C++ is a high-level target,
 **expression-based**: `emitExpr` returns a C++ expression string and we let `clang++` do the
 real lowering — no SSA temporaries or pointer bookkeeping here.
 
+## The runtime header (`cpp/tsn_runtime.h`)
+
+The program-**independent** C++ — `tsn_str`, the JS-semantics numeric/string/array helpers
+(`tsn_mod`, `tsn_substring`, `tsn_push`, …), and the scalar + array-template `tsn_inspect`
+overloads — lives as **real, editable C++** in [cpp/tsn_runtime.h](cpp/tsn_runtime.h), not as a
+string in `emit.ts`. Every emitted `.cpp` is just `#include "<abs>/tsn_runtime.h"` on top,
+followed by the program-**dependent** code `emit` generates (per-object-shape structs, the
+per-type `tsn_inspect` overloads that know field names, the user's functions, `main`).
+
+- `emit.ts` resolves `RUNTIME_HEADER = ${__dirname}/cpp/tsn_runtime.h` and emits it as an
+  **absolute** path, so the generated `.cpp` recompiles by hand (`clang++ -std=c++17 file.cpp`)
+  with no `-I` — keeping it self-contained.
+- `tsc` only transpiles `.ts`, so the header doesn't reach `dist` on its own;
+  [../../scripts/copy-runtime.mjs](../../scripts/copy-runtime.mjs) (wired into `npm run build`)
+  mirrors `cpp/` into `dist/codegen/cpp/`, so `${__dirname}/cpp` resolves whether `emit` runs from
+  `src` (the vitest suite imports `../src/driver`) or `dist` (the installed CLI). The published
+  package ships only `dist`, so this is also what makes the runtime available to consumers.
+- **Inspect ordering / ADL.** The header carries `tsn_inspect`'s scalar overloads + the array
+  template (decl + def); the per-struct/class overloads stay in the `.cpp` (they need field
+  names). The array template calls `tsn_inspect((*a)[i])` on a *dependent* element type, so an
+  object/class element resolves its overload by **ADL at the instantiation point** in the
+  generated code (those overloads share the global namespace with their struct/class). Editing the
+  header? Keep that contract: scalars + array template here, per-type overloads emitted there.
+
 ## Type mapping (`cppType` / `slotType`)
 
 | tsn type            | C++ type             | notes                                                  |
@@ -70,11 +94,13 @@ reps and a float argument passed from a module's top-level demotes the callee's 
   `vars` (name → `Type`), `curReturn`, `funcKey` (rep-lookup scope), `currentClass`, `indent`.
 - **Module-level state (cont.):** `globals` (name → `Type`, the entry's promoted top-level vars) +
   `globalDecls` (their namespace-scope declaration lines).
-- Output shape: `#include`s → `tsn_str` + runtime helpers (incl. `tsn_truthy` for `&&`/`||`) → inspect
-  prelude (scalars + array-template fwd decl) → class/struct forward decls → per-type inspect fwd decls
-  → object struct defs → class struct defs → array-template + per-type inspect defs → **module-level
-  global decls** → out-of-line class method/ctor defs → **dependency `init()` prototypes + defs** →
-  function prototypes → function definitions → `int main()`.
+- Output shape: `#include "cpp/tsn_runtime.h"` (the fixed runtime — `tsn_str`, helpers incl.
+  `tsn_truthy` for `&&`/`||`, and the scalar + array-template `tsn_inspect`; see *The runtime
+  header* above) → class/struct forward decls → per-type inspect fwd decls → object struct defs →
+  class struct defs → per-type inspect defs → **module-level global decls** → out-of-line class
+  method/ctor defs → **dependency `init()` prototypes + defs** → function prototypes → function
+  definitions → `int main()`. (The runtime header replaces what used to be an inlined string
+  prelude; only the program-dependent parts are generated now.)
 - **Emission order matters:** `main` and the dependency `init()`s are emitted **before** the
   function/class bodies, because emitting them populates `this.globals` (entry vars) and registers the
   synthetic `tsn_modN_init` signatures (dependency record types) that those bodies reference.

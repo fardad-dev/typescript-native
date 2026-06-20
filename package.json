@@ -30,7 +30,7 @@
     "node": ">=22"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.json && node scripts/copy-runtime.mjs",
     "tsn-compiler": "node dist/index.js",
     "bench": "node benchmark/run.mjs",
     "bench:words": "node benchmark/sort-words.mjs",

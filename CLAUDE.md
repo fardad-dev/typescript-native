@@ -69,8 +69,12 @@ src/
     nodes.ts        # internal IR node definitions (typed)
   codegen/
     emit.ts         # (3) internal IR -> C++ source text
+    cpp/
+      tsn_runtime.h # the fixed C++ runtime (tsn_str, helpers, tsn_inspect) — #included by every emitted .cpp
   backend/
     clang.ts        # (4) shell out to clang++ to compile + link the .cpp
+scripts/
+  copy-runtime.mjs  # post-build: copy src/codegen/cpp/ -> dist/codegen/cpp/ (the .h isn't transpiled by tsc)
 tests/
   e2e.test.ts       # harness: compile each case, run binary, diff stdout
   typecheck.test.ts # stage-0 checker: asserts bad programs are rejected
