@@ -341,7 +341,7 @@ function best(cmd, args) {
 }
 
 // Is a JDK available? If not, fall back to the node-vs-tsnc comparison.
-let hasJava = false;
+let hasJava;
 try {
   execFileSync("java", ["-version"], { stdio: "ignore" });
   execFileSync("javac", ["-version"], { stdio: "ignore" });

@@ -99,7 +99,8 @@ function displayType(t: RetType): string {
 
 function sameType(a: Type, b: Type): boolean {
   // Class instances are nominal: equal iff they name the same class.
-  if (isClass(a) || isClass(b)) return isClass(a) && isClass(b) && a.name === b.name;
+  if (isClass(a) || isClass(b))
+    return isClass(a) && isClass(b) && a.name === b.name;
   if (isArray(a) && isArray(b)) return sameType(a.element, b.element);
   if (isObject(a) && isObject(b)) {
     if (a.fields.length !== b.fields.length) return false;
@@ -388,7 +389,9 @@ class Emitter {
 
   // `type name` declarators for a parameter list (used in definitions).
   private declParams(funcKey: string, params: Param[]): string {
-    return params.map((p) => `${this.paramType(funcKey, p)} ${p.name}`).join(", ");
+    return params
+      .map((p) => `${this.paramType(funcKey, p)} ${p.name}`)
+      .join(", ");
   }
 
   // Register parameters as local variables. Every parameter is mutable now —
@@ -440,18 +443,29 @@ class Emitter {
   // body can reference any class. Calling cppType on field types here also lazily
   // generates any object structs the fields need (into structDefs).
   private emitClassStruct(cls: ClassDecl): string {
-    const members = cls.fields.map((f) => `  ${this.cppType(f.type)} ${f.name};`);
+    const members = cls.fields.map(
+      (f) => `  ${this.cppType(f.type)} ${f.name};`,
+    );
     const ctorDecl = `  ${cls.name}(${this.declParams(this.ctorKey(cls.name), cls.ctor.params)});`;
     const methodDecls = cls.methods.map((m) => {
       const key = this.methodKey(cls.name, m.name);
       return `  ${this.retSlotType(key, m.returnType)} ${m.name}(${this.declParams(key, m.params)});`;
     });
-    return [`struct ${cls.name} {`, ...members, ctorDecl, ...methodDecls, `};`].join("\n");
+    return [
+      `struct ${cls.name} {`,
+      ...members,
+      ctorDecl,
+      ...methodDecls,
+      `};`,
+    ].join("\n");
   }
 
   // Out-of-line constructor and method definitions for one class.
   private emitClassDefs(cls: ClassDecl): string[] {
-    return [this.emitCtorDef(cls), ...cls.methods.map((m) => this.emitMethodDef(cls, m))];
+    return [
+      this.emitCtorDef(cls),
+      ...cls.methods.map((m) => this.emitMethodDef(cls, m)),
+    ];
   }
 
   private emitCtorDef(cls: ClassDecl): string {
@@ -488,7 +502,10 @@ class Emitter {
     if (!this.currentClass) {
       throw new Error("'this' is only valid inside a method or constructor");
     }
-    return { code: "this", type: { kind: "class", name: this.currentClass.name } };
+    return {
+      code: "this",
+      type: { kind: "class", name: this.currentClass.name },
+    };
   }
   private emitReceiver(e: Expr): Value {
     return e.kind === "this" ? this.thisValue() : this.emitExpr(e);
@@ -535,7 +552,10 @@ class Emitter {
           );
         }
         fields.push({ name: s.name, type: init.type });
-        this.sigs.set(fn, { params: [], ret: { kind: "object", fields: [...fields] } });
+        this.sigs.set(fn, {
+          params: [],
+          ret: { kind: "object", fields: [...fields] },
+        });
         // Record fields are object fields (f64 for numbers), so cast an i64 init.
         this.push(`rec->${s.name} = ${this.f64SlotCode(init)};`);
       } else {
@@ -657,7 +677,10 @@ class Emitter {
       // The variable's C++ type follows its inferred number representation (a
       // safe-integer initializer that's never assigned a fraction stays i64); an
       // i64 init code widens harmlessly into a demoted (double) slot.
-      const cpp = this.slotType(init.type, this.reps.varRep(this.funcKey, stmt.name));
+      const cpp = this.slotType(
+        init.type,
+        this.reps.varRep(this.funcKey, stmt.name),
+      );
       return `${cpp} ${stmt.name} = ${init.code}`;
     }
     if (stmt.kind === "assign") {
@@ -690,7 +713,8 @@ class Emitter {
     switch (target.kind) {
       case "var": {
         // Locals shadow globals; fall back to a module-level global otherwise.
-        const type = this.vars.get(target.name) ?? this.globals.get(target.name);
+        const type =
+          this.vars.get(target.name) ?? this.globals.get(target.name);
         if (!type)
           throw new Error(
             `Cannot assign to undeclared variable '${target.name}'`,
@@ -847,13 +871,18 @@ class Emitter {
       case "bool":
         return { code: e.value ? "true" : "false", type: "boolean" };
       case "str":
-        return { code: `tsn_str(${cppStringLiteral(e.value)})`, type: "string" };
+        return {
+          code: `tsn_str(${cppStringLiteral(e.value)})`,
+          type: "string",
+        };
       case "var": {
         // A local binding shadows a same-named global, so check `vars` first.
         const local = this.vars.get(e.name);
         if (local !== undefined) {
           const rep =
-            local === "number" ? this.reps.varRep(this.funcKey, e.name) : undefined;
+            local === "number"
+              ? this.reps.varRep(this.funcKey, e.name)
+              : undefined;
           return { code: e.name, type: local, rep };
         }
         // Otherwise it may be a module-level global (a promoted top-level var),
@@ -898,7 +927,10 @@ class Emitter {
         // A reference-typed array: a shared_ptr to a heap vector (so `let b = a`
         // aliases, mutations are shared, and `===` is identity — JS semantics).
         const vec = this.vecType(arrType);
-        return { code: `std::make_shared<${vec}>(${vec}{${items}})`, type: arrType };
+        return {
+          code: `std::make_shared<${vec}>(${vec}{${items}})`,
+          type: arrType,
+        };
       }
       case "object": {
         const props = e.properties.map((p) => ({
@@ -1101,7 +1133,11 @@ class Emitter {
       if (e.op === "/") {
         // JS `/` is always float division — this is also what stops two integer
         // operands from doing C++ truncating integer division.
-        return { code: `(${asF64(l)} / ${asF64(r)})`, type: "number", rep: "f64" };
+        return {
+          code: `(${asF64(l)} / ${asF64(r)})`,
+          type: "number",
+          rep: "f64",
+        };
       }
       if (e.op === "%") {
         // Integer operands take the fast guarded integer remainder; otherwise
@@ -1241,7 +1277,9 @@ class Emitter {
           // `slice(start?, end?)` — both optional numbers; an omitted one is NaN
           // ("default") in the helper. Returns a *new* array (a fresh shared_ptr).
           if (e.args.length > 2) {
-            throw new Error(`'slice' expects 0-2 argument(s), got ${e.args.length}`);
+            throw new Error(
+              `'slice' expects 0-2 argument(s), got ${e.args.length}`,
+            );
           }
           const nums = e.args.map((a) => this.emitExpr(a));
           for (const n of nums) {
@@ -1293,7 +1331,9 @@ class Emitter {
         }
         case "join": {
           if (e.args.length > 1) {
-            throw new Error(`'join' expects 0-1 argument(s), got ${e.args.length}`);
+            throw new Error(
+              `'join' expects 0-1 argument(s), got ${e.args.length}`,
+            );
           }
           if (elem !== "string" && elem !== "number") {
             throw new Error(
@@ -1394,7 +1434,10 @@ class Emitter {
       }
       case "substring": {
         const [start, end] = numArgs(1, 2);
-        return { code: `tsn_substring(${s}, ${start}, ${end})`, type: "string" };
+        return {
+          code: `tsn_substring(${s}, ${start}, ${end})`,
+          type: "string",
+        };
       }
       case "slice": {
         const [start, end] = numArgs(1, 2);
@@ -1404,7 +1447,9 @@ class Emitter {
         // `split(sep: string, limit?: number)` -> string[]. Regex separators are
         // outside the subset (a regex literal already fails at lowering).
         if (argv.length < 1 || argv.length > 2) {
-          throw new Error(`'split' expects 1-2 argument(s), got ${argv.length}`);
+          throw new Error(
+            `'split' expects 1-2 argument(s), got ${argv.length}`,
+          );
         }
         if (argv[0].type !== "string") {
           throw new Error("'split' separator must be a string");

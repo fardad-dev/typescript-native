@@ -22,7 +22,15 @@
 // imprecision — shared with every native-int compilation strategy — is wraparound
 // past 2^63 for integer-valued numbers; `number` is otherwise f64.
 
-import { Module, Expr, Stmt, Type, RetType, Param, ClassDecl } from "../ir/nodes";
+import {
+  Module,
+  Expr,
+  Stmt,
+  Type,
+  RetType,
+  Param,
+  ClassDecl,
+} from "../ir/nodes";
 
 export type Rep = "i64" | "f64";
 
@@ -115,7 +123,12 @@ class RepAnalyzer {
         for (const m of cls.methods) {
           const scope = new Map<string, Type>();
           for (const p of m.params) scope.set(p.name, p.type);
-          this.walkAll(m.body, scope, methodSlotKey(cls.name, m.name), m.returnType);
+          this.walkAll(
+            m.body,
+            scope,
+            methodSlotKey(cls.name, m.name),
+            m.returnType,
+          );
         }
         this.currentClass = undefined;
       }

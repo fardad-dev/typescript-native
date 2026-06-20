@@ -39,6 +39,6 @@ export async function buildExecutableAsync(
     await execFileP("clang++", CLANG_ARGS(cppPath, outPath));
   } catch (err) {
     const e = err as { stderr?: string; message: string };
-    throw new Error(e.stderr?.trim() || e.message);
+    throw new Error(e.stderr?.trim() || e.message, { cause: err });
   }
 }

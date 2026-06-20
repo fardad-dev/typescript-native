@@ -23,17 +23,23 @@ describe("e2e: compile a .ts case to a native binary and run it", () => {
     .map((f) => path.basename(f, ".ts"));
 
   for (const name of names) {
-    it.concurrent(`${name}.ts prints its expected stdout`, async ({ expect }) => {
-      const input = path.join(casesDir, `${name}.ts`);
-      const expected = fs.readFileSync(path.join(casesDir, `${name}.expected`), "utf8");
-      // Unique per case, so concurrent runs never collide on the same path.
-      const out = path.join(os.tmpdir(), `tsn-${name}-${process.pid}`);
+    it.concurrent(
+      `${name}.ts prints its expected stdout`,
+      async ({ expect }) => {
+        const input = path.join(casesDir, `${name}.ts`);
+        const expected = fs.readFileSync(
+          path.join(casesDir, `${name}.expected`),
+          "utf8",
+        );
+        // Unique per case, so concurrent runs never collide on the same path.
+        const out = path.join(os.tmpdir(), `tsn-${name}-${process.pid}`);
 
-      await compileAsync({ input, output: out, emitCpp: false });
-      const { stdout } = await run(out, { encoding: "utf8" });
-      fs.rmSync(out, { force: true });
+        await compileAsync({ input, output: out, emitCpp: false });
+        const { stdout } = await run(out, { encoding: "utf8" });
+        fs.rmSync(out, { force: true });
 
-      expect(stdout).toBe(expected);
-    });
+        expect(stdout).toBe(expected);
+      },
+    );
   }
 });

@@ -21,7 +21,7 @@ export function lower(fileName: string, source: string): Module {
     fileName,
     source,
     ts.ScriptTarget.Latest,
-    /*setParentNodes*/ true
+    /*setParentNodes*/ true,
   );
   const classes: ClassDecl[] = [];
   const functions: Func[] = [];
@@ -79,8 +79,9 @@ function lowerParams(params: ts.NodeArray<ts.ParameterDeclaration>): Param[] {
 // — we don't enforce visibility yet, and they don't affect generated code.
 function hasStatic(node: ts.HasModifiers): boolean {
   return (
-    ts.getModifiers(node)?.some((m) => m.kind === ts.SyntaxKind.StaticKeyword) ??
-    false
+    ts
+      .getModifiers(node)
+      ?.some((m) => m.kind === ts.SyntaxKind.StaticKeyword) ?? false
   );
 }
 
@@ -117,7 +118,8 @@ function lowerClass(cls: ts.ClassDeclaration): ClassDecl {
       continue;
     }
     if (ts.isConstructorDeclaration(m)) {
-      if (ctor) throw new Error(`Class '${name}' has more than one constructor`);
+      if (ctor)
+        throw new Error(`Class '${name}' has more than one constructor`);
       if (!m.body) throw new Error(`Constructor of '${name}' must have a body`);
       const body: Stmt[] = [];
       for (const s of m.body.statements) lowerStatement(s, body);
@@ -133,21 +135,26 @@ function lowerClass(cls: ts.ClassDeclaration): ClassDecl {
       }
       if (!m.body) throw new Error(`Method '${m.name.text}' must have a body`);
       if (!m.type) {
-        throw new Error(`Method '${m.name.text}' needs a return type annotation`);
+        throw new Error(
+          `Method '${m.name.text}' needs a return type annotation`,
+        );
       }
       const returnType: RetType =
         m.type.kind === ts.SyntaxKind.VoidKeyword ? "void" : lowerType(m.type);
       const body: Stmt[] = [];
       for (const s of m.body.statements) lowerStatement(s, body);
-      methods.push({ name: m.name.text, params: lowerParams(m.parameters), returnType, body });
+      methods.push({
+        name: m.name.text,
+        params: lowerParams(m.parameters),
+        returnType,
+        body,
+      });
       continue;
     }
     if (ts.isGetAccessor(m) || ts.isSetAccessor(m)) {
       throw new Error(`Getters/setters are not supported yet (v1)`);
     }
-    throw new Error(
-      `Unsupported class member: ${ts.SyntaxKind[m.kind]}`,
-    );
+    throw new Error(`Unsupported class member: ${ts.SyntaxKind[m.kind]}`);
   }
 
   if (!ctor) {
@@ -167,7 +174,9 @@ function lowerFunction(fn: ts.FunctionDeclaration): Func {
   const params = lowerParams(fn.parameters);
 
   if (!fn.type) {
-    throw new Error(`Function '${fn.name.text}' needs a return type annotation`);
+    throw new Error(
+      `Function '${fn.name.text}' needs a return type annotation`,
+    );
   }
   let returnType: RetType;
   if (fn.type.kind === ts.SyntaxKind.VoidKeyword) {
@@ -294,7 +303,9 @@ function lowerAssignTarget(node: ts.Expression): Expr {
   ) {
     return lowerExpr(node);
   }
-  throw new Error("Assignment target must be a variable, array element, or object field");
+  throw new Error(
+    "Assignment target must be a variable, array element, or object field",
+  );
 }
 
 // Lower an assignment-like expression to an `assign` statement, desugaring
@@ -310,17 +321,28 @@ function lowerAssignLike(expr: ts.Expression): Stmt {
       return {
         kind: "assign",
         target,
-        value: { kind: "binary", op, left: target, right: lowerExpr(expr.right) },
+        value: {
+          kind: "binary",
+          op,
+          left: target,
+          right: lowerExpr(expr.right),
+        },
       };
     }
   }
   if (ts.isPostfixUnaryExpression(expr) || ts.isPrefixUnaryExpression(expr)) {
     const target = lowerAssignTarget(expr.operand);
-    const op: BinaryOp = expr.operator === ts.SyntaxKind.PlusPlusToken ? "+" : "-";
+    const op: BinaryOp =
+      expr.operator === ts.SyntaxKind.PlusPlusToken ? "+" : "-";
     return {
       kind: "assign",
       target,
-      value: { kind: "binary", op, left: target, right: { kind: "num", value: 1 } },
+      value: {
+        kind: "binary",
+        op,
+        left: target,
+        right: { kind: "num", value: 1 },
+      },
     };
   }
   throw new Error("Unsupported assignment expression");
@@ -357,7 +379,12 @@ function lowerVarDecl(decl: ts.VariableDeclaration): Stmt {
   }
   // No annotation -> leave type undefined; codegen infers it from the initializer.
   const type = decl.type ? lowerType(decl.type) : undefined;
-  return { kind: "let", name: decl.name.text, type, init: lowerExpr(decl.initializer) };
+  return {
+    kind: "let",
+    name: decl.name.text,
+    type,
+    init: lowerExpr(decl.initializer),
+  };
 }
 
 function lowerType(node: ts.TypeNode): Type {
@@ -374,7 +401,12 @@ function lowerType(node: ts.TypeNode): Type {
   // its C++ type (a `std::vector<...>` member or a nested struct).
   if (ts.isTypeLiteralNode(node)) {
     const fields = node.members.map((m) => {
-      if (!ts.isPropertySignature(m) || !m.name || !ts.isIdentifier(m.name) || !m.type) {
+      if (
+        !ts.isPropertySignature(m) ||
+        !m.name ||
+        !ts.isIdentifier(m.name) ||
+        !m.type
+      ) {
         throw new Error("Unsupported object type member (v1)");
       }
       return { name: m.name.text, type: lowerType(m.type) };
@@ -411,8 +443,10 @@ function lowerExpr(node: ts.Expression): Expr {
   if (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) {
     return { kind: "str", value: node.text };
   }
-  if (node.kind === ts.SyntaxKind.TrueKeyword) return { kind: "bool", value: true };
-  if (node.kind === ts.SyntaxKind.FalseKeyword) return { kind: "bool", value: false };
+  if (node.kind === ts.SyntaxKind.TrueKeyword)
+    return { kind: "bool", value: true };
+  if (node.kind === ts.SyntaxKind.FalseKeyword)
+    return { kind: "bool", value: false };
   if (node.kind === ts.SyntaxKind.ThisKeyword) return { kind: "this" };
   if (ts.isIdentifier(node)) return { kind: "var", name: node.text };
   if (ts.isNewExpression(node)) {
@@ -442,7 +476,9 @@ function lowerExpr(node: ts.Expression): Expr {
       kind: "object",
       properties: node.properties.map((p) => {
         if (!ts.isPropertyAssignment(p) || !ts.isIdentifier(p.name)) {
-          throw new Error("Only simple { name: value } object properties are supported (v1)");
+          throw new Error(
+            "Only simple { name: value } object properties are supported (v1)",
+          );
         }
         return { name: p.name.text, value: lowerExpr(p.initializer) };
       }),
@@ -457,7 +493,11 @@ function lowerExpr(node: ts.Expression): Expr {
   }
   // Both `obj.field` and `arr.length`; resolved by type during codegen.
   if (ts.isPropertyAccessExpression(node)) {
-    return { kind: "member", obj: lowerExpr(node.expression), name: node.name.text };
+    return {
+      kind: "member",
+      obj: lowerExpr(node.expression),
+      name: node.name.text,
+    };
   }
   if (ts.isCallExpression(node)) {
     // `recv.method(args)` -> methodCall (e.g. xs.push(v)).
@@ -470,7 +510,9 @@ function lowerExpr(node: ts.Expression): Expr {
       };
     }
     if (!ts.isIdentifier(node.expression)) {
-      throw new Error("Only direct calls to named functions are supported (v1)");
+      throw new Error(
+        "Only direct calls to named functions are supported (v1)",
+      );
     }
     return {
       kind: "call",

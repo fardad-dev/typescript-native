@@ -33,11 +33,7 @@ describe("type checker: rejects type-erroneous programs before codegen", () => {
       `let n: number = 5;\nn.toUpperCase();`,
       /Property 'toUpperCase' does not exist/,
     ],
-    [
-      "return type mismatch",
-      `function f(): number { return "s"; }`,
-      /TS2322/,
-    ],
+    ["return type mismatch", `function f(): number { return "s"; }`, /TS2322/],
     [
       "field access that doesn't exist",
       `let p = { x: 1 };\nconsole.log(p.y);`,

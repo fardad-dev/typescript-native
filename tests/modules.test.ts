@@ -30,7 +30,10 @@ describe("module loader: graph resolution and rejections", () => {
 
   it("merges a simple two-module program", () => {
     file("dep.ts", `export function inc(n: number): number { return n + 1; }`);
-    const entry = file("main.ts", `import { inc } from "./dep";\nconsole.log(inc(1));`);
+    const entry = file(
+      "main.ts",
+      `import { inc } from "./dep";\nconsole.log(inc(1));`,
+    );
     const mod = load(entry);
     // inc lowered from dep.ts; the log statement from main.ts.
     expect(mod.functions.map((f) => f.name)).toContain("inc");
@@ -52,9 +55,18 @@ describe("module loader: graph resolution and rejections", () => {
   });
 
   it("rejects circular imports", () => {
-    file("a.ts", `import { b } from "./b";\nexport function a(): number { return b(); }`);
-    file("b.ts", `import { a } from "./a";\nexport function b(): number { return a(); }`);
-    const entry = file("main.ts", `import { a } from "./a";\nconsole.log(a());`);
+    file(
+      "a.ts",
+      `import { b } from "./b";\nexport function a(): number { return b(); }`,
+    );
+    file(
+      "b.ts",
+      `import { a } from "./a";\nexport function b(): number { return a(); }`,
+    );
+    const entry = file(
+      "main.ts",
+      `import { a } from "./a";\nconsole.log(a());`,
+    );
     expect(() => load(entry)).toThrow(/[Cc]ircular import/);
   });
 
@@ -77,12 +89,18 @@ describe("module loader: graph resolution and rejections", () => {
   });
 
   it("rejects an unresolvable import specifier", () => {
-    const entry = file("main.ts", `import { x } from "./missing";\nconsole.log(x);`);
+    const entry = file(
+      "main.ts",
+      `import { x } from "./missing";\nconsole.log(x);`,
+    );
     expect(() => load(entry)).toThrow(/[Cc]annot resolve import/);
   });
 
   it("rejects non-relative (package) imports", () => {
-    const entry = file("main.ts", `import { readFileSync } from "fs";\nconsole.log(1);`);
+    const entry = file(
+      "main.ts",
+      `import { readFileSync } from "fs";\nconsole.log(1);`,
+    );
     expect(() => load(entry)).toThrow(/relative import/);
   });
 
@@ -94,19 +112,28 @@ describe("module loader: graph resolution and rejections", () => {
 
   it("rejects namespace imports", () => {
     file("dep.ts", `export function f(): number { return 1; }`);
-    const entry = file("main.ts", `import * as ns from "./dep";\nconsole.log(1);`);
+    const entry = file(
+      "main.ts",
+      `import * as ns from "./dep";\nconsole.log(1);`,
+    );
     expect(() => load(entry)).toThrow(/[Nn]amespace import/);
   });
 
   it("rejects import aliasing", () => {
     file("dep.ts", `export function f(): number { return 1; }`);
-    const entry = file("main.ts", `import { f as g } from "./dep";\nconsole.log(1);`);
+    const entry = file(
+      "main.ts",
+      `import { f as g } from "./dep";\nconsole.log(1);`,
+    );
     expect(() => load(entry)).toThrow(/alias/);
   });
 
   it("rejects re-export statements", () => {
     file("dep.ts", `export function f(): number { return 1; }`);
-    const entry = file("main.ts", `export { f } from "./dep";\nconsole.log(1);`);
+    const entry = file(
+      "main.ts",
+      `export { f } from "./dep";\nconsole.log(1);`,
+    );
     expect(() => load(entry)).toThrow(/[Rr]e-export|export-list/);
   });
 });

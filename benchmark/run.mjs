@@ -24,7 +24,10 @@ import * as fs from "node:fs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const root = join(here, "..");
-const tsnc = (src, out) => execFileSync("node", [join(root, "dist/index.js"), src, "-o", out], { stdio: "ignore" });
+const tsnc = (src, out) =>
+  execFileSync("node", [join(root, "dist/index.js"), src, "-o", out], {
+    stdio: "ignore",
+  });
 
 const REPEAT = 7;
 
@@ -57,7 +60,11 @@ function best(cmd, args) {
   return { ms: b, out: out.trim() };
 }
 
-console.log("== tsn-compiler vs Node: end-to-end wall-clock (best of " + REPEAT + ") ==\n");
+console.log(
+  "== tsn-compiler vs Node: end-to-end wall-clock (best of " +
+    REPEAT +
+    ") ==\n",
+);
 console.log("building compiler (npm run build)...");
 execFileSync("npm", ["run", "build"], { cwd: root, stdio: "ignore" });
 
@@ -65,7 +72,9 @@ const SIZES = [10_000, 30_000, 100_000, 300_000, 1_000_000, 2_000_000];
 const tmp = join(root, "benchmark", ".sweep");
 fs.mkdirSync(tmp, { recursive: true });
 
-console.log("\n  workload            node app.ts     tsnc bin      speedup   regime");
+console.log(
+  "\n  workload            node app.ts     tsnc bin      speedup   regime",
+);
 console.log("  " + "-".repeat(72));
 let headline = 0;
 for (const limit of SIZES) {
@@ -77,11 +86,18 @@ for (const limit of SIZES) {
   const n = best("node", [src]);
   const t = best(bin, []);
   if (n.out !== t.out) {
-    console.log(`  primes<${limit}: OUTPUT MISMATCH node=${n.out} tsnc=${t.out}`);
+    console.log(
+      `  primes<${limit}: OUTPUT MISMATCH node=${n.out} tsnc=${t.out}`,
+    );
     process.exit(1);
   }
   const x = n.ms / t.ms;
-  const regime = x >= 10 ? "startup-bound  ★ 10x+" : x >= 2 ? "transition" : "compute-bound (V8 JIT warm)";
+  const regime =
+    x >= 10
+      ? "startup-bound  ★ 10x+"
+      : x >= 2
+        ? "transition"
+        : "compute-bound (V8 JIT warm)";
   const label = `primes < ${limit.toLocaleString("en-US")}`;
   console.log(
     `  ${label.padEnd(20)}${(n.ms.toFixed(1) + "ms").padStart(10)}${(t.ms.toFixed(1) + "ms").padStart(13)}${(x.toFixed(2) + "x").padStart(11)}   ${regime}`,

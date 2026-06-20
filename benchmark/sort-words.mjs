@@ -41,7 +41,10 @@ import * as fs from "node:fs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const root = join(here, "..");
-const tsnc = (src, out) => execFileSync("node", [join(root, "dist/index.js"), src, "-o", out], { stdio: "ignore" });
+const tsnc = (src, out) =>
+  execFileSync("node", [join(root, "dist/index.js"), src, "-o", out], {
+    stdio: "ignore",
+  });
 
 const REPEAT = 7;
 
@@ -63,13 +66,17 @@ for good or for evil, in the superlative degree of comparison only.`;
 // than just compare) strings, which is where the ref-counted representation
 // earns its keep; on an artificially de-duplicated uniform pool the sort is
 // comparison-bound and the representation makes no difference.
-const VOCAB = PARAGRAPH.toLowerCase().split(/[^a-z]+/).filter((w) => w.length > 0);
+const VOCAB = PARAGRAPH.toLowerCase()
+  .split(/[^a-z]+/)
+  .filter((w) => w.length > 0);
 
 // The program emits only the (small) vocabulary as a literal; it then builds the
 // `size`-word array at run time with a MINSTD PRNG and insertion-sorts it. Stays
 // inside the tsnc subset: string[], push, indexing/assignment, .length, `%`,
 // lexicographic `<`, while.
-const program = (size) => `let vocab: string[] = [${VOCAB.map((w) => JSON.stringify(w)).join(", ")}];
+const program = (
+  size,
+) => `let vocab: string[] = [${VOCAB.map((w) => JSON.stringify(w)).join(", ")}];
 let vlen: number = vocab.length;
 let words: string[] = [];
 let seed: number = 987654321;
@@ -114,8 +121,18 @@ function best(cmd, args) {
   return { ms: b, out: out.trim() };
 }
 
-console.log("== tsn-compiler vs Node: sort a paragraph's words (best of " + REPEAT + ") ==\n");
-console.log("word pool: " + VOCAB.length + " words (" + new Set(VOCAB).size + " distinct) at natural frequency; sampled in-language (MINSTD)");
+console.log(
+  "== tsn-compiler vs Node: sort a paragraph's words (best of " +
+    REPEAT +
+    ") ==\n",
+);
+console.log(
+  "word pool: " +
+    VOCAB.length +
+    " words (" +
+    new Set(VOCAB).size +
+    " distinct) at natural frequency; sampled in-language (MINSTD)",
+);
 console.log("building compiler (npm run build)...");
 execFileSync("npm", ["run", "build"], { cwd: root, stdio: "ignore" });
 
@@ -123,7 +140,9 @@ const SIZES = [250, 1_000, 4_000, 12_000, 24_000];
 const tmp = join(root, "benchmark", ".sweep-words");
 fs.mkdirSync(tmp, { recursive: true });
 
-console.log("\n  workload            node app.ts     tsnc bin      speedup   regime");
+console.log(
+  "\n  workload            node app.ts     tsnc bin      speedup   regime",
+);
 console.log("  " + "-".repeat(72));
 let headline = 0;
 for (const size of SIZES) {
@@ -135,11 +154,18 @@ for (const size of SIZES) {
   const n = best("node", [src]);
   const t = best(bin, []);
   if (n.out !== t.out) {
-    console.log(`  sort<${size}>: OUTPUT MISMATCH\n--- node ---\n${n.out}\n--- tsnc ---\n${t.out}`);
+    console.log(
+      `  sort<${size}>: OUTPUT MISMATCH\n--- node ---\n${n.out}\n--- tsnc ---\n${t.out}`,
+    );
     process.exit(1);
   }
   const x = n.ms / t.ms;
-  const regime = x >= 10 ? "startup-bound  ★ 10x+" : x >= 2 ? "transition" : "compute-bound (V8 JIT warm)";
+  const regime =
+    x >= 10
+      ? "startup-bound  ★ 10x+"
+      : x >= 2
+        ? "transition"
+        : "compute-bound (V8 JIT warm)";
   const label = `sort ${size.toLocaleString("en-US")} words`;
   console.log(
     `  ${label.padEnd(20)}${(n.ms.toFixed(1) + "ms").padStart(10)}${(t.ms.toFixed(1) + "ms").padStart(13)}${(x.toFixed(2) + "x").padStart(11)}   ${regime}`,

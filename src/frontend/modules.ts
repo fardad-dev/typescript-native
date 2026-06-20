@@ -62,7 +62,9 @@ function resolveImport(fromFile: string, spec: string): string {
 // module's declarations are merged in.
 function importDependency(node: ts.ImportDeclaration, file: string): string {
   if (!ts.isStringLiteral(node.moduleSpecifier)) {
-    throw new Error(`Import specifier must be a string literal in '${path.basename(file)}'`);
+    throw new Error(
+      `Import specifier must be a string literal in '${path.basename(file)}'`,
+    );
   }
   const spec = node.moduleSpecifier.text;
   const clause = node.importClause;
@@ -141,7 +143,8 @@ function importBindings(file: string, source: string): Binding[] {
       file,
       (stmt.moduleSpecifier as ts.StringLiteral).text,
     );
-    for (const el of nb.elements) bindings.push({ local: el.name.text, depFile });
+    for (const el of nb.elements)
+      bindings.push({ local: el.name.text, depFile });
   }
   return bindings;
 }
@@ -155,7 +158,8 @@ function globalSymbols(mod: Module, isEntry: boolean): string[] {
   const names: string[] = [];
   for (const f of mod.functions) names.push(f.name);
   for (const c of mod.classes) names.push(c.name);
-  if (isEntry) for (const s of mod.main) if (s.kind === "let") names.push(s.name);
+  if (isEntry)
+    for (const s of mod.main) if (s.kind === "let") names.push(s.name);
   return names;
 }
 
@@ -172,13 +176,51 @@ function mangle(moduleIndex: number, name: string): string {
 // words like `class`/`return` can't reach here — they're already syntax errors.)
 const RESERVED = new Set([
   "main",
-  "int", "char", "short", "long", "unsigned", "signed", "float", "double",
-  "void", "bool", "wchar_t", "struct", "union", "enum", "class",
-  "template", "typename", "namespace", "using", "operator", "friend",
-  "virtual", "inline", "explicit", "mutable", "volatile", "register",
-  "static", "extern", "const", "constexpr", "goto", "sizeof", "typedef",
-  "nullptr", "and", "or", "not", "xor", "compl", "bitand", "bitor",
-  "std", "NULL", "EOF",
+  "int",
+  "char",
+  "short",
+  "long",
+  "unsigned",
+  "signed",
+  "float",
+  "double",
+  "void",
+  "bool",
+  "wchar_t",
+  "struct",
+  "union",
+  "enum",
+  "class",
+  "template",
+  "typename",
+  "namespace",
+  "using",
+  "operator",
+  "friend",
+  "virtual",
+  "inline",
+  "explicit",
+  "mutable",
+  "volatile",
+  "register",
+  "static",
+  "extern",
+  "const",
+  "constexpr",
+  "goto",
+  "sizeof",
+  "typedef",
+  "nullptr",
+  "and",
+  "or",
+  "not",
+  "xor",
+  "compl",
+  "bitand",
+  "bitor",
+  "std",
+  "NULL",
+  "EOF",
 ]);
 
 // The name of a dependency module's memoized init function.
@@ -244,7 +286,10 @@ class Renamer {
     c.name = this.symName(c.name);
     for (const fld of c.fields) this.type(fld.type);
     for (const p of c.ctor.params) this.type(p.type);
-    c.ctor.body = this.body(c.ctor.body, new Set(c.ctor.params.map((p) => p.name)));
+    c.ctor.body = this.body(
+      c.ctor.body,
+      new Set(c.ctor.params.map((p) => p.name)),
+    );
     for (const m of c.methods) {
       for (const p of m.params) this.type(p.type);
       if (m.returnType !== "void") this.type(m.returnType);

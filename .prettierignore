@@ -1,0 +1,16 @@
+# Build output / deps
+dist/
+node_modules/
+package-lock.json
+
+# C++ runtime header — not JS/TS, hand-maintained
+src/codegen/cpp/
+
+# Compiler input fixtures and sample programs — kept as authored
+tests/cases/
+examples/
+
+# Markdown docs (CLAUDE.md / README) are hand-aligned — Prettier reflows
+# wide tables and rewrites emphasis markers, so leave them as authored.
+*.md
+
