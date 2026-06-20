@@ -72,7 +72,10 @@ A multi-file program is assembled from per-file `lower` results by `loadProgram`
 
 ## Internal helpers (one concern each)
 
-- `lowerFunction(fn)` — name, typed params, return type (incl. `void`), body statements.
+- `lowerFunction(fn)` — name, typed params, return type (incl. `void`), body statements, and the
+  `async` flag (`hasAsync`). An `async` function's annotated `Promise<...>` return type lowers via
+  `lowerType` to a promise type (codegen makes it a coroutine); `await` inside lowers to an `await`
+  node. Same for async **methods** in `lowerClass`.
 - `lowerClass(cls)` — fields (typed, no initializers), one constructor, methods. Rejects
   inheritance, `static`, accessors, parameter properties, field initializers, and a missing
   constructor; **ignores** access modifiers (public/private/…). Bodies lower via `lowerStatement`.
@@ -87,8 +90,8 @@ A multi-file program is assembled from per-file `lower` results by `loadProgram`
   the `const x: T = JSON.parse(text)` idiom: when annotated and the initializer is a `JSON.parse`
   call, the annotation supplies the parse target type (→ a `jsonParse` node).
 - `lowerType(node)` — TS `TypeNode` → IR `Type` (keywords, `T[]`, `Array<T>`, `Map<K, V>` / `Set<T>`,
-  object type literals; a **bare identifier** that isn't a known primitive/built-in → a `class`
-  instance type).
+  `Promise<T>` / `Promise<void>` → a promise type, object type literals; a **bare identifier** that
+  isn't a known primitive/built-in → a `class` instance type).
 - `lowerExpr(node)` — TS `Expression` → IR `Expr` (literals, identifiers, binary, ternary
   (`cond ? a : b`), unary, array/object literals, indexing, member access, calls, `new C(...)`,
   `this`, and the **non-null assertion `e!`** — lowered transparently as `lowerExpr(e)`, since it
@@ -97,9 +100,12 @@ A multi-file program is assembled from per-file `lower` results by `loadProgram`
   no IR node of its own; the head anchors the chain to `string`. Also recognizes the `JSON.*`
   builtins (`tryLowerJsonCall`) and the `JSON.parse(text) as T` assertion (the one `as`-expression
   form the subset accepts — a general type assertion is rejected), the `Math.*` builtins
-  (`tryLowerMathCall` / `lowerMathConst`, intercepted before the generic method/member path), and
+  (`tryLowerMathCall` / `lowerMathConst`, intercepted before the generic method/member path),
   `new Map<K, V>()` / `new Set<T>(arr?)` (`lowerNewMap` / `lowerNewSet`, intercepted before the
-  generic `new C(...)` path).
+  generic `new C(...)` path), the `Promise.*` statics (`tryLowerPromiseCall` — `Promise.resolve` /
+  `Promise.all`; reject/race/etc. are clean errors), and **`await e`** (→ an `await` node — kept
+  even in statement position, `await f();`, since the suspension matters). `new Promise(executor)`
+  is a clean `tsnc:` error (needs closures).
 - `lowerBinaryOp(kind)` — operator token → `BinaryOp`.
 - `isConsoleLog(expr)` — recognizes the `console.log` callee.
 - `tryLowerJsonCall(node)` / `isJsonParseCall(node)` / `jsonParseNode(call, type)` — recognize and

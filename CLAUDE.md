@@ -50,7 +50,7 @@ which makes heap-backed values like strings and arrays straightforward.)
 | ------------------- | -------------------------------------------------------------- |
 | Compiler language   | **TypeScript**, run on Node (>= 22)                            |
 | Front-end (parsing) | **Official `typescript` package** — reuse its lexer/parser     |
-| Backend             | **Emit C++ source**, compile with **`clang++ -std=c++17 -O3`** |
+| Backend             | **Emit C++ source**, compile with **`clang++ -std=c++20 -O3`** |
 | Target              | native binary for this host (Apple Silicon / arm64 macOS)      |
 | CLI                 | **commander**                                                  |
 | Tests               | **vitest** (end-to-end: compile → run → diff stdout)           |
@@ -105,7 +105,7 @@ npm test            # run the e2e suite once (vitest run)
 npm run test:watch  # re-run on change — the TDD red->green loop
 ```
 
-The suite (currently **104 e2e cases** + a stage-0 type-checker test file + a module-loader test
+The suite (currently **113 e2e cases** + a stage-0 type-checker test file + a module-loader test
 file, all green) auto-discovers every `tests/cases/*.ts`, compiles it to a real native binary,
 runs it, and diffs stdout against the matching `.expected` file. **Every feature gets a
 `tests/cases/*.ts` + `.expected` pair**, ideally written first (red), then implemented to green.
@@ -220,6 +220,25 @@ Implemented and tested end-to-end:
   value** — for arrays/objects/instances that's a `shared_ptr` copy (a refcount bump) that aliases
   the caller's value, so a callee mutation is visible to the caller (JS reference semantics);
   returns likewise hand back the shared reference.
+- **Async / await:** **`async` functions and methods**, **`await`**, the **`Promise<T>`** type
+  (a first-class value — storable, passable, returnable; `Promise<void>` too), and the static
+  builtins **`Promise.resolve(x)`** and **`Promise.all(xs)`**. This is a **faithful event-loop**
+  implementation, **not** synchronous erasure: an `async` function compiles to a **C++20
+  coroutine** returning a real promise, `await` **suspends** and schedules its continuation on a
+  **microtask queue**, and `main()` drains that queue after the synchronous top-level. There are
+  no timers/IO in the subset, so the microtask queue *is* the whole event loop (no macrotasks;
+  every promise settles via synchronous computation, so the drain terminates). Ordering matches
+  Node/V8 **byte-for-byte** — including the one-tick deferral of code after an `await` (verified
+  against Node in the e2e cases). **Rejection** rides the subset's string-only exception model: a
+  `throw` inside an async function rejects its promise; `await`ing a rejected promise re-throws
+  the string (caught by an ordinary `try`/`catch`, with `finally` still running). No closures are
+  needed — the only continuations are internal coroutine handles, and `.then`/`new Promise(executor)`
+  aren't in the subset. **Subset divergence:** `await` may not appear inside a non-boolean `&&`/`||`
+  operand or `Array.fill`'s index args (those lower to a C++ lambda body, where `co_await` can't go)
+  — assign the awaited value to a variable first (a clean `tsnc:` error). **Deferred** (clean
+  `tsnc:` errors): `new Promise(executor)` and `Promise.reject`/`race`/`any`/`allSettled` (need
+  closures / a richer model), top-level `await` (would need `main` to be a coroutine), and
+  `for await` (no async iterables).
 - **Classes:** `class C { f: T; constructor(...) {…}; method(...): R {…} }`, `new C(...)`,
   `this.field` / `this.method()` (read + write), instances in variables / params / returns / arrays.
   Instances are **reference types** (`new` is shared; `let b = a` aliases, so a mutation through one
@@ -267,6 +286,7 @@ tsn types map onto C++ types (see [src/codegen/CLAUDE.md](src/codegen/CLAUDE.md)
 | class `C` | `std::shared_ptr<C>`    | **reference** type: `new C()` is heap + ref-counted; copy/assign aliases (shared mutation, identity via `==`); `struct C { fields; ctor; methods; }` |
 | `Map<K, V>` | `std::shared_ptr<tsn_map<K, V>>` | **reference** type: insertion-ordered `tsn_map` (runtime), shared on copy/assign; methods via `->`; `.size` → `->size()` (i64). Keys/values use the f64 rep |
 | `Set<T>` | `std::shared_ptr<tsn_set<T>>` | **reference** type: insertion-ordered `tsn_set`; iterable by `for…of`; methods via `->`; `.size` (i64) |
+| `Promise<T>` | `tsn_promise<T>` (a C++20 coroutine type) | **reference** type: a handle holding a `shared_ptr` to shared promise state. An `async` function returns one (its body is a coroutine using `co_return`/`co_await`); `await` is `co_await`. `Promise<void>` → `tsn_promise<tsn_unit>`. Resolved numbers use the f64 rep |
 
 - **`number` is f64, but integer-valued numbers use a 64-bit integer representation.** A
   pre-pass ([src/codegen/repr.ts](src/codegen/repr.ts)) infers, per variable / parameter / return,
@@ -331,7 +351,7 @@ Not yet supported:
 | Literal / enum       | `"a" \| "b"`, `enum E {}`     | No literal types or enums.                            |
 | Intersection         | `A & B`                       | No type composition.                                  |
 | Function type        | `(x: number) => number`       | No first-class function values / closures.            |
-| Generic / type param | `<T>(x: T) => T`, `Promise<T>` | Only built-in `Array<T>` / `Map<K, V>` / `Set<T>` are special-cased; user generics aren't. |
+| Generic / type param | `<T>(x: T) => T`, `Box<T>`     | Only built-in `Array<T>` / `Map<K, V>` / `Set<T>` / `Promise<T>` are special-cased; user generics aren't. |
 | `null` / `undefined` | `string \| null`              | No nullable types; no optional (`x?:`) fields/params. |
 
 ## Conventions
@@ -347,7 +367,10 @@ Not yet supported:
 ### Verified environment (2026-06-19, this machine)
 
 - Apple Silicon (`arm64`), macOS (Darwin 24.6).
-- Apple **clang++ 17.0.0** at `/usr/bin/clang++`; we compile with `-std=c++17`.
+- Apple **clang++ 17.0.0** at `/usr/bin/clang++`; we compile with `-std=c++20` (was `-std=c++17`;
+  bumped for coroutines, which back async/await — clang 17 supports them with no extra flag). A
+  program that uses async therefore needs `-std=c++20` to recompile by hand (`clang++ -std=c++20
+  file.cpp`); a non-async program still builds with the default standard.
 - `node` v22, `tsc` present.
 
 A minimal generated program (the shape codegen produces) — computes 20+22, prints 42:
@@ -624,6 +647,34 @@ pair** (red → green).
         iterates a Set directly (a Map iterates entries = tuples → clean error; use `.keys()`/
         `.values()`, which return arrays). Deferred (clean `tsnc:` errors): `forEach` (no closures),
         `entries`/`for…of`-over-Map (no tuples), `JSON.stringify` of a Map/Set, `new Map(entries)`.
+- [x] **Async / await (faithful event loop)** — `async` functions/methods, `await`, the `Promise<T>`
+      type (a first-class value, incl. `Promise<void>`), and `Promise.resolve`/`Promise.all`. The
+      design decision was **faithful vs. synchronous-erasure**, and this is the **faithful** one: an
+      `async` function compiles to a **C++20 coroutine** returning a real `tsn_promise<T>` (`return`
+      → `co_return`, `await` → `co_await`), `await` **suspends** and schedules its continuation on a
+      **microtask queue**, and `main()` drains that queue after the synchronous top-level. The key
+      realization that made it tractable *without* closures: C++20 coroutines provide the suspension
+      natively, the subset has no timers/IO (so the microtask queue is the *entire* event loop — no
+      macrotasks, and the drain provably terminates since every promise settles synchronously), and
+      the subset exposes no `.then`/`new Promise(executor)` (so the only continuations are internal
+      coroutine handles, never user closures). Ordering matches Node/V8 **byte-for-byte** — verified
+      against `node` in the e2e cases — including the famous one-tick deferral (`await_ready` is
+      always false; `initial_suspend`/`final_suspend` are `suspend_never`; settling a promise
+      schedules its waiters as microtasks). **Rejection** reuses the string-only `throw` model:
+      `unhandled_exception` rejects the promise, `await_resume` re-throws the `tsn_str` (caught by an
+      ordinary `try`/`catch`, `finally` still runs via the RAII guard — works across a `co_await`).
+      Threaded across all the usual files: a new `Type` (`{ kind: "promise"; value? }`), three `Expr`
+      nodes (`await`, `promiseResolve`, `promiseAll`), an `async` flag on `Func`/`Method`, plus
+      `repr.ts` (awaited/promise values are f64), the module `Renamer`, and the runtime
+      ([src/codegen/cpp/tsn_runtime.h](src/codegen/cpp/tsn_runtime.h): the microtask queue,
+      `tsn_promise`/`tsn_promise_state`, `tsn_unit`, `tsn_resolve`, `tsn_all`, and a promise
+      `tsn_inspect`). The backend bumped `-std=c++17` → `-std=c++20`. Non-async programs are
+      byte-identical (the microtask drain is gated on a module actually using async). **Subset
+      divergence:** `await` can't appear inside a non-boolean `&&`/`||` operand or `Array.fill`'s index
+      args (they lower to a C++ lambda body, where `co_await` is illegal) — a clean `tsnc:` error asks
+      you to bind the awaited value first. **Deferred** (clean `tsnc:` errors): `new Promise(executor)`,
+      `Promise.reject`/`race`/`any`/`allSettled` (closures / richer model), top-level `await` (`main`
+      isn't a coroutine), and `for await` (no async iterables).
 
 ### todo
 
@@ -640,8 +691,9 @@ ships with a `tests/cases/*.ts` + `.expected` pair** (red → green), except pro
 **Control flow** — the statement-level control flow is now complete (`if`/`else`, `while`,
 `do…while`, C-style `for`, `for…of`/`for…in`, `switch`, `break`/`continue` + labeled loops,
 `try`/`catch`/`finally`/`throw`; see _Done_). Still open at the statement level: only the rarely
-needed **`for await`** and **labeling a non-loop** (both currently clean `tsnc:` errors), which
-wait on async and a block/labeled-block representation respectively.
+needed **`for await`** (needs async iterables / `Symbol.asyncIterator` — `await`/`async` themselves
+shipped, see _Done_) and **labeling a non-loop** (a block/labeled-block representation) — both
+currently clean `tsnc:` errors.
 
 **Builtins / stdlib** — `Math.*`, `Map`/`Set`, and broader (non-callback) string/array methods are
 done (see _Done_). Still open:
@@ -672,7 +724,9 @@ keystone** — a tagged representation that unlocks most of the rest.
 - [ ] **Closures + first-class functions** — arrow functions / function expressions, function-typed
       values (`(x: number) => number`), default/rest params, and the capture machinery. (`import`/
       `export` modules shipped — see _Done_; a module variable is already usable inside that module's
-      function bodies, via the module record.)
+      function bodies, via the module record. **Async/await also shipped without this** — the faithful
+      event loop uses C++20 coroutine handles, not user closures — but closures are what unblock the
+      callback array methods, `Map`/`Set.forEach`, `new Promise(executor)`, and `Promise.reject`/`race`.)
 - [ ] **Destructuring + spread/rest** — array/object binding patterns in `let` and params, and spread
       in array literals and calls (all currently rejected: only simple identifier bindings,
       [src/frontend/lower.ts](src/frontend/lower.ts)).

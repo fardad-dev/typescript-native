@@ -16,6 +16,9 @@ is added or changed.
     `Set<T>`. Codegen compiles **all** of these composite shapes (array, object, class, map, set) to
     `std::shared_ptr<…>` reference types — the `Type` union doesn't encode value-vs-reference; that's
     a codegen decision.
+  - `{ kind: "promise"; value?: Type }` — `Promise<T>` (the result type of an `async` function and a
+    first-class value); `value` absent = `Promise<void>`. A reference type too (codegen → the C++20
+    coroutine type `tsn_promise<…>`); resolved numbers use the f64 rep.
 - **`BinaryOp`** — `"+" | "-" | "*" | "/" | "%"`.
 - **`Expr`** (discriminated union) — `num`, `bool`, `str`, `var`, `binary`, `ternary`
   (`cond ? whenTrue : whenFalse`; branches share a type = the result type), `unary`, `array`,
@@ -24,7 +27,9 @@ is added or changed.
   (`{ text; type }` — the parse target type, since `JSON.parse` is `any` and the subset needs a
   concrete type; carried from a `JSON.parse(text) as T` assertion or an annotated target),
   `mathCall` (`{ fn; args }` — a `Math.<fn>(...)` builtin) / `mathConst` (`{ name }` — `Math.PI`, …),
-  and `mapNew` (`{ key; value }`) / `setNew` (`{ element; init? }` — `new Set<T>(arr?)`).
+  `mapNew` (`{ key; value }`) / `setNew` (`{ element; init? }` — `new Set<T>(arr?)`), and the async
+  trio `await` (`{ expr }` — `co_await`), `promiseResolve` (`{ arg }` — `Promise.resolve`), and
+  `promiseAll` (`{ arg }` — `Promise.all`).
 - **`Stmt`** — `let`, `log`, `return`, `exprStmt` (a bare expression evaluated for effect),
   `assign`, and the control-flow statements: `if`, `while`, `for`, `doWhile`, `forOf`
   (`{ name; iterable; body }`), `forIn` (`{ name; target; body }`), `switch` (`{ disc; cases }`
@@ -33,9 +38,13 @@ is added or changed.
   string), and `try` (`{ block; catchName?; catchBody?; finallyBody? }`). `switch` + labeled
   break/continue are lowered to `goto`s in codegen, not modeled with a value table.
 - **`RetType`** — `Type | "void"` (functions may return nothing; values never have `void` type).
-- **`Param`**, **`Func`** (`name`, `params`, `returnType`, `body`).
-- **`Method`** (a `Func` minus the implicit receiver) and **`ClassDecl`** (`name`, `fields`,
-  `ctor: { params; body }`, `methods`). One constructor; inheritance/static/accessors not modeled.
+  An `async` function's `returnType` is a `promise` `Type` (`Promise<void>` is a promise with no
+  `value` — not `"void"`).
+- **`Param`**, **`Func`** (`name`, `params`, `returnType`, `body`, `async`). `async: true` ⇒ codegen
+  emits a coroutine (`co_return`/`co_await`).
+- **`Method`** (a `Func` minus the implicit receiver — also carries `async`) and **`ClassDecl`**
+  (`name`, `fields`, `ctor: { params; body }`, `methods`). One constructor; inheritance/static/
+  accessors not modeled.
 - **`Module`** — `{ classes: ClassDecl[]; functions: Func[]; main: Stmt[] }`. `main` is the
   top-level program body → C++ `main()`.
 
@@ -49,8 +58,9 @@ is added or changed.
 - `member` is intentionally generic (`{ obj, name }`); codegen resolves it to an array/string
   `length`, a Map/Set `size`, an object field load, or a class field load based on the value's type.
   Likewise `methodCall` dispatches on the receiver type (string/array/map/set helper vs instance method).
-- **Arrays, objects, class instances, and Maps/Sets are all *reference* types** in codegen (each a
-  `std::shared_ptr<…>`): aliasing, shared mutation, mutable params, and identity `===`/`!==`. `this`
+- **Arrays, objects, class instances, Maps/Sets, and Promises are all *reference* types** in codegen
+  (each holds a `std::shared_ptr<…>`): aliasing, shared mutation, mutable params, identity `===`/`!==`.
+  (A `promise` is a `tsn_promise<…>` handle wrapping a `shared_ptr` to its state.) `this`
   is only valid as `this.field` / `this.method()` (bare `this` as a value isn't modeled yet). The
   `class` `Type` carries just the name; the layout/methods live in the `ClassDecl` (looked up by
   name in codegen).

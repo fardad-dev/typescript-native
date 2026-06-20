@@ -10,7 +10,10 @@ real lowering — no SSA temporaries or pointer bookkeeping here.
 The program-**independent** C++ — `tsn_str`, the JS-semantics numeric/string/array helpers
 (`tsn_mod`, `tsn_substring`, `tsn_push`, `tsn_str_includes`, `tsn_trim`, `tsn_array_reverse`, …),
 the `tsn_math_*` helpers (where Math diverges from `<cmath>`), the `tsn_map`/`tsn_set` container
-templates, the scalar + array/map/set-template `tsn_inspect` overloads, and the JSON runtime
+templates, the **async runtime** (the microtask queue `tsn_microtask_queue`/`tsn_enqueue_microtask`/
+`tsn_run_microtasks`, `tsn_unit`, `tsn_promise`/`tsn_promise_state`, and the `tsn_resolve`/`tsn_all`
+helpers — see *Async / await* below), the scalar + array/map/set-template `tsn_inspect` overloads
+(incl. a `tsn_promise` one), and the JSON runtime
 (`tsn_json` + `tsn_json_parse`, the `tsn_json_as_*` accessors, and the scalar +
 array-template `tsn_json_stringify`) — lives as **real, editable C++** in
 [cpp/tsn_runtime.h](cpp/tsn_runtime.h), not as a string in `emit.ts`. Every emitted `.cpp` is just
@@ -45,6 +48,7 @@ field names, the user's functions, `main`).
 | class `C`           | `std::shared_ptr<C>` | **reference** type: `struct C { fields; ctor; methods; }`, instance is a shared_ptr — `new` → `make_shared`, `.field`/`.method()` via `->`. See *Classes* below |
 | `Map<K, V>`         | `std::shared_ptr<tsn_map<Kc, Vc>>` | **reference** type (`mapPointee`): an insertion-ordered `tsn_map` (runtime). `new Map<K,V>()` → `make_shared`; methods (`set`/`get`/`has`/`del`/`clear`/`keys`/`values`) via `->`; `.size` like `.length` (i64). Keys/values use the f64 rep. See *Math / Map / Set* below |
 | `Set<T>`            | `std::shared_ptr<tsn_set<Tc>>` | **reference** type (`setPointee`): an insertion-ordered `tsn_set`. `new Set<T>(arr?)` → `make_shared` (the array seeds it); `add`/`has`/`del`/`clear`/`values` via `->`; iterable by `for…of`; `.size` (i64) |
+| `Promise<T>`        | `tsn_promise<Tc>` (C++20 coroutine type) | **reference** type: a handle wrapping a `shared_ptr` to promise state. An `async` function's declared return type — its body is a coroutine (`co_return`/`co_await`). `Promise<void>` → `tsn_promise<tsn_unit>`. Resolved numbers use the f64 rep. See *Async / await* below |
 
 Arrays, objects and class instances are now **all reference types** (`std::shared_ptr<…>`), so JS
 semantics hold uniformly: copy/assign aliases, mutation through one alias is visible through the
@@ -319,6 +323,46 @@ Beyond `if`/`while`/C-style `for`, the emitter lowers JS's remaining statement-l
   no trailing `return`, but clang's reachability analysis follows the `goto` dispatch and is
   satisfied. (Clang does emit a harmless `-Wparentheses-equality` on the fully-parenthesized
   `(_sw == test)` dispatch — a warning, not an error, and the same style the rest of codegen uses.)
+
+## Async / await (faithful event loop)
+
+`async`/`await` is a **faithful event-loop** implementation (not synchronous erasure), built on
+**C++20 coroutines** + a **microtask queue** — no closures needed, because the only continuations
+are internal coroutine handles. Ordering matches Node/V8 byte-for-byte (verified in the e2e cases).
+
+- **Async function → coroutine.** `emitFunction`/`emitMethodDef` set `curAsync = fn.async`. The
+  declared return type is the promise type, so `retSlotType`→`cppType` gives `tsn_promise<…>` (the
+  coroutine return type, which carries a `promise_type`). A `return` becomes `emitAsyncReturn` →
+  `co_return <value>` against the promise's **resolved** type (curReturn is `Promise<T>`, so the
+  value is checked against `T`, not the promise); numbers store in the f64 rep. Returning a
+  `Promise<T>` from a `Promise<T>` function **adopts** it (`co_return co_await …`, JS flattening).
+  A **void** async coroutine (`Promise<void>`) gets a trailing `co_return tsn_unit{};`
+  (`emitAsyncVoidTail`) — both to make it a coroutine when the body has no other `co_return` and to
+  satisfy the fall-off-the-end path.
+- **`await` → `co_await`** (`emitAwait`). On a `Promise<T>` it's `co_await (p)` yielding `T`
+  (f64 for numbers); on a non-promise it wraps in `tsn_resolve(v)` so the one-tick deferral still
+  happens (JS `await 5`). Rejected outside an async function (incl. **top-level await** — `main`
+  isn't a coroutine). A void-promise await is statement-only (`emitStmt`'s `exprStmt` routes an
+  `await` node through `emitAwait`); used as a value it's a clean error.
+- **`Promise.resolve` / `Promise.all`** (`promiseResolve` / `promiseAll` nodes) → `tsn_resolve(v)`
+  (identity if `v` is already a promise) / `tsn_all(ps)` (a runtime coroutine that awaits each input
+  in order → a `T[]`). `Promise.reject`/`race`/`any`/`allSettled` and `new Promise(executor)` are
+  clean `tsnc:` errors (lowering).
+- **The event loop.** `emitMain` appends one `tsn_run_microtasks();` after the synchronous top-level
+  — **gated on `this.usesAsync`** (any function/method is async), so a non-async program's `main()`
+  is byte-identical to the pre-async output. No timers/IO ⇒ the microtask queue is the entire loop.
+- **Runtime** ([cpp/tsn_runtime.h](cpp/tsn_runtime.h)): `tsn_promise<T>` (a `promise_type` with
+  `initial_suspend`/`final_suspend` = `suspend_never` so the body runs synchronously until the first
+  `await` and the frame self-destroys at the end; `await_ready` always false so `await` defers ≥1
+  tick; settling schedules waiters as microtasks) + `tsn_promise_state<T>` (the `shared_ptr`ed state
+  that outlives the frame). **Rejection** reuses the string-only `throw`: `unhandled_exception`
+  rejects, `await_resume` re-throws the `tsn_str` (an ordinary `catch (const tsn_str&)` handles it;
+  `finally`'s RAII guard still runs across a `co_await`).
+- **Lambda-body limitation.** `await` can't appear inside a construct codegen lowers to a C++
+  **lambda body** — the operand-returning `&&`/`||` IIFE and `Array.fill`'s index args — since a
+  lambda isn't a coroutine. `containsAwait` detects this and raises a clean `tsnc:` error (assign the
+  awaited value first). `await` in IIFE *arguments* (e.g. the receiver of a chainable method, or
+  `JSON.parse(await …)`) is fine — it's evaluated in the enclosing coroutine, not the lambda.
 
 ## Guard clauses
 

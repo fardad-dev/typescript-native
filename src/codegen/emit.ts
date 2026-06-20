@@ -73,6 +73,7 @@ type ObjectType = { kind: "object"; fields: Field[] };
 type ClassType = { kind: "class"; name: string };
 type MapType = { kind: "map"; key: Type; value: Type };
 type SetType = { kind: "set"; element: Type };
+type PromiseType = { kind: "promise"; value?: Type };
 
 function isArray(t: Type): t is ArrayType {
   return typeof t === "object" && t.kind === "array";
@@ -85,6 +86,10 @@ function isMap(t: Type): t is MapType {
 }
 function isSet(t: Type): t is SetType {
   return typeof t === "object" && t.kind === "set";
+}
+// A `Promise<T>` (reference type, a coroutine handle). `value` absent ⇒ `Promise<void>`.
+function isPromise(t: Type): t is PromiseType {
+  return typeof t === "object" && t.kind === "promise";
 }
 // A class instance is a *reference* type, deliberately NOT an "aggregate": those
 // (array/object) are value types passed by const& and read-only, whereas an
@@ -102,6 +107,9 @@ function displayType(t: RetType): string {
   if (isArray(t)) return `${displayType(t.element)}[]`;
   if (isMap(t)) return `Map<${displayType(t.key)}, ${displayType(t.value)}>`;
   if (isSet(t)) return `Set<${displayType(t.element)}>`;
+  if (isPromise(t)) {
+    return `Promise<${t.value === undefined ? "void" : displayType(t.value)}>`;
+  }
   if (isObject(t)) {
     return `{ ${t.fields.map((f) => `${f.name}: ${displayType(f.type)}`).join("; ")} }`;
   }
@@ -119,6 +127,13 @@ function sameType(a: Type, b: Type): boolean {
     );
   if (isSet(a) || isSet(b))
     return isSet(a) && isSet(b) && sameType(a.element, b.element);
+  // Promises: equal iff both resolve to the same type (or both are Promise<void>).
+  if (isPromise(a) || isPromise(b)) {
+    if (!isPromise(a) || !isPromise(b)) return false;
+    if (a.value === undefined || b.value === undefined)
+      return a.value === b.value;
+    return sameType(a.value, b.value);
+  }
   if (isArray(a) && isArray(b)) return sameType(a.element, b.element);
   if (isObject(a) && isObject(b)) {
     if (a.fields.length !== b.fields.length) return false;
@@ -193,10 +208,18 @@ class Emitter {
   private globals = new Map<string, Type>();
   private globalDecls: string[] = [];
 
+  // True if the whole module uses async (any function/method is async). Gates the
+  // one `tsn_run_microtasks()` drain in main(); kept false for non-async programs
+  // so their emitted main() stays byte-identical.
+  private usesAsync = false;
+
   // Per-function scratch, reset by resetForFunction().
   private body: string[] = [];
   private vars = new Map<string, Type>();
   private curReturn: RetType = "void";
+  // True while emitting an async function/method body — a C++20 coroutine, so a
+  // `return` is `co_return` and `await` is `co_await` (and is rejected elsewhere).
+  private curAsync = false;
   private funcKey: string = MAIN_KEY; // scope key for repr lookups
   // The class whose method/constructor body is being emitted (so `this` resolves);
   // undefined inside free functions and main.
@@ -213,6 +236,11 @@ class Emitter {
 
   emitModule(mod: Module): string {
     this.reps = analyze(mod); // decide each number slot's representation
+    // Does any function/method use async? If so, main() drains the microtask queue
+    // after the synchronous top-level (the event loop). Non-async programs skip it.
+    this.usesAsync =
+      mod.functions.some((f) => f.async) ||
+      mod.classes.some((c) => c.methods.some((m) => m.async));
 
     // First pass: collect class declarations and function signatures so any
     // construct can reference any class/function regardless of source order.
@@ -319,6 +347,12 @@ class Emitter {
     if (isClass(t)) return `std::shared_ptr<${t.name}>`; // reference-typed instance
     if (isMap(t)) return `std::shared_ptr<${this.mapPointee(t)}>`;
     if (isSet(t)) return `std::shared_ptr<${this.setPointee(t)}>`;
+    // A `Promise<T>` is a coroutine return type / awaitable (its own handle holds
+    // a shared_ptr to the promise state, so it's a reference type). Promise<void>
+    // resolves to `tsn_unit`. Resolved numbers use the f64 rep (like array elements).
+    if (isPromise(t)) {
+      return `tsn_promise<${t.value === undefined ? "tsn_unit" : this.cppType(t.value)}>`;
+    }
     if (t === "number") return "double"; // f64 rep — the default for nested aggregates
     if (t === "boolean") return "bool";
     return "tsn_str"; // string — a ref-counted immutable string (see prelude)
@@ -533,6 +567,7 @@ class Emitter {
     this.body = [];
     this.vars = new Map();
     this.curReturn = ret;
+    this.curAsync = false;
     this.funcKey = funcKey;
     this.currentClass = undefined;
     this.indent = "  ";
@@ -543,13 +578,61 @@ class Emitter {
 
   private emitFunction(fn: Func): string {
     this.resetForFunction(fn.returnType, fn.name);
+    this.curAsync = fn.async;
     this.bindParams(fn.params);
     for (const s of fn.body) this.emitStmt(s);
+    // A `void` async coroutine (Promise<void>) needs a final `co_return tsn_unit{}`
+    // — both to make it a coroutine when the body has no other co_return and to
+    // satisfy the return value (the function's body may fall off the end).
+    this.emitAsyncVoidTail();
     return [
       `${this.retSlotType(fn.name, fn.returnType)} ${fn.name}(${this.declParams(fn.name, fn.params)}) {`,
       ...this.body,
       `}`,
     ].join("\n");
+  }
+
+  // Append `co_return tsn_unit{};` when emitting a `void` async coroutine
+  // (Promise<void>). A non-void async function returns on all paths (stage 0
+  // guarantees it), so its `co_return`s already make it a coroutine.
+  private emitAsyncVoidTail(): void {
+    const ret = this.curReturn;
+    if (this.curAsync && ret !== "void" && isPromise(ret) && ret.value === undefined) {
+      this.push(`co_return tsn_unit{};`);
+    }
+  }
+
+  // A `return` inside an async function — a `co_return` whose value is the
+  // promise's RESOLVED type (curReturn is `Promise<T>`). For Promise<void> a bare
+  // `return;` co_returns the unit; returning a value is rejected. Returning a
+  // `Promise<T>` from a `Promise<T>` function adopts it (JS flattening: await it).
+  private emitAsyncReturn(stmt: { value?: Expr }): void {
+    const ret = this.curReturn as PromiseType; // async ⇒ a promise type
+    const valueType = ret.value;
+    if (valueType === undefined) {
+      // Promise<void>.
+      if (stmt.value) {
+        throw new Error("Cannot return a value from an async 'Promise<void>' function");
+      }
+      this.push(`co_return tsn_unit{};`);
+      return;
+    }
+    if (!stmt.value) throw new Error("Missing return value");
+    const val = this.emitExpr(stmt.value);
+    if (sameType(val.type, valueType)) {
+      // Resolved values store in the f64 rep for numbers (cast an i64 value).
+      this.push(`co_return ${this.f64SlotCode(val)};`);
+      return;
+    }
+    // `return somePromise` where the function resolves to the same type: adopt the
+    // returned promise by awaiting it (matching JS's async return-a-thenable).
+    if (isPromise(val.type) && val.type.value !== undefined && sameType(val.type.value, valueType)) {
+      this.push(`co_return co_await (${val.code});`);
+      return;
+    }
+    throw new Error(
+      `Type '${displayType(val.type)}' is not assignable to async return type 'Promise<${displayType(valueType)}>'`,
+    );
   }
 
   // --- classes ------------------------------------------------------------
@@ -611,9 +694,11 @@ class Emitter {
   private emitMethodDef(cls: ClassDecl, m: Method): string {
     const key = this.methodKey(cls.name, m.name);
     this.resetForFunction(m.returnType, key);
+    this.curAsync = m.async;
     this.currentClass = cls;
     this.bindParams(m.params);
     for (const s of m.body) this.emitStmt(s);
+    this.emitAsyncVoidTail();
     return [
       `${this.retSlotType(key, m.returnType)} ${cls.name}::${m.name}(${this.declParams(key, m.params)}) {`,
       ...this.body,
@@ -647,7 +732,12 @@ class Emitter {
     // later module-variable read just returns the cached record.
     for (const d of deps) this.push(`${this.depInitName(d)}();`);
     for (const s of stmts) this.emitTopLevel(s);
-    return [`int main() {`, ...this.body, `  return 0;`, `}`].join("\n");
+    // After the synchronous top-level, drain the microtask queue — the event loop
+    // that runs async continuations (only when the program uses async; otherwise
+    // main() is byte-identical to the pre-async output). No timers/IO => no
+    // macrotasks, so draining to empty is the whole loop.
+    const drain = this.usesAsync ? [`  tsn_run_microtasks();`] : [];
+    return [`int main() {`, ...this.body, ...drain, `  return 0;`, `}`].join("\n");
   }
 
   // --- dependency modules (records + memoized init) -----------------------
@@ -1048,6 +1138,10 @@ class Emitter {
         return;
       }
       case "return": {
+        if (this.curAsync) {
+          this.emitAsyncReturn(stmt);
+          return;
+        }
         if (this.curReturn === "void") {
           if (stmt.value)
             throw new Error("Cannot return a value from a void function");
@@ -1071,6 +1165,9 @@ class Emitter {
           code = this.emitCall(stmt.expr, /*asStatement*/ true).code;
         } else if (stmt.expr.kind === "methodCall") {
           code = this.emitMethodCall(stmt.expr, /*asStatement*/ true).code;
+        } else if (stmt.expr.kind === "await") {
+          // `await f();` — run for effect; discard the result (works for void too).
+          code = this.emitAwait(stmt.expr).code;
         } else {
           code = this.emitExpr(stmt.expr).code;
         }
@@ -1632,10 +1729,9 @@ class Emitter {
         // have no JSON form here (Node serializes them as `{}`); reject cleanly
         // rather than emit a C++ overload error.
         const v = this.emitExpr(e.arg);
-        if (isMap(v.type) || isSet(v.type)) {
-          throw new Error(
-            `JSON.stringify of a ${isMap(v.type) ? "Map" : "Set"} is not supported (v1)`,
-          );
+        if (isMap(v.type) || isSet(v.type) || isPromise(v.type)) {
+          const what = isMap(v.type) ? "Map" : isSet(v.type) ? "Set" : "Promise";
+          throw new Error(`JSON.stringify of a ${what} is not supported (v1)`);
         }
         return { code: `tsn_json_stringify(${v.code})`, type: "string" };
       }
@@ -1672,7 +1768,75 @@ class Emitter {
           type: t,
         };
       }
+      case "await": {
+        const a = this.emitAwait(e);
+        if (a.valueType === "void") {
+          throw new Error(
+            "'await' of a Promise<void> has no value — use it as a statement, not an expression",
+          );
+        }
+        return { code: a.code, type: a.valueType, rep: a.rep };
+      }
+      case "promiseResolve": {
+        const v = this.emitExpr(e.arg);
+        // Promise.resolve(p) === p when the argument is already a promise.
+        if (isPromise(v.type)) return { code: v.code, type: v.type };
+        return {
+          code: `tsn_resolve(${this.f64SlotCode(v)})`,
+          type: { kind: "promise", value: v.type },
+        };
+      }
+      case "promiseAll": {
+        const v = this.emitExpr(e.arg);
+        if (!isArray(v.type) || !isPromise(v.type.element)) {
+          throw new Error(
+            `Promise.all expects a Promise<T>[] argument, got '${displayType(v.type)}'`,
+          );
+        }
+        const inner = v.type.element.value;
+        if (inner === undefined) {
+          throw new Error("Promise.all of a Promise<void>[] is not supported (v1)");
+        }
+        // tsn_all(ps) resolves to a vector of the element results -> T[].
+        return {
+          code: `tsn_all(${v.code})`,
+          type: { kind: "promise", value: { kind: "array", element: inner } },
+        };
+      }
     }
+  }
+
+  // Emit an `await`. Returns the C++ `co_await …` expression and the awaited
+  // (resolved) type — `"void"` for a Promise<void> (only valid as a statement).
+  // Rejects `await` outside an async function (incl. top-level await, which would
+  // need main() itself to be a coroutine — out of subset).
+  private emitAwait(e: { expr: Expr }): {
+    code: string;
+    valueType: RetType;
+    rep?: Rep;
+  } {
+    if (!this.curAsync) {
+      throw new Error(
+        "'await' is only valid inside an async function (top-level await is not supported (v1))",
+      );
+    }
+    const inner = this.emitExpr(e.expr);
+    if (isPromise(inner.type)) {
+      const valueType: RetType =
+        inner.type.value === undefined ? "void" : inner.type.value;
+      return {
+        code: `co_await (${inner.code})`,
+        valueType,
+        rep: valueType === "number" ? "f64" : undefined,
+      };
+    }
+    // await on a non-promise: wrap in a resolved promise so the one-tick deferral
+    // still happens (JS `await 5`), then unwrap to the value.
+    return {
+      code: `co_await tsn_resolve(${this.f64SlotCode(inner)})`,
+      valueType: inner.type,
+      rep: inner.type === "number" ? "f64" : undefined,
+    };
   }
 
   // --- Math.* -------------------------------------------------------------
@@ -1808,6 +1972,11 @@ class Emitter {
     if (isMap(t) || isSet(t)) {
       throw new Error(
         `JSON.parse target type may not be a ${isMap(t) ? "Map" : "Set"} — use an object/array type`,
+      );
+    }
+    if (isPromise(t)) {
+      throw new Error(
+        "JSON.parse target type may not be a Promise — use a JSON value type",
       );
     }
     if (isArray(t)) {
@@ -1991,6 +2160,14 @@ class Emitter {
     if (!sameType(l.type, r.type)) {
       throw new Error(
         `Operator '${e.op}' needs operands of the same type, got '${displayType(l.type)}' and '${displayType(r.type)}'`,
+      );
+    }
+    // This form lowers the operands into a C++ lambda body (to keep short-circuit
+    // + single left-eval), and `co_await` can't appear in a lambda. Reject an
+    // awaited operand here with a clear message (assign it to a variable first).
+    if (containsAwait(e.left) || containsAwait(e.right)) {
+      throw new Error(
+        `'await' inside a non-boolean '${e.op}' operand is not supported (v1) — assign the awaited value to a variable first`,
       );
     }
     const ternary =
@@ -2222,6 +2399,13 @@ class Emitter {
             if (n.type !== "number") {
               throw new Error("'fill' start/end must be numbers");
             }
+          }
+          // start/end are lowered into a C++ lambda body (see below), where a
+          // co_await can't appear — reject an awaited index argument cleanly.
+          if (e.args.slice(1).some(containsAwait)) {
+            throw new Error(
+              "'await' inside Array.fill's start/end is not supported (v1) — assign it to a variable first",
+            );
           }
           const start = nums[0]?.code ?? "NAN";
           const end = nums[1]?.code ?? "NAN";
@@ -2682,6 +2866,54 @@ class Emitter {
       default:
         throw new Error(`Unsupported string method '${e.method}'`);
     }
+  }
+}
+
+// Does `e` contain an `await` anywhere in its subtree? Used to reject `await` in
+// the few spots codegen lowers to a C++ *lambda body* — the operand-returning
+// `&&`/`||` IIFE and Array.fill's index args — where a `co_await` can't appear
+// (a lambda is not a coroutine). `await` in plain positions (let/return/args/if/
+// while/ternary branches/IIFE *arguments*) is fine and not flagged.
+function containsAwait(e: Expr): boolean {
+  switch (e.kind) {
+    case "await":
+      return true;
+    case "binary":
+      return containsAwait(e.left) || containsAwait(e.right);
+    case "unary":
+      return containsAwait(e.operand);
+    case "ternary":
+      return (
+        containsAwait(e.cond) ||
+        containsAwait(e.whenTrue) ||
+        containsAwait(e.whenFalse)
+      );
+    case "array":
+      return e.elements.some(containsAwait);
+    case "index":
+      return containsAwait(e.arr) || containsAwait(e.index);
+    case "object":
+      return e.properties.some((p) => containsAwait(p.value));
+    case "member":
+      return containsAwait(e.obj);
+    case "call":
+      return e.args.some(containsAwait);
+    case "methodCall":
+      return containsAwait(e.receiver) || e.args.some(containsAwait);
+    case "new":
+      return e.args.some(containsAwait);
+    case "jsonStringify":
+    case "promiseResolve":
+    case "promiseAll":
+      return containsAwait(e.arg);
+    case "jsonParse":
+      return containsAwait(e.text);
+    case "mathCall":
+      return e.args.some(containsAwait);
+    case "setNew":
+      return e.init ? containsAwait(e.init) : false;
+    default:
+      return false; // num / bool / str / var / this / mathConst / mapNew
   }
 }
 

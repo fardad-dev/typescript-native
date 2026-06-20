@@ -447,7 +447,12 @@ class Renamer {
         e.args = e.args.map((a) => this.expr(a, locals));
         return e;
       case "jsonStringify":
+      case "promiseResolve":
+      case "promiseAll":
         e.arg = this.expr(e.arg, locals);
+        return e;
+      case "await":
+        e.expr = this.expr(e.expr, locals);
         return e;
       case "mathCall":
         e.args = e.args.map((a) => this.expr(a, locals));
@@ -477,7 +482,9 @@ class Renamer {
       this.type(t.key);
       this.type(t.value);
     } else if (t.kind === "set") this.type(t.element);
-    else for (const f of t.fields) this.type(f.type);
+    else if (t.kind === "promise") {
+      if (t.value) this.type(t.value); // resolve a class type-ref in Promise<C>
+    } else for (const f of t.fields) this.type(f.type);
   }
 }
 

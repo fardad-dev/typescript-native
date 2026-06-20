@@ -14,8 +14,10 @@ const execFileP = promisify(execFile);
 //    divergence). The speedup comes from -O3; this flag just protects correctness.
 // -Werror=return-type turns "non-void function may not return a value" into a
 //    hard error, so control-flow paths that forget to return fail the build.
+// -std=c++20 (was c++17) gives us coroutines, which back async/await: an async
+//    function compiles to a coroutine returning tsn_promise<T> (see tsn_runtime.h).
 const CLANG_ARGS = (cppPath: string, outPath: string) => [
-  "-std=c++17",
+  "-std=c++20",
   "-O3",
   "-ffp-contract=off",
   "-Werror=return-type",

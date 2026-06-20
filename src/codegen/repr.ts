@@ -594,6 +594,44 @@ class RepAnalyzer {
         // annotated/asserted target type may be number, but it's never i64-rep).
         this.visit(e.text, scope, fk);
         return { type: e.type, rep: "f64" };
+      case "await": {
+        // `await p` yields the promise's resolved type. A resolved number is the
+        // f64 rep (promise values are stored as f64, like array elements).
+        const inner = this.visit(e.expr, scope, fk);
+        if (
+          typeof inner.type === "object" &&
+          inner.type.kind === "promise"
+        ) {
+          // value absent => Promise<void>; report a number placeholder (a void
+          // await is statement-only and never feeds a slot).
+          return { type: inner.type.value ?? "number", rep: "f64" };
+        }
+        return { type: inner.type, rep: "f64" }; // await of a non-promise = identity
+      }
+      case "promiseResolve": {
+        const a = this.visit(e.arg, scope, fk);
+        // Promise.resolve(p) === p when the arg is already a promise.
+        const t: Type =
+          typeof a.type === "object" && a.type.kind === "promise"
+            ? a.type
+            : { kind: "promise", value: a.type as Type };
+        return { type: t, rep: "f64" };
+      }
+      case "promiseAll": {
+        const a = this.visit(e.arg, scope, fk);
+        // arr is a Promise<T>[]; the result resolves to a T[].
+        let value: Type = "number";
+        if (
+          typeof a.type === "object" &&
+          a.type.kind === "array" &&
+          typeof a.type.element === "object" &&
+          a.type.element.kind === "promise" &&
+          a.type.element.value !== undefined
+        ) {
+          value = { kind: "array", element: a.type.element.value };
+        }
+        return { type: { kind: "promise", value }, rep: "f64" };
+      }
     }
   }
 }

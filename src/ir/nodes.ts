@@ -19,7 +19,14 @@ export type Type =
   // tsn_map / tsn_set (see codegen). Keys/values/elements may be any value type;
   // numbers are stored in the f64 rep (like array elements / object fields).
   | { kind: "map"; key: Type; value: Type }
-  | { kind: "set"; element: Type };
+  | { kind: "set"; element: Type }
+  // `Promise<T>` — the result type of an async function and a first-class value
+  // (reference type: a handle to shared promise state). `value` is the resolved
+  // type; absent means `Promise<void>` (resolves to nothing / JS `undefined`).
+  // `await` on a promise yields its `value`; codegen compiles it to a C++20
+  // coroutine type `tsn_promise<…>` (see codegen). Numbers in `value` use the
+  // f64 rep (like array elements / object fields).
+  | { kind: "promise"; value?: Type };
 
 export type BinaryOp =
   // arithmetic (number -> number)
@@ -79,7 +86,17 @@ export type Expr =
   // `JSON.parse(text) as T` (or a `T`-annotated target) — parse a JSON string into
   // a value of a statically-known type `T`. JSON.parse is `any` in TypeScript, so
   // the subset requires the target type up front (it can't lower an untyped value).
-  | { kind: "jsonParse"; text: Expr; type: Type };
+  | { kind: "jsonParse"; text: Expr; type: Type }
+  // `await expr` — suspend the enclosing async function until `expr`'s promise
+  // settles, then yield its resolved value (or re-throw its rejection). Only valid
+  // inside an async function (a coroutine); compiles to `co_await` (see codegen).
+  | { kind: "await"; expr: Expr }
+  // `Promise.resolve(arg)` — a promise already fulfilled with `arg` (if `arg` is
+  // itself a promise it is returned as-is, matching JS).
+  | { kind: "promiseResolve"; arg: Expr }
+  // `Promise.all(arg)` — `arg` is a `Promise<T>[]`; resolves to a `T[]` once every
+  // input promise resolves (rejects if any rejects).
+  | { kind: "promiseAll"; arg: Expr };
 
 export type Stmt =
   // `type` is the annotation; absent means infer from the initializer.
@@ -149,6 +166,9 @@ export interface Func {
   params: Param[];
   returnType: RetType;
   body: Stmt[];
+  // An `async function`. Its `returnType` is a `Promise<T>` (or `Promise<void>`);
+  // codegen emits it as a C++20 coroutine (`co_return`, `co_await`). See codegen.
+  async: boolean;
 }
 
 // An instance method. Same shape as a Func minus the (implicit `this`) receiver,
@@ -158,6 +178,8 @@ export interface Method {
   params: Param[];
   returnType: RetType;
   body: Stmt[];
+  // An `async` method — same coroutine treatment as an async free function.
+  async: boolean;
 }
 
 // A class: fields (declaration order = struct layout), exactly one constructor,

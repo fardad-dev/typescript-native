@@ -86,6 +86,18 @@ function hasStatic(node: ts.HasModifiers): boolean {
   );
 }
 
+// The `async` modifier on a function/method. An async function returns a
+// `Promise<T>` and compiles to a C++20 coroutine (see codegen); its body may use
+// `await`. (Stage 0 already enforces that `await` appears only in async functions
+// and that an async function's annotated return type is a `Promise<...>`.)
+function hasAsync(node: ts.HasModifiers): boolean {
+  return (
+    ts
+      .getModifiers(node)
+      ?.some((m) => m.kind === ts.SyntaxKind.AsyncKeyword) ?? false
+  );
+}
+
 function lowerClass(cls: ts.ClassDeclaration): ClassDecl {
   if (!cls.name) throw new Error("Class declarations must be named (v1)");
   const name = cls.name.text;
@@ -140,6 +152,8 @@ function lowerClass(cls: ts.ClassDeclaration): ClassDecl {
           `Method '${m.name.text}' needs a return type annotation`,
         );
       }
+      // An async method's annotated type is a `Promise<...>` (lowered to a
+      // promise type by lowerType); `void` only appears on non-async methods.
       const returnType: RetType =
         m.type.kind === ts.SyntaxKind.VoidKeyword ? "void" : lowerType(m.type);
       const body: Stmt[] = [];
@@ -149,6 +163,7 @@ function lowerClass(cls: ts.ClassDeclaration): ClassDecl {
         params: lowerParams(m.parameters),
         returnType,
         body,
+        async: hasAsync(m),
       });
       continue;
     }
@@ -183,15 +198,15 @@ function lowerFunction(fn: ts.FunctionDeclaration): Func {
   if (fn.type.kind === ts.SyntaxKind.VoidKeyword) {
     returnType = "void";
   } else {
-    // Returns may be any supported type now (scalars, arrays, objects).
-    // Codegen returns aggregates by value, leaning on C++ RVO/move so the cost
-    // is paid only where the result is bound or used (see emit.ts).
+    // Returns may be any supported type now (scalars, arrays, objects). An async
+    // function's annotation is a `Promise<...>` — lowerType maps it to a promise
+    // type, and the function compiles to a coroutine (see codegen).
     returnType = lowerType(fn.type);
   }
 
   const body: Stmt[] = [];
   for (const s of fn.body.statements) lowerStatement(s, body);
-  return { name: fn.name.text, params, returnType, body };
+  return { name: fn.name.text, params, returnType, body, async: hasAsync(fn) };
 }
 
 function lowerStatement(node: ts.Statement, out: Stmt[]): void {
@@ -314,6 +329,12 @@ function lowerStatement(node: ts.Statement, out: Stmt[]): void {
     }
     if (isAssignmentLike(expr)) {
       out.push(lowerAssignLike(expr));
+      return;
+    }
+    // `await f();` — run for its side effect (and suspension). Kept as an `await`
+    // IR node (codegen emits `co_await`), not unwrapped — the suspension matters.
+    if (ts.isAwaitExpression(expr)) {
+      out.push({ kind: "exprStmt", expr: lowerExpr(expr) });
       return;
     }
     if (ts.isCallExpression(expr)) {
@@ -629,6 +650,14 @@ function lowerType(node: ts.TypeNode): Type {
     if (n === "Set" && node.typeArguments?.length === 1) {
       return { kind: "set", element: lowerType(node.typeArguments[0]) };
     }
+    // `Promise<T>` — the result type of an async function and a first-class value.
+    // `Promise<void>` lowers to a promise with no resolved value (resolves to JS
+    // `undefined`). `await` on a promise yields `T` (see codegen).
+    if (n === "Promise" && node.typeArguments?.length === 1) {
+      const arg = node.typeArguments[0];
+      if (arg.kind === ts.SyntaxKind.VoidKeyword) return { kind: "promise" };
+      return { kind: "promise", value: lowerType(arg) };
+    }
     // A bare identifier that isn't a known primitive/built-in is treated as a
     // class instance type (`let p: Point`). The emitter validates the class
     // exists. Generic refs (with type arguments) still fall through as
@@ -689,11 +718,25 @@ function lowerExpr(node: ts.Expression): Expr {
     // `new Map<K, V>()` / `new Set<T>(...)` are builtins, not class instances.
     if (ctor === "Map") return lowerNewMap(node);
     if (ctor === "Set") return lowerNewSet(node);
+    // `new Promise(executor)` needs a first-class function (the executor) and
+    // capture machinery — out of subset. Async functions / Promise.resolve cover
+    // the common cases without it.
+    if (ctor === "Promise") {
+      throw new Error(
+        "new Promise(executor) is not supported (v1) — it needs first-class function values (closures); use an async function or Promise.resolve",
+      );
+    }
     return {
       kind: "new",
       className: ctor,
       args: node.arguments ? node.arguments.map(lowerExpr) : [],
     };
+  }
+  // `await e` — suspend the enclosing async function until `e`'s promise settles
+  // and yield its resolved value. Lowered to an `await` IR node (codegen emits
+  // `co_await`); codegen enforces it appears only inside an async function.
+  if (ts.isAwaitExpression(node)) {
+    return { kind: "await", expr: lowerExpr(node.expression) };
   }
   if (ts.isParenthesizedExpression(node)) return lowerExpr(node.expression);
   // `e!` (non-null assertion) only narrows the *static* type (drops null/undefined)
@@ -764,6 +807,8 @@ function lowerExpr(node: ts.Expression): Expr {
     if (json) return json;
     const math = tryLowerMathCall(node);
     if (math) return math;
+    const promise = tryLowerPromiseCall(node);
+    if (promise) return promise;
     // `recv.method(args)` -> methodCall (e.g. xs.push(v)).
     if (ts.isPropertyAccessExpression(node.expression)) {
       return {
@@ -953,6 +998,47 @@ function tryLowerMathCall(node: ts.CallExpression): Expr | null {
     throw new Error(`Unsupported Math function 'Math.${fn}' (v1)`);
   }
   return { kind: "mathCall", fn, args: node.arguments.map(lowerExpr) };
+}
+
+// Recognize the `Promise.*` static builtins in call position (like `JSON.*` /
+// `Math.*`). `Promise.resolve(x)` and `Promise.all(arr)` are supported; the rest
+// (reject/race/any/allSettled — and `new Promise`) are clean errors. Returns null
+// for a non-Promise call (it falls through to the normal method/function path).
+function tryLowerPromiseCall(node: ts.CallExpression): Expr | null {
+  const callee = node.expression;
+  if (
+    !ts.isPropertyAccessExpression(callee) ||
+    !ts.isIdentifier(callee.expression) ||
+    callee.expression.text !== "Promise"
+  ) {
+    return null;
+  }
+  const method = callee.name.text;
+  if (method === "resolve") {
+    if (node.arguments.length !== 1) {
+      throw new Error(
+        "Promise.resolve expects exactly one argument (v1) — Promise.resolve() with no value is out of subset",
+      );
+    }
+    return { kind: "promiseResolve", arg: lowerExpr(node.arguments[0]) };
+  }
+  if (method === "all") {
+    if (node.arguments.length !== 1) {
+      throw new Error(
+        "Promise.all expects exactly one argument (an array of promises) (v1)",
+      );
+    }
+    return { kind: "promiseAll", arg: lowerExpr(node.arguments[0]) };
+  }
+  if (method === "reject") {
+    throw new Error(
+      "Promise.reject is not supported (v1) — `throw` inside an async function to reject its promise",
+    );
+  }
+  if (method === "race" || method === "any" || method === "allSettled") {
+    throw new Error(`Promise.${method} is not supported (v1)`);
+  }
+  throw new Error(`Unsupported Promise method 'Promise.${method}' (v1)`);
 }
 
 // Lower a `Math.<name>` constant reference to a `mathConst` node. An unknown name

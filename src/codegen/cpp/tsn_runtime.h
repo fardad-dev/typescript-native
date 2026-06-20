@@ -24,7 +24,10 @@
 #include <cctype>
 #include <charconv>
 #include <cmath>
+#include <coroutine>
 #include <cstdlib>
+#include <deque>
+#include <functional>
 #include <iostream>
 #include <memory>
 #include <string>
@@ -105,6 +108,143 @@ inline bool operator==(const tsn_str& a, const tsn_str& b) { return a.str() == b
 inline bool operator!=(const tsn_str& a, const tsn_str& b) { return a.str() != b.str(); }
 inline tsn_str operator+(const tsn_str& a, const tsn_str& b) { return tsn_str(a.str() + b.str()); }
 inline std::ostream& operator<<(std::ostream& os, const tsn_str& s) { return os << s.str(); }
+
+// --- async / await: promises + the microtask event loop -----------------
+//
+// An `async function` compiles to a C++20 coroutine returning `tsn_promise<T>`
+// (codegen emits `co_await` for `await` and `co_return` for `return`); `await`
+// suspends the coroutine and schedules its continuation on a microtask queue.
+// There are no timers / I/O in the subset, so the "event loop" is exactly that
+// queue: `main()` runs the synchronous top-level, then drains it to fixpoint
+// (every promise settles via synchronous computation, so the drain terminates).
+//
+// This reproduces V8's ordering precisely (verified byte-for-byte against Node):
+//   - `initial_suspend` is `suspend_never`, so an async function runs
+//     synchronously until its first `await` (then returns its pending promise);
+//   - `await_ready` is ALWAYS false, so `await` defers the continuation by at
+//     least one microtask tick even when the awaited promise is already settled
+//     (the famous "await schedules a microtask" behavior);
+//   - settling a promise schedules its waiters as microtasks (never resumes them
+//     inline), so suspended awaiters resume in FIFO order after the current run.
+// Rejection rides the subset's string-only exception model: a `throw` inside an
+// async function rejects its promise with the string; `await`ing a rejected
+// promise re-throws it (caught by an ordinary `try`/`catch`).
+
+inline std::deque<std::function<void()>>& tsn_microtask_queue() {
+  static std::deque<std::function<void()>> q;
+  return q;
+}
+inline void tsn_enqueue_microtask(std::function<void()> f) {
+  tsn_microtask_queue().push_back(std::move(f));
+}
+// Drain the microtask queue to empty. Called once from main() after the
+// synchronous top-level; a microtask may enqueue more, which this keeps running.
+inline void tsn_run_microtasks() {
+  auto& q = tsn_microtask_queue();
+  while (!q.empty()) {
+    auto f = std::move(q.front());
+    q.pop_front();
+    f();
+  }
+}
+
+// The value of a `Promise<void>` — the subset has no `undefined`, so a void
+// promise resolves to this empty unit (an async `void` function `co_return`s it).
+struct tsn_unit {};
+
+// The shared, heap-allocated state behind a promise (a `tsn_promise<T>` is a
+// thin handle to it, so copies alias — JS reference semantics, identity `===`).
+// `value` outlives the coroutine frame that produced it (the frame self-destroys
+// at final_suspend, but this shared_ptr is also held by the returned promise and
+// any waiters), which is what makes the design memory-safe.
+template <class T>
+struct tsn_promise_state {
+  int status = 0;  // 0 pending, 1 fulfilled, 2 rejected
+  T value{};
+  tsn_str reason;  // rejection reason (the subset throws strings)
+  std::vector<std::coroutine_handle<>> waiters;
+  void schedule_waiters() {
+    if (waiters.empty()) return;
+    std::vector<std::coroutine_handle<>> w;
+    w.swap(waiters);
+    for (auto h : w) tsn_enqueue_microtask([h]() { h.resume(); });
+  }
+  void fulfill(T v) {
+    if (status) return;
+    value = std::move(v);
+    status = 1;
+    schedule_waiters();
+  }
+  void reject(tsn_str e) {
+    if (status) return;
+    reason = std::move(e);
+    status = 2;
+    schedule_waiters();
+  }
+};
+
+template <class T>
+struct tsn_promise {
+  std::shared_ptr<tsn_promise_state<T>> state;
+  tsn_promise() : state(std::make_shared<tsn_promise_state<T>>()) {}
+  explicit tsn_promise(std::shared_ptr<tsn_promise_state<T>> s) : state(std::move(s)) {}
+
+  // The C++ coroutine return-object protocol: an async function returning
+  // tsn_promise<T> uses this promise_type to drive the coroutine. (Note the name
+  // clash with JS "promise" is unavoidable — this is C++'s coroutine vocabulary.)
+  struct promise_type {
+    std::shared_ptr<tsn_promise_state<T>> state =
+        std::make_shared<tsn_promise_state<T>>();
+    tsn_promise get_return_object() { return tsn_promise(state); }
+    std::suspend_never initial_suspend() noexcept { return {}; }
+    std::suspend_never final_suspend() noexcept { return {}; }
+    void return_value(T v) { state->fulfill(std::move(v)); }
+    void unhandled_exception() {
+      // An async function never throws synchronously — a thrown value rejects its
+      // promise instead. The subset throws only strings (see emit.ts `throw`).
+      try {
+        throw;
+      } catch (const tsn_str& e) {
+        state->reject(e);
+      } catch (...) {
+        state->reject(tsn_str("uncaught exception"));
+      }
+    }
+  };
+
+  // The awaiter protocol: a tsn_promise<T> is itself awaitable. await_ready is
+  // always false so the continuation always defers by >=1 microtask tick.
+  bool await_ready() const noexcept { return false; }
+  void await_suspend(std::coroutine_handle<> h) const {
+    if (state->status == 0) state->waiters.push_back(h);  // resume when settled
+    else tsn_enqueue_microtask([h]() { h.resume(); });    // settled: one tick
+  }
+  T await_resume() const {
+    if (state->status == 2) throw state->reason;  // rejection -> thrown tsn_str
+    return state->value;
+  }
+};
+
+// `Promise.resolve(v)` for a non-promise `v` (codegen passes a promise argument
+// through unchanged): a promise already fulfilled with `v`.
+template <class T>
+static tsn_promise<T> tsn_resolve(T v) {
+  tsn_promise<T> p;
+  p.state->fulfill(std::move(v));
+  return p;
+}
+
+// `Promise.all(ps)`: itself a coroutine that awaits each input promise in order
+// and resolves to an array of the results (rejecting if any input rejects). The
+// inputs already run concurrently (an async function starts when called), so the
+// in-order await still collects every result; the result array is in input order.
+template <class T>
+static tsn_promise<std::shared_ptr<std::vector<T>>> tsn_all(
+    std::shared_ptr<std::vector<tsn_promise<T>>> ps) {
+  auto out = std::make_shared<std::vector<T>>();
+  for (auto& p : *ps) out->push_back(co_await p);
+  co_return out;
+}
 
 // `number` is a double; print it JS-style (shortest round-trip, integers
 // without a trailing ".0") via std::to_chars. NaN/Infinity get their JS
@@ -676,6 +816,19 @@ static std::string tsn_inspect(const std::shared_ptr<std::vector<T>>& a) {
   }
   out += " ]";
   return out;
+}
+
+// A Promise<void> value prints as `undefined` when nested (e.g. `[ undefined ]`).
+static std::string tsn_inspect(tsn_unit) { return "undefined"; }
+
+// Promise printing, best-effort toward Node: `Promise { <pending> }`,
+// `Promise { 5 }` (fulfilled), `Promise { <rejected> }`. The fulfilled value
+// recurses through tsn_inspect (object/class values resolve via ADL, like arrays).
+template <class T>
+static std::string tsn_inspect(const tsn_promise<T>& p) {
+  if (!p.state || p.state->status == 0) return "Promise { <pending> }";
+  if (p.state->status == 2) return "Promise { <rejected> }";
+  return "Promise { " + tsn_inspect(p.state->value) + " }";
 }
 
 // Map / Set printing, matching Node: `Map(2) { 'a' => 1, 'b' => 2 }`,

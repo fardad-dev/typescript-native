@@ -2,7 +2,7 @@
 
 [clang.ts](clang.ts) takes the generated C++ and produces the native binary.
 
-- `buildExecutable(cppPath, outPath)` shells out: `clang++ -std=c++17 <cppPath> -o <outPath>`
+- `buildExecutable(cppPath, outPath)` shells out: `clang++ -std=c++20 <cppPath> -o <outPath>`
   (via `execFileSync`, inheriting stdio so clang++'s diagnostics reach the user).
 - `clang++` compiles + links in one step (it drives the C++ frontend, optimizer, assembler,
   and linker), so there's no separate codegen/assemble/link tooling to manage here.
@@ -15,7 +15,9 @@
 
 ## Notes
 
-- We pin `-std=c++17` (the generated code uses `std::vector`, `std::string`, brace/aggregate
-  init, `static_cast`).
+- We pin `-std=c++20` (was `-std=c++17`): besides `std::vector`/`std::string`/brace-init/
+  `static_cast`, async/await compiles to **C++20 coroutines** (`co_await`/`co_return`, an async
+  function's `tsn_promise<T>` return type with a `promise_type`). Apple clang 17 enables them under
+  `-std=c++20` with no extra flag.
 - This stage is intentionally tiny. Future work (optimization flags `-O2`, choosing a compiler,
   linking extra runtime support) would live here.
