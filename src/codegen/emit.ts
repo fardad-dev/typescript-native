@@ -254,6 +254,12 @@ class Emitter {
   // Per-function scratch, reset by resetForFunction().
   private body: string[] = [];
   private vars = new Map<string, Type>();
+  // Flow-narrowing: a union-typed variable narrowed by an enclosing `typeof`/`===
+  // null`/truthiness guard. `vars` keeps the *declared* union; this overrides it
+  // for reads inside the guarded region (a single-member narrowing emits a
+  // `std::get`). Installed by the `if`/ternary emitters, restored on block exit,
+  // and dropped on reassignment (see `analyzeGuard` / the `var` read).
+  private narrowed = new Map<string, Type>();
   private curReturn: RetType = "void";
   // True while emitting an async function/method body — a C++20 coroutine, so a
   // `return` is `co_return` and `await` is `co_await` (and is rejected elsewhere).
@@ -683,6 +689,7 @@ class Emitter {
   private resetForFunction(ret: RetType, funcKey: string): void {
     this.body = [];
     this.vars = new Map();
+    this.narrowed = new Map();
     this.curReturn = ret;
     this.curAsync = false;
     this.funcKey = funcKey;
@@ -1040,9 +1047,23 @@ class Emitter {
   // Emit a nested `{ ... }` block of statements at one deeper indent level.
   private emitBlock(stmts: Stmt[]): void {
     const saved = this.indent;
+    // Snapshot the narrowing state: an early-return guard inside this block may
+    // narrow the fallthrough (see the `if` emitter), and that must not leak past
+    // the block's end. (Cheap — the map holds at most a handful of entries.)
+    const savedNarrowed = new Map(this.narrowed);
     this.indent += "  ";
     for (const s of stmts) this.emitStmt(s);
     this.indent = saved;
+    this.narrowed = savedNarrowed;
+  }
+
+  // Whether a block unconditionally exits the enclosing control flow on every path
+  // (so code after it runs only when the block was NOT taken). v1: the block ends
+  // in a `return` or `throw`. Used for early-return narrowing: `if (s === null)
+  // return; …` narrows `s` to non-null for the statements after the `if`.
+  private alwaysExits(stmts: Stmt[]): boolean {
+    const last = stmts[stmts.length - 1];
+    return last !== undefined && (last.kind === "return" || last.kind === "throw");
   }
 
   // Emit a condition expression; it must be usable as a C++ condition.
@@ -1054,6 +1075,163 @@ class Emitter {
       );
     }
     return v.code;
+  }
+
+  // --- flow narrowing -----------------------------------------------------
+  //
+  // A union-typed variable can be *narrowed* by a guard so its members can be
+  // used directly (`if (typeof x === "string") { x.length }`). This is done at
+  // emit time: `analyzeGuard` recognizes the guard shape and returns the narrowed
+  // type for the positive (then) and negative (else) branches; the `if`/ternary
+  // emitters install it for the matching block via `withNarrowed`, and the `var`
+  // read emits a `std::get<Member>` when the narrowing is down to one member. The
+  // stage-0 TS checker has already proven the program correct under TS narrowing,
+  // so the `std::get` is sound (no runtime variant-access check needed).
+
+  // The declared union type of a (possibly global) variable, or undefined.
+  private declaredUnion(name: string): UnionType | undefined {
+    const t = this.vars.get(name) ?? this.globals.get(name);
+    return t !== undefined && isUnion(t) ? t : undefined;
+  }
+
+  // Filter a union's members by a predicate, collapsing the result: a single
+  // surviving member becomes that member; an empty/unchanged set yields the
+  // original union (i.e. "no narrowing").
+  private filterUnion(u: UnionType, keep: (m: Type) => boolean): Type {
+    const kept = u.members.filter(keep);
+    if (kept.length === 0 || kept.length === u.members.length) return u;
+    return kept.length === 1 ? kept[0] : { kind: "union", members: kept };
+  }
+
+  // Recognize a narrowing guard on a single union variable and return the narrowed
+  // types for the then/else branches. Supported v1 forms: `typeof x === "lit"`
+  // (and `!==`), `x === null`/`undefined` (and `!==`), bare truthiness `x` / `!x`
+  // (removes null/undefined), and a boolean `&&` chain over the same variable.
+  private analyzeGuard(
+    cond: Expr,
+  ): { name: string; positive: Type; negative: Type } | undefined {
+    // `!guard` swaps the branches.
+    if (cond.kind === "unary" && cond.op === "!") {
+      const inner = this.analyzeGuard(cond.operand);
+      if (!inner) {
+        // bare `!x` truthiness: else-branch (x truthy) drops null/undefined.
+        const tv = this.truthyGuard(cond.operand);
+        if (tv)
+          return { name: tv.name, positive: tv.declared, negative: tv.truthy };
+        return undefined;
+      }
+      return {
+        name: inner.name,
+        positive: inner.negative,
+        negative: inner.positive,
+      };
+    }
+    // Boolean `&&` chain: combine same-variable narrowings (positive only; the
+    // else-branch of `a && b` can't be cleanly narrowed, so it stays the union).
+    if (cond.kind === "binary" && cond.op === "&&") {
+      const l = this.analyzeGuard(cond.left);
+      const r = this.analyzeGuard(cond.right);
+      if (l && r && l.name === r.name) {
+        const u = this.declaredUnion(l.name);
+        if (!u) return undefined;
+        // Intersect: keep members in both positives (compare against each side).
+        const keep = (m: Type) =>
+          this.typeInNarrow(m, l.positive) && this.typeInNarrow(m, r.positive);
+        return { name: l.name, positive: this.filterUnion(u, keep), negative: u };
+      }
+      return l ?? r;
+    }
+    if (cond.kind === "binary" && (cond.op === "===" || cond.op === "!==")) {
+      return this.equalityGuard(cond.op, cond.left, cond.right);
+    }
+    // Bare truthiness `x` → then-branch drops null/undefined.
+    const tv = this.truthyGuard(cond);
+    if (tv) return { name: tv.name, positive: tv.truthy, negative: tv.declared };
+    return undefined;
+  }
+
+  // Whether member `m` is within the narrowed type `n` (a member is in a union if
+  // it's one of its members; otherwise types must match).
+  private typeInNarrow(m: Type, n: Type): boolean {
+    return isUnion(n) ? n.members.some((nm) => sameType(nm, m)) : sameType(n, m);
+  }
+
+  // A bare-variable truthiness guard: `{ name, declared union, truthy }` where
+  // `truthy` drops `null`/`undefined`. Undefined if `e` isn't a union variable.
+  private truthyGuard(
+    e: Expr,
+  ): { name: string; declared: UnionType; truthy: Type } | undefined {
+    if (e.kind !== "var") return undefined;
+    const u = this.declaredUnion(e.name);
+    if (!u) return undefined;
+    const truthy = this.filterUnion(u, (m) => m !== "null" && m !== "undefined");
+    return { name: e.name, declared: u, truthy };
+  }
+
+  // `===`/`!==` guard: `typeof x === "lit"` or `x === null|undefined`.
+  private equalityGuard(
+    op: "===" | "!==",
+    left: Expr,
+    right: Expr,
+  ): { name: string; positive: Type; negative: Type } | undefined {
+    const swap = op === "!==";
+    const flip = (g: { name: string; positive: Type; negative: Type }) =>
+      swap ? { name: g.name, positive: g.negative, negative: g.positive } : g;
+
+    // typeof x === "literal"
+    const tof = this.typeofOperand(left) ?? this.typeofOperand(right);
+    const lit = this.stringLiteral(right) ?? this.stringLiteral(left);
+    if (tof !== undefined && lit !== undefined) {
+      const u = this.declaredUnion(tof);
+      if (!u) return undefined;
+      const positive = this.filterUnion(u, (m) => this.staticTypeof(m) === lit);
+      const negative = this.filterUnion(u, (m) => this.staticTypeof(m) !== lit);
+      return flip({ name: tof, positive, negative });
+    }
+    // x === null / x === undefined
+    const v = left.kind === "var" ? left.name : right.kind === "var" ? right.name : undefined;
+    const litType =
+      left.kind === "null" || right.kind === "null"
+        ? "null"
+        : left.kind === "undefined" || right.kind === "undefined"
+          ? "undefined"
+          : undefined;
+    if (v !== undefined && litType !== undefined) {
+      const u = this.declaredUnion(v);
+      if (!u) return undefined;
+      const positive = this.filterUnion(u, (m) => m === litType);
+      const negative = this.filterUnion(u, (m) => m !== litType);
+      return flip({ name: v, positive, negative });
+    }
+    return undefined;
+  }
+
+  private typeofOperand(e: Expr): string | undefined {
+    return e.kind === "typeof" && e.operand.kind === "var"
+      ? e.operand.name
+      : undefined;
+  }
+  private stringLiteral(e: Expr): string | undefined {
+    return e.kind === "str" ? e.value : undefined;
+  }
+
+  // Install a narrowing for the duration of `fn`, restoring the prior state. A
+  // no-op when there's nothing to narrow.
+  private withNarrowed<T>(
+    name: string | undefined,
+    type: Type | undefined,
+    fn: () => T,
+  ): T {
+    if (name === undefined || type === undefined) return fn();
+    const had = this.narrowed.has(name);
+    const prev = this.narrowed.get(name);
+    this.narrowed.set(name, type);
+    try {
+      return fn();
+    } finally {
+      if (had) this.narrowed.set(name, prev!);
+      else this.narrowed.delete(name);
+    }
   }
 
   // --- loops / break / continue -------------------------------------------
@@ -1242,6 +1420,10 @@ class Emitter {
           `Type '${displayType(val.type)}' is not assignable to '${displayType(target.type)}'`,
         );
       }
+      // Reassigning a narrowed variable invalidates the narrowing for the rest of
+      // the block — the lvalue type is the declared union (emitLValue ignores the
+      // narrowing), so the value re-widens into it.
+      if (stmt.target.kind === "var") this.narrowed.delete(stmt.target.name);
       return `${target.code} = ${this.coerceTo(val, target.type)}`;
     }
     throw new Error(`Statement '${stmt.kind}' is not valid here`);
@@ -1380,13 +1562,25 @@ class Emitter {
         return;
       }
       case "if": {
+        const guard = this.analyzeGuard(stmt.cond);
         this.push(`if (${this.condition(stmt.cond)}) {`);
-        this.emitBlock(stmt.then);
+        this.withNarrowed(guard?.name, guard?.positive, () =>
+          this.emitBlock(stmt.then),
+        );
         if (stmt.else) {
           this.push(`} else {`);
-          this.emitBlock(stmt.else);
+          this.withNarrowed(guard?.name, guard?.negative, () =>
+            this.emitBlock(stmt.else!),
+          );
         }
         this.push(`}`);
+        // Early-return narrowing: when the then-block always exits and there's no
+        // else, the code after the `if` runs only when the guard was false — so
+        // install the negative narrowing for the rest of the enclosing block (the
+        // block's emitBlock snapshot restores it at the block's end).
+        if (guard && !stmt.else && this.alwaysExits(stmt.then)) {
+          this.narrowed.set(guard.name, guard.negative);
+        }
         return;
       }
       case "while": {
@@ -1728,6 +1922,22 @@ class Emitter {
         };
       }
       case "var": {
+        // A flow-narrowed union variable: when narrowed to a single member, read
+        // it through `std::get<Member>` (the active alternative — sound because the
+        // stage-0 checker proved the guard holds on this path); when narrowed to a
+        // smaller union, keep the variant value but report the narrower type.
+        const narrowedType = this.narrowed.get(e.name);
+        if (narrowedType !== undefined && this.declaredUnion(e.name)) {
+          if (isUnion(narrowedType)) {
+            return { code: e.name, type: narrowedType };
+          }
+          const mcpp = this.cppType(narrowedType);
+          return {
+            code: `std::get<${mcpp}>((${e.name}).v())`,
+            type: narrowedType,
+            rep: narrowedType === "number" ? "f64" : undefined,
+          };
+        }
         // A local binding shadows a same-named global, so check `vars` first.
         const local = this.vars.get(e.name);
         if (local !== undefined) {
@@ -1767,9 +1977,14 @@ class Emitter {
         // type is the result. For a number result the rep follows both branches
         // (i64 only when both are) — a mixed pair is promoted to double by C++,
         // matching the f64 rep.
+        const guard = this.analyzeGuard(e.cond);
         const cond = this.condition(e.cond);
-        const a = this.emitExpr(e.whenTrue);
-        const b = this.emitExpr(e.whenFalse);
+        const a = this.withNarrowed(guard?.name, guard?.positive, () =>
+          this.emitExpr(e.whenTrue),
+        );
+        const b = this.withNarrowed(guard?.name, guard?.negative, () =>
+          this.emitExpr(e.whenFalse),
+        );
         if (!sameType(a.type, b.type)) {
           throw new Error(
             `Ternary branches must have the same type, got '${displayType(a.type)}' and '${displayType(b.type)}'`,
@@ -2365,7 +2580,18 @@ class Emitter {
 
   private emitBinary(e: { op: BinaryOp; left: Expr; right: Expr }): Value {
     const l = this.emitExpr(e.left);
-    const r = this.emitExpr(e.right);
+    // For `&&` / `||` the right operand is evaluated under the left's narrowing:
+    // `a && b` runs `b` only when `a` held (positive narrowing), `a || b` runs `b`
+    // only when `a` failed (negative). This is what lets `typeof x === "string" &&
+    // x.length` use `x` as a string in the right operand.
+    let r: Value;
+    if (e.op === "&&" || e.op === "||") {
+      const g = this.analyzeGuard(e.left);
+      const narrow = e.op === "&&" ? g?.positive : g?.negative;
+      r = this.withNarrowed(g?.name, narrow, () => this.emitExpr(e.right));
+    } else {
+      r = this.emitExpr(e.right);
+    }
     const code = `(${l.code} ${CPP_OP[e.op]} ${r.code})`;
 
     if (ARITH.has(e.op)) {
