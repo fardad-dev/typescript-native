@@ -105,16 +105,18 @@ npm test            # run the e2e suite once (vitest run)
 npm run test:watch  # re-run on change — the TDD red->green loop
 ```
 
-The suite (currently **136 e2e cases** + a stage-0 type-checker test file + a module-loader test
-file + a `fetch` test file + union- and closure-rejection test files, all green) auto-discovers every
-`tests/cases/*.ts`, compiles it to a real native binary,
+The suite (currently **141 e2e cases** + a stage-0 type-checker test file + a module-loader test
+file + a `fetch` test file + union-, closure-, and destructuring/spread/rest-rejection test files,
+all green) auto-discovers every `tests/cases/*.ts`, compiles it to a real native binary,
 runs it, and diffs stdout against the matching `.expected` file. **Every feature gets a
 `tests/cases/*.ts` + `.expected` pair**, ideally written first (red), then implemented to green.
 Programs that must be *rejected* (type errors) can't be expressed as a case pair, so they live in
 [tests/typecheck.test.ts](tests/typecheck.test.ts); structural module-graph rejections (cycles,
 name collisions, unsupported import forms) live in [tests/modules.test.ts](tests/modules.test.ts);
 union-specific subset rejections (optional object fields, …) live in
-[tests/union.test.ts](tests/union.test.ts). See [tests/CLAUDE.md](tests/CLAUDE.md).
+[tests/union.test.ts](tests/union.test.ts); and destructuring/spread/rest/default-parameter subset
+rejections (object rest, destructured `for…of`, spread into a fixed parameter, …) live in
+[tests/destructure.test.ts](tests/destructure.test.ts). See [tests/CLAUDE.md](tests/CLAUDE.md).
 
 ## Current language support
 
@@ -240,6 +242,32 @@ Implemented and tested end-to-end:
   value** — for arrays/objects/instances that's a `tsn_rc` copy (a refcount bump) that aliases
   the caller's value, so a callee mutation is visible to the caller (JS reference semantics);
   returns likewise hand back the shared reference.
+- **Default, rest & destructuring parameters** (functions, methods, constructors, **and** closures):
+  - **Default params** `(a: T = expr)` — resolved at the function's **entry**, so the default may
+    reference earlier parameters (evaluated left to right); the parameter has its declared type `T`
+    in the body (the default fills an omitted argument). At the boundary it's received as
+    `T | undefined` under a hidden name and rebound to `T` (see codegen). Defaults may be any value
+    (a call, a reference type, …); a **union-typed** default param is a clean error (deferred).
+  - **Rest params** `(...xs: T[])` — the trailing call arguments are collected into a fresh `T[]`;
+    the body uses `xs` as an ordinary array. Also valid in **function-type annotations**
+    (`(...xs: T[]) => R`).
+  - **Spread arguments** `f(1, ...xs, 2)` / `new C(...xs)` — splice an array into a call, but **only**
+    into a rest parameter (spreading into a fixed parameter is a clean error — its length is unknown
+    statically).
+  - **Destructuring params** `({ x, y }: P)` / `([a, b]: T[])` — desugar to a synthetic parameter
+    plus body bindings (same machinery as a destructuring `let`); rename / nesting / a whole-param
+    default all work.
+- **Destructuring & spread** (in `let`/`const`):
+  - **Array** `const [a, , b, ...rest] = xs` — index per element, skip **holes** (`[, x]`), and an
+    element **default** `[a = 5]` fills an out-of-bounds element (`i < xs.length ? xs[i] : 5`); a
+    **rest** `...rest` takes `xs.slice(i)` (a new array).
+  - **Object** `const { x, y: alias, p: { z } } = obj` — bind each field, with **rename** and
+    **nesting**. (Object fields are always present in the subset, so a property default never fires.)
+  - **Nesting** composes to any depth; the initializer is evaluated **once** (bound to a temp). A
+    spread in an **array literal** `[...a, ...b, c]` builds a *fresh* array (so `[...a]` is a copy).
+  - **Deferred** (clean `tsnc:` errors): **object rest** `{ ...rest }` (needs a residual-object
+    build), **destructuring a `for…of`/`for…in` binding**, and a **destructuring assignment**
+    (`[a, b] = xs` as a statement — only declarations destructure).
 - **Closures & first-class functions:** **arrow functions** (`(x: T) => e` / `(x: T) => { … }`)
   and **anonymous function expressions** (`function (x: T) { … }`); **function-type annotations**
   `(a: T, b: U) => R` (incl. `() => void`) on variables, parameters, returns, fields, and array
@@ -256,8 +284,9 @@ Implemented and tested end-to-end:
   types); the **return type is inferred** from the body (or taken from an explicit annotation). A
   captured **`for…of`/`for…in`** loop variable is re-boxed each iteration (correct `let`
   per-iteration capture); `typeof f === "function"`; `console.log(f)` prints `[Function (anonymous)]`.
-  **Deferred** (clean `tsnc:` errors): **async** arrow/function expressions, **default**/​**rest**
-  parameters, comparing function values with `===`/`!==`, `this` inside a closure (lexical-`this`
+  Closures also support **default / rest / destructuring parameters** (see _Default, rest &
+  destructuring parameters_). **Deferred** (clean `tsnc:` errors): **async** arrow/function
+  expressions, comparing function values with `===`/`!==`, `this` inside a closure (lexical-`this`
   capture), and `JSON.stringify` of a function. The callback array methods (`map`/`filter`/`reduce`/
   …), `Map`/`Set.forEach`, `new Promise(executor)`, and `Promise.reject`/`race` are now *unblocked*
   by closures but not yet implemented (still clean errors). A **C-style `for` counter** captured by a
@@ -492,9 +521,10 @@ pair** (red → green).
       (`tsn_box` + `std::function` overloads for `tsn_inspect`/`tsn_truthy`/`tsn_typeof`), and
       `emit.ts` (closure emission with full per-function state save/restore, boxing of params/lets/
       loop-vars/catch-bindings, value calls, function-field calls). Non-closure programs are
-      byte-identical. **Deferred** (clean `tsnc:` errors): async arrow/function expressions,
-      default/rest parameters, `this` inside a closure, function `===`/`!==`, and `JSON.stringify` of
-      a function. Tests: `tests/cases/closure-*.ts`, `function-{value,expr,typeof,log}.ts`,
+      byte-identical. Closures support default / rest / destructuring **parameters** (see the
+      _Destructuring + spread/rest + default/rest params_ Done item). **Deferred** (clean `tsnc:`
+      errors): async arrow/function expressions, `this` inside a closure, function `===`/`!==`, and
+      `JSON.stringify` of a function. Tests: `tests/cases/closure-*.ts`, `function-{value,expr,typeof,log}.ts`,
       `class-fn-field.ts` + [tests/closures.test.ts](tests/closures.test.ts) (rejections).
 - [x] **`if` / `while` / `for`** — control flow (+ comparison/logical operators, recursion).
 - [x] **Assignment** — `x = e`, `a[i] = e`, `obj.f = e`, compound `+= …`, `i++` / `i--`.
@@ -907,12 +937,29 @@ see _Done_), which unblocks most of what was here. Still open:
       parameter properties, and field initializers (default member init). (Bare `this` as a value is
       **out of scope** — see _will never support_.)
 - [x] **Closures + first-class functions** — done (arrows / function expressions / function-typed
-      values / boxed capture machinery; see _Done_). Still open as follow-ups: **default/rest params**
-      and **async arrow/function expressions** (clean errors today), and the callback array methods /
-      `new Promise(executor)` / `Promise.reject`/`race` that closures unblock (see _todo_).
-- [ ] **Destructuring + spread/rest** — array/object binding patterns in `let` and params, and spread
-      in array literals and calls (all currently rejected: only simple identifier bindings,
-      [src/frontend/lower.ts](src/frontend/lower.ts)).
+      values / boxed capture machinery; see _Done_). Default / rest / destructuring **parameters** on
+      closures are done too (see _Destructuring + spread/rest + default/rest params_). Still open as
+      follow-ups: **async arrow/function expressions** (clean error today), and the callback array
+      methods / `new Promise(executor)` / `Promise.reject`/`race` that closures unblock (see _todo_).
+- [x] **Destructuring + spread/rest + default/rest params** — done. **Default params** `(a: T = expr)`
+      and **rest params** `(...xs: T[])` on functions / methods / constructors / closures (rest also in
+      function-type annotations); **spread arguments** `f(...xs)` / `new C(...xs)` into a rest param;
+      **spread in array literals** `[...a, ...b, c]` (a fresh copy); and **array / object destructuring**
+      in `let`/`const` and **parameter** position (rename, holes, element defaults, array rest, and
+      nesting). Two implementation strategies: destructuring + parameter spread are **desugared in
+      lowering** ([src/frontend/lower.ts](src/frontend/lower.ts)) into the source temp + per-binding
+      `let`s / synthetic params (so the rest of the pipeline only ever sees simple bindings and array
+      literals), needing no IR/emit change beyond a `spread` element node; default/rest params are
+      handled in **codegen** — `checkArgs` works over normalized `CallSlot`s (rest collection + spread
+      splicing + optional/default tail-fill), and a default param is received as `T | undefined` at the
+      boundary and rebound to `T` at function entry (so the default may reference earlier params). The
+      `spread` `Expr`, `default`/`rest` on `Param`, and `restParam` on the function `Type` were threaded
+      through lower → repr → closures → the module `Renamer` → emit. **Deferred** (clean `tsnc:` errors):
+      object rest `{ ...rest }` (residual-object build), destructuring a `for…of`/`for…in` binding, a
+      destructuring assignment statement (`[a, b] = xs` — only declarations destructure), a destructured
+      rest param (`...[a, b]`), and a default on a union-typed parameter. Tests:
+      `tests/cases/{spread-array,rest-params,default-params,destructure-var,destructure-params}.ts` +
+      [tests/destructure.test.ts](tests/destructure.test.ts) (rejections).
 - [ ] **Generics / type parameters** — `<T>(x: T) => T`, `Map<K, V>`; depends on the type-system work above.
 - [ ] **`typeof` / `instanceof` / `in`**, **optional chaining `?.` / nullish `??`**.
 

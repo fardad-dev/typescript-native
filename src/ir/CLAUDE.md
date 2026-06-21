@@ -27,10 +27,11 @@ is added or changed.
     coroutine type `tsn_promise<…>`); resolved numbers use the f64 rep.
   - `{ kind: "response" }` — the `Response` of a `fetch(...)` — a built-in reference type
     (codegen → `tsn_rc<tsn_response>`): fields `status`/`ok`, methods `text()`/`json()`.
-  - `{ kind: "function"; params: Type[]; ret: RetType }` — a first-class function value
+  - `{ kind: "function"; params: Type[]; ret: RetType; restParam? }` — a first-class function value
     `(p: T, …) => R` (arrow / function expression / top-level-function reference). A reference type
     (codegen → `std::function<Rc(Pc…)>`); number params/returns use the f64 rep (a context-stable
-    signature).
+    signature). `restParam: true` ⇒ the last `params` entry is a rest parameter (`(...xs: T[]) => R`);
+    an optional param surfaces as a `T | undefined` member.
 - **`BinaryOp`** — `"+" | "-" | "*" | "/" | "%"`.
 - **`Expr`** (discriminated union) — `num`, `bool`, `str`, `var`, `binary`, `ternary`
   (`cond ? whenTrue : whenFalse`; branches share a type = the result type), `unary`, `array`,
@@ -47,8 +48,11 @@ is added or changed.
   the `null` / `undefined` literals, `typeof` (`{ operand }` — a `string`; on a union resolved
   at runtime, and as `typeof x === "…"` in a guard it drives flow narrowing in codegen), `closure`
   (`{ params; returnType?; body; async; id? }` — an arrow / function expression; `returnType` absent
-  ⇒ inferred at codegen; `id` is set by the closure pass), and `callValue` (`{ callee; args }` —
-  calling a function *value*, as opposed to a named `call` or a `methodCall`).
+  ⇒ inferred at codegen; `id` is set by the closure pass), `callValue` (`{ callee; args }` —
+  calling a function *value*, as opposed to a named `call` or a `methodCall`), and `spread`
+  (`{ arg }` — a `...arg` element, valid only inside an `array` literal or a call's argument list,
+  where it targets a rest parameter; codegen errors anywhere else). A call/new/method `args` array
+  may contain `spread` elements.
 - **`Stmt`** — `let`, `log`, `return`, `exprStmt` (a bare expression evaluated for effect),
   `assign`, and the control-flow statements: `if`, `while`, `for`, `doWhile`, `forOf`
   (`{ name; iterable; body }`), `forIn` (`{ name; target; body }`), `switch` (`{ disc; cases }`
@@ -62,8 +66,12 @@ is added or changed.
 - **`RetType`** — `Type | "void"` (functions may return nothing; values never have `void` type).
   An `async` function's `returnType` is a `promise` `Type` (`Promise<void>` is a promise with no
   `value` — not `"void"`).
-- **`Param`**, **`Func`** (`name`, `params`, `returnType`, `body`, `async`). `async: true` ⇒ codegen
-  emits a coroutine (`co_return`/`co_await`).
+- **`Param`** (`name`, `type`, optional `boxed`/`default`/`rest`). `default?: Expr` ⇒ a default
+  parameter (`a: T = expr`): `type` is the declared `T`; codegen receives it as `T | undefined` and
+  resolves the default at entry. `rest?: true` ⇒ a rest parameter (`...xs: T[]`): `type` is the
+  array, and a call collects trailing args into it. (Destructuring params have no IR form — lowering
+  desugars them to a synthetic param + body `let`s.) **`Func`** (`name`, `params`, `returnType`,
+  `body`, `async`). `async: true` ⇒ codegen emits a coroutine (`co_return`/`co_await`).
 - **`Method`** (a `Func` minus the implicit receiver — also carries `async`) and **`ClassDecl`**
   (`name`, `fields`, `ctor: { params; body }`, `methods`). One constructor; inheritance/static/
   accessors not modeled.

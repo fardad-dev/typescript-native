@@ -23,7 +23,17 @@ import {
   SwitchCase,
 } from "../ir/nodes";
 
+// Monotonic counter for the synthetic temporaries destructuring / parameter
+// patterns introduce (`_tsn_d<n>`). Reset per `lower()` (one file), so names are
+// unique within a file; cross-file top-level collisions are mangled by the module
+// loader, and inside functions these are ordinary locals (distinct scopes).
+let tempCounter = 0;
+function freshTemp(): string {
+  return `_tsn_d${tempCounter++}`;
+}
+
 export function lower(fileName: string, source: string): Module {
+  tempCounter = 0;
   const sf = ts.createSourceFile(
     fileName,
     source,
@@ -60,13 +70,17 @@ export function lower(fileName: string, source: string): Module {
   return { classes, functions, main, modules: [] };
 }
 
-// Lower a typed parameter list (function, method, or constructor). Each param
-// needs a simple name and an explicit type annotation.
-function lowerParams(params: ts.NodeArray<ts.ParameterDeclaration>): Param[] {
-  return params.map((p) => {
-    if (!ts.isIdentifier(p.name)) {
-      throw new Error("Only simple parameter names are supported (v1)");
-    }
+// Lower a typed parameter list (function, method, constructor, or closure). Each
+// param needs an explicit type annotation. Returns the lowered `Param`s plus a
+// `prelude`: the statements a **destructuring** parameter (`({ x }: P)` / `([a]:
+// T[])`) desugars to — they bind the pattern off a synthetic parameter and must be
+// prepended to the function body by the caller.
+function lowerParams(params: ts.NodeArray<ts.ParameterDeclaration>): {
+  params: Param[];
+  prelude: Stmt[];
+} {
+  const prelude: Stmt[] = [];
+  const out = params.map((p): Param => {
     // A parameter-property (`constructor(private x: number)`) implicitly declares
     // and assigns a field — out of subset; declare the field explicitly instead.
     if (p.modifiers && p.modifiers.length > 0) {
@@ -74,18 +88,57 @@ function lowerParams(params: ts.NodeArray<ts.ParameterDeclaration>): Param[] {
         "Constructor parameter properties are not supported (v1) — declare the field explicitly",
       );
     }
-    // Rest (`...args`) and default (`x = 5`) parameters need extra machinery
-    // (variadic packing / default-value insertion) — out of subset for now.
-    if (p.dotDotDotToken) {
-      throw new Error("Rest parameters ('...args') are not supported yet (v1)");
+    // A **destructuring** parameter (`({ x, y }: P)` / `([a, b]: T[])`). Receive it
+    // under a synthetic name with the annotated type, and desugar the pattern into
+    // `prelude` `let`s (bound off the synthetic param), prepended to the body. A
+    // whole-param default / optional applies to the synthetic param.
+    if (!ts.isIdentifier(p.name)) {
+      if (p.dotDotDotToken) {
+        throw new Error("A rest parameter cannot be destructured (v1)");
+      }
+      if (!p.type) {
+        throw new Error("A destructured parameter needs a type annotation (v1)");
+      }
+      const type = lowerType(p.type);
+      const synth = freshTemp();
+      lowerBindingPattern(p.name, { kind: "var", name: synth }, prelude);
+      if (p.initializer) {
+        return { name: synth, type, default: lowerExpr(p.initializer) };
+      }
+      return {
+        name: synth,
+        type: p.questionToken ? canonicalizeUnion([type, "undefined"]) : type,
+      };
     }
-    if (p.initializer) {
-      throw new Error(
-        `Default parameter values are not supported yet (v1) — '${p.name.text}' cannot have a default`,
-      );
+    // A **rest** parameter `...xs: T[]`. Its annotation is the array type; the
+    // body uses it as an ordinary array. Codegen collects the trailing call
+    // arguments into a fresh `T[]`. (Stage 0 guarantees a rest param is last and
+    // array-typed; we also check so a tuple/non-array annotation errors cleanly.)
+    if (p.dotDotDotToken) {
+      if (!p.type) {
+        throw new Error(`Rest parameter '${p.name.text}' needs a type annotation`);
+      }
+      const type = lowerType(p.type);
+      if (typeof type !== "object" || type.kind !== "array") {
+        throw new Error(
+          `Rest parameter '${p.name.text}' must have an array type 'T[]' (v1)`,
+        );
+      }
+      return { name: p.name.text, type, rest: true };
     }
     if (!p.type) {
       throw new Error(`Parameter '${p.name.text}' needs a type annotation`);
+    }
+    // A **default** parameter `a: T = expr`. `type` stays the declared `T` (the
+    // type seen in the body); codegen resolves the default at the function's entry
+    // (so it may reference earlier params) and treats the param as optional at the
+    // boundary. (A `?` on a defaulted param is redundant — TS forbids it.)
+    if (p.initializer) {
+      return {
+        name: p.name.text,
+        type: lowerType(p.type),
+        default: lowerExpr(p.initializer),
+      };
     }
     // An optional parameter `a?: T` is `T | undefined` (callers may omit it; the
     // omitted value is `undefined`). Codegen appends an `undefined` default for an
@@ -95,6 +148,7 @@ function lowerParams(params: ts.NodeArray<ts.ParameterDeclaration>): Param[] {
     if (p.questionToken) type = canonicalizeUnion([type, "undefined"]);
     return { name: p.name.text, type };
   });
+  return { params: out, prelude };
 }
 
 // Whether `node` carries the given modifier keyword.
@@ -153,9 +207,10 @@ function lowerClass(cls: ts.ClassDeclaration): ClassDecl {
       if (ctor)
         throw new Error(`Class '${name}' has more than one constructor`);
       if (!m.body) throw new Error(`Constructor of '${name}' must have a body`);
+      const { params, prelude } = lowerParams(m.parameters);
       ctor = {
-        params: lowerParams(m.parameters),
-        body: lowerStmts(m.body.statements),
+        params,
+        body: [...prelude, ...lowerStmts(m.body.statements)],
       };
       continue;
     }
@@ -176,11 +231,12 @@ function lowerClass(cls: ts.ClassDeclaration): ClassDecl {
       // promise type by lowerType); `void` only appears on non-async methods.
       const returnType: RetType =
         m.type.kind === ts.SyntaxKind.VoidKeyword ? "void" : lowerType(m.type);
+      const { params, prelude } = lowerParams(m.parameters);
       methods.push({
         name: m.name.text,
-        params: lowerParams(m.parameters),
+        params,
         returnType,
-        body: lowerStmts(m.body.statements),
+        body: [...prelude, ...lowerStmts(m.body.statements)],
         async: hasAsync(m),
       });
       continue;
@@ -204,8 +260,8 @@ function lowerFunction(fn: ts.FunctionDeclaration): Func {
   if (!fn.body) throw new Error(`Function '${fn.name.text}' must have a body`);
 
   // Params may be any supported type — scalars, arrays, objects, or class
-  // instances. Codegen passes aggregates by `const&` and instances by value.
-  const params = lowerParams(fn.parameters);
+  // instances. A destructuring param contributes desugared `let`s in `prelude`.
+  const { params, prelude } = lowerParams(fn.parameters);
 
   if (!fn.type) {
     throw new Error(
@@ -222,7 +278,7 @@ function lowerFunction(fn: ts.FunctionDeclaration): Func {
     returnType = lowerType(fn.type);
   }
 
-  const body = lowerStmts(fn.body.statements);
+  const body = [...prelude, ...lowerStmts(fn.body.statements)];
   return { name: fn.name.text, params, returnType, body, async: hasAsync(fn) };
 }
 
@@ -234,7 +290,7 @@ function lowerStatement(node: ts.Statement, out: Stmt[]): void {
       throw new Error("'var' is not supported — use 'let' or 'const'");
     }
     for (const decl of node.declarationList.declarations) {
-      out.push(lowerVarDecl(decl));
+      lowerVarDeclInto(decl, out);
     }
     return;
   }
@@ -566,6 +622,127 @@ function lowerBlock(node: ts.Statement): Stmt[] {
   return out;
 }
 
+// Lower one `let`/`const` declarator into `out`. A simple identifier binding goes
+// through `lowerVarDecl` (one `let` stmt, plus the JSON/Map/Set annotated-target
+// idioms). A **destructuring** binding (`const [a, b] = …` / `const { x } = …`) is
+// *desugared* here into the source temp + per-binding `let`s — so the rest of the
+// pipeline only ever sees simple bindings.
+function lowerVarDeclInto(decl: ts.VariableDeclaration, out: Stmt[]): void {
+  if (ts.isIdentifier(decl.name)) {
+    out.push(lowerVarDecl(decl));
+    return;
+  }
+  if (!decl.initializer) {
+    throw new Error("A destructuring binding must have an initializer (v1)");
+  }
+  // Evaluate the initializer once (into a temp unless it's already a variable),
+  // then bind each element/property from that stable source.
+  const src = stableSource(lowerExpr(decl.initializer), out);
+  lowerBindingPattern(decl.name, src, out);
+}
+
+// Bind `source` (already a value Expr) according to a binding name: a plain
+// identifier becomes `let <name> = source`; an array/object pattern is destructured
+// element-by-element. The source is stabilized (bound to a temp unless it is a
+// variable) before a pattern reads it repeatedly, so it is evaluated exactly once.
+function lowerBindingPattern(
+  name: ts.BindingName,
+  source: Expr,
+  out: Stmt[],
+): void {
+  if (ts.isIdentifier(name)) {
+    out.push({ kind: "let", name: name.text, init: source });
+    return;
+  }
+  const src = stableSource(source, out);
+  if (ts.isArrayBindingPattern(name)) lowerArrayPattern(name, src, out);
+  else lowerObjectPattern(name, src, out);
+}
+
+// Ensure `source` can be referenced repeatedly without re-evaluating it: a `var`
+// is already stable; anything else is bound to a fresh temp `let` whose `var` ref
+// is returned. (So `const [a, b] = f()` calls `f()` once.)
+function stableSource(source: Expr, out: Stmt[]): Expr {
+  if (source.kind === "var") return source;
+  const t = freshTemp();
+  out.push({ kind: "let", name: t, init: source });
+  return { kind: "var", name: t };
+}
+
+// `const [a, , b, ...rest] = src` — index each element off `src`, skipping holes.
+// An element default (`[a = 5]`) is taken only when the index is out of bounds
+// (`i < src.length ? src[i] : default`), matching JS (which yields `undefined` for
+// a missing element). A rest element (`...rest`) takes `src.slice(i)` — a new array.
+function lowerArrayPattern(
+  pattern: ts.ArrayBindingPattern,
+  src: Expr,
+  out: Stmt[],
+): void {
+  pattern.elements.forEach((el, i) => {
+    if (ts.isOmittedExpression(el)) return; // a hole: `[, x]`
+    if (el.dotDotDotToken) {
+      if (el.initializer) {
+        throw new Error("A rest element cannot have a default value");
+      }
+      const rest: Expr = {
+        kind: "methodCall",
+        receiver: src,
+        method: "slice",
+        args: [{ kind: "num", value: i }],
+      };
+      lowerBindingPattern(el.name, rest, out);
+      return;
+    }
+    let value: Expr = { kind: "index", arr: src, index: { kind: "num", value: i } };
+    if (el.initializer) {
+      // `i < src.length ? src[i] : <default>` — the default fills an out-of-bounds
+      // (absent) element. (The subset's arrays are dense and typed, so this is the
+      // only way an element is "missing"; an explicit `undefined` element would
+      // need a `T | undefined` element type, which is itself deferred.)
+      value = {
+        kind: "ternary",
+        cond: {
+          kind: "binary",
+          op: "<",
+          left: { kind: "num", value: i },
+          right: { kind: "member", obj: src, name: "length" },
+        },
+        whenTrue: value,
+        whenFalse: lowerExpr(el.initializer),
+      };
+    }
+    lowerBindingPattern(el.name, value, out);
+  });
+}
+
+// `const { x, y: alias, z: { … }, ...rest } = src` — bind each property off `src`.
+// A renamed (`y: alias`) or nested (`z: { … }`) property uses `propertyName` as the
+// source field; a shorthand (`x`) uses the binding name. A property default is
+// ignored: object fields in the subset are always present and non-optional, so the
+// default can never fire (an optional `{ x?: T }` field is itself deferred). Object
+// rest (`...rest`) needs building a residual object and is deferred (clean error).
+function lowerObjectPattern(
+  pattern: ts.ObjectBindingPattern,
+  src: Expr,
+  out: Stmt[],
+): void {
+  for (const el of pattern.elements) {
+    if (el.dotDotDotToken) {
+      throw new Error(
+        "Object rest in destructuring ('{ ...rest }') is not supported yet (v1)",
+      );
+    }
+    const fieldNode = el.propertyName ?? el.name;
+    if (!ts.isIdentifier(fieldNode)) {
+      throw new Error(
+        "Only identifier property names are supported in object destructuring (v1)",
+      );
+    }
+    const value: Expr = { kind: "member", obj: src, name: fieldNode.text };
+    lowerBindingPattern(el.name, value, out);
+  }
+}
+
 function lowerVarDecl(decl: ts.VariableDeclaration): Stmt {
   if (!ts.isIdentifier(decl.name)) {
     throw new Error("Only simple identifier bindings are supported (v1)");
@@ -666,16 +843,24 @@ function lowerType(node: ts.TypeNode): Type {
   // `(a: T, b: U) => R` — a function type. Parameter names are irrelevant to the
   // type; an optional param `(a?: T)` widens to `T | undefined` (like a value param).
   if (ts.isFunctionTypeNode(node)) {
-    const params = node.parameters.map((p) => {
-      if (p.dotDotDotToken) {
-        throw new Error(
-          "Rest parameters in function types are not supported yet (v1)",
-        );
-      }
+    let restParam = false;
+    const params = node.parameters.map((p, i) => {
       if (!p.type) {
         throw new Error("Function type parameters need a type annotation");
       }
       let t = lowerType(p.type);
+      // `(...xs: T[]) => R` — a rest parameter (the last one). Its type entry is
+      // the array `T[]`; `restParam` marks it so a call collects trailing args.
+      if (p.dotDotDotToken) {
+        if (typeof t !== "object" || t.kind !== "array") {
+          throw new Error("A rest parameter in a function type must be 'T[]' (v1)");
+        }
+        if (i !== node.parameters.length - 1) {
+          throw new Error("A rest parameter must be last in a function type");
+        }
+        restParam = true;
+        return t;
+      }
       if (p.questionToken) t = canonicalizeUnion([t, "undefined"]);
       return t;
     });
@@ -683,7 +868,9 @@ function lowerType(node: ts.TypeNode): Type {
       node.type.kind === ts.SyntaxKind.VoidKeyword
         ? "void"
         : lowerType(node.type);
-    return { kind: "function", params, ret };
+    return restParam
+      ? { kind: "function", params, ret, restParam: true }
+      : { kind: "function", params, ret };
   }
   // `T[]`
   if (ts.isArrayTypeNode(node)) {
@@ -942,8 +1129,15 @@ function lowerExpr(node: ts.Expression): Expr {
     return {
       kind: "array",
       elements: node.elements.map((el) => {
+        // `[...arr]` — a spread element splices `arr`'s items into the literal.
         if (ts.isSpreadElement(el)) {
-          throw new Error("Spread elements in arrays are not supported (v1)");
+          return { kind: "spread", arg: lowerExpr(el.expression) };
+        }
+        // `[, x]` — an array hole. Holes only make sense in *destructuring*
+        // patterns (handled in lowerVarDecl); in a value literal they'd be the
+        // `undefined` element type, which the subset can't represent.
+        if (ts.isOmittedExpression(el)) {
+          throw new Error("Array holes ('[ , x ]') are not supported in a value (v1)");
         }
         return lowerExpr(el);
       }),
@@ -1035,7 +1229,7 @@ function lowerNew(node: ts.NewExpression): Expr {
   return {
     kind: "new",
     className: ctor,
-    args: node.arguments ? node.arguments.map(lowerExpr) : [],
+    args: node.arguments ? lowerArgs(node.arguments) : [],
   };
 }
 
@@ -1054,6 +1248,16 @@ function lowerAsExpr(node: ts.AsExpression): Expr {
   }
   throw new Error(
     "Type assertions ('as T') are only supported on JSON.parse(...) and `await res.json()` (v1)",
+  );
+}
+
+// Lower a call/new argument list, turning a `...arg` spread element into a
+// `spread` IR node (valid only when it targets a rest parameter — codegen checks).
+function lowerArgs(args: ts.NodeArray<ts.Expression>): Expr[] {
+  return args.map((a) =>
+    ts.isSpreadElement(a)
+      ? { kind: "spread", arg: lowerExpr(a.expression) }
+      : lowerExpr(a),
   );
 }
 
@@ -1076,7 +1280,7 @@ function lowerCall(node: ts.CallExpression): Expr {
       kind: "methodCall",
       receiver: lowerExpr(node.expression.expression),
       method: node.expression.name.text,
-      args: node.arguments.map(lowerExpr),
+      args: lowerArgs(node.arguments),
     };
   }
   // `f(args)` where `f` is a bare identifier — a direct named call (codegen resolves
@@ -1085,7 +1289,7 @@ function lowerCall(node: ts.CallExpression): Expr {
     return {
       kind: "call",
       callee: node.expression.text,
-      args: node.arguments.map(lowerExpr),
+      args: lowerArgs(node.arguments),
     };
   }
   // `expr(args)` where `expr` is any other expression (a call result `getFn()(x)`,
@@ -1093,7 +1297,7 @@ function lowerCall(node: ts.CallExpression): Expr {
   return {
     kind: "callValue",
     callee: lowerExpr(node.expression),
-    args: node.arguments.map(lowerExpr),
+    args: lowerArgs(node.arguments),
   };
 }
 
@@ -1112,7 +1316,7 @@ function lowerClosure(
   if (ts.isFunctionExpression(node) && node.asteriskToken) {
     throw new Error("Generator functions are not supported (v1)");
   }
-  const params = lowerParams(node.parameters);
+  const { params, prelude } = lowerParams(node.parameters);
   let returnType: RetType | undefined;
   if (node.type) {
     returnType =
@@ -1122,10 +1326,11 @@ function lowerClosure(
   }
   let body: Stmt[];
   if (ts.isBlock(node.body)) {
-    body = lowerStmts(node.body.statements);
+    body = [...prelude, ...lowerStmts(node.body.statements)];
   } else {
-    // Expression-bodied arrow: the body expression is the (single) return value.
-    body = [{ kind: "return", value: lowerExpr(node.body) }];
+    // Expression-bodied arrow: the body expression is the (single) return value
+    // (any destructuring-param prelude runs first).
+    body = [...prelude, { kind: "return", value: lowerExpr(node.body) }];
   }
   return { kind: "closure", params, returnType, body, async: false };
 }

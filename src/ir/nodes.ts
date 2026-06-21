@@ -51,7 +51,11 @@ export type Type =
   // it to `std::function<Rc(P0c, …)>` (a reference type); a `number` parameter or
   // return uses the **f64 rep** in the signature (like array elements / promise
   // values), so a function value's C++ type is stable regardless of context.
-  | { kind: "function"; params: Type[]; ret: RetType };
+  // `restParam: true` ⇒ the LAST `params` entry is a **rest** parameter (a `T[]`);
+  // callers may pass zero or more trailing `T` args, collected into a fresh array.
+  // An **optional** param is encoded as a `T | undefined` member (so it may be
+  // omitted at a call); the type carries no separate optional flag.
+  | { kind: "function"; params: Type[]; ret: RetType; restParam?: boolean };
 
 export type BinaryOp =
   // arithmetic (number -> number)
@@ -160,7 +164,12 @@ export type Expr =
   // direct named call (`call`) or a method call (`methodCall`). A bare identifier
   // call stays a `call` node — codegen resolves it to a top-level function or a
   // function-typed variable.
-  | { kind: "callValue"; callee: Expr; args: Expr[] };
+  | { kind: "callValue"; callee: Expr; args: Expr[] }
+  // A spread element `...arg` — valid only inside an array literal (`[...a, b]`) or
+  // a call's argument list (`f(...xs)`, where it targets a rest parameter). `arg` is
+  // an array; its elements are spliced into the surrounding array/argument list.
+  // A `spread` reaching `emitExpr` directly (anywhere else) is a clean error.
+  | { kind: "spread"; arg: Expr };
 
 // Several binding sites below carry an optional `boxed` flag, set by the capture
 // pass (src/codegen/closures.ts) when a local variable is captured by a nested
@@ -239,6 +248,18 @@ export interface Param {
   type: Type;
   // Captured by a nested closure ⇒ stored in a shared cell (see `boxed` above).
   boxed?: boolean;
+  // A **default** parameter `p: T = <default>`. `type` stays the declared `T` (the
+  // type seen in the body); the caller may omit the argument. Codegen receives the
+  // value at the boundary as `T | undefined` and, at function entry, rebinds `p` to
+  // `T` — the default expression when the argument was omitted (`undefined`), else
+  // the passed value. The default is evaluated in the function body's scope (so it
+  // may reference earlier parameters), left to right.
+  default?: Expr;
+  // A **rest** parameter `...p: T[]`. `type` is the array type `T[]`; the body uses
+  // `p` as an ordinary array. At a call, the trailing arguments are collected into a
+  // fresh `T[]` (so `f(1, 2, 3)` and `f(...arr)` both work). The rest parameter is
+  // always last (enforced by TypeScript at stage 0).
+  rest?: boolean;
 }
 
 export interface Func {

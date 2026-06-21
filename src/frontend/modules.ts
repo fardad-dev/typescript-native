@@ -35,7 +35,7 @@ import * as fs from "fs";
 import * as path from "path";
 import * as ts from "typescript";
 import { lower } from "./lower";
-import { Module, Func, ClassDecl, Stmt, Expr, Type } from "../ir/nodes";
+import { Module, Func, ClassDecl, Stmt, Expr, Type, Param } from "../ir/nodes";
 
 // Resolve a relative import specifier to an absolute `.ts` file path. Only
 // relative specifiers are supported; package/bare specifiers are out of subset.
@@ -275,25 +275,34 @@ class Renamer {
     return typeof r === "string" ? r : name;
   }
 
+  // Resolve a parameter list's type references and (default-param) initializer
+  // expressions, returning the set of parameter names (locals for the body). A
+  // default expression is rewritten with the param names as locals — it runs in
+  // the body's scope, so it may reference earlier params (left unrewritten).
+  private params(params: Param[]): Set<string> {
+    const locals = new Set(params.map((p) => p.name));
+    for (const p of params) {
+      this.type(p.type);
+      if (p.default !== undefined) p.default = this.expr(p.default, locals);
+    }
+    return locals;
+  }
+
   private func(f: Func): void {
     f.name = this.symName(f.name);
-    for (const p of f.params) this.type(p.type);
+    const locals = this.params(f.params);
     if (f.returnType !== "void") this.type(f.returnType);
-    f.body = this.body(f.body, new Set(f.params.map((p) => p.name)));
+    f.body = this.body(f.body, locals);
   }
 
   private cls(c: ClassDecl): void {
     c.name = this.symName(c.name);
     for (const fld of c.fields) this.type(fld.type);
-    for (const p of c.ctor.params) this.type(p.type);
-    c.ctor.body = this.body(
-      c.ctor.body,
-      new Set(c.ctor.params.map((p) => p.name)),
-    );
+    c.ctor.body = this.body(c.ctor.body, this.params(c.ctor.params));
     for (const m of c.methods) {
-      for (const p of m.params) this.type(p.type);
+      const locals = this.params(m.params);
       if (m.returnType !== "void") this.type(m.returnType);
-      m.body = this.body(m.body, new Set(m.params.map((p) => p.name)));
+      m.body = this.body(m.body, locals);
     }
   }
 
@@ -454,11 +463,15 @@ class Renamer {
         return e;
       case "closure": {
         // A closure introduces its own scope: its parameters shadow the table, so
-        // only genuinely free references in its body are rewritten.
+        // only genuinely free references in its body (and default expressions) are
+        // rewritten.
         const inner = new Set(locals);
         for (const p of e.params) {
           this.type(p.type);
           inner.add(p.name);
+        }
+        for (const p of e.params) {
+          if (p.default !== undefined) p.default = this.expr(p.default, inner);
         }
         if (e.returnType && e.returnType !== "void") this.type(e.returnType);
         e.body = this.body(e.body, inner);
@@ -467,6 +480,9 @@ class Renamer {
       case "callValue":
         e.callee = this.expr(e.callee, locals);
         e.args = e.args.map((a) => this.expr(a, locals));
+        return e;
+      case "spread":
+        e.arg = this.expr(e.arg, locals);
         return e;
       case "await":
         e.expr = this.expr(e.expr, locals);

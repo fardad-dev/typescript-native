@@ -80,17 +80,29 @@ A multi-file program is assembled from per-file `lower` results by `loadProgram`
   inheritance, `static`, accessors, parameter properties, field initializers, and a missing
   constructor; **ignores** access modifiers (public/private/…). Bodies lower via `lowerStatement`.
 - `lowerParams(params)` — shared typed-parameter lowering (functions, methods, constructors, and
-  closures); also rejects parameter-properties (`constructor(private x: ...)`) and **default**
-  (`x = 5`) / **rest** (`...args`) parameters (clean v1 errors). An **optional parameter** `a?: T`
-  lowers to `T | undefined` (an omitted trailing arg defaults to `undefined` in codegen).
-- `lowerStatement(node, out)` — `let`/`const`, `return`, `console.log(...)` (special-cased to a
-  `log` stmt), bare call expressions (`exprStmt`), and all the control-flow statements: `if`,
-  `while`, `do…while`, C-style `for`, `for…of`/`for…in` (helper `lowerForBindingName`), `switch`,
-  `break`/`continue`, labeled loops (`lowerLabeled` — rejects labeling a non-loop), and `try` /
-  `throw` (`lowerTry` / `lowerThrowValue`, where `throw new Error(msg)` lowers to throwing `msg`).
-- `lowerVarDecl(decl)` — a single `let`/`const` binding; initializer is required. Also the home of
-  the `const x: T = JSON.parse(text)` idiom: when annotated and the initializer is a `JSON.parse`
-  call, the annotation supplies the parse target type (→ a `jsonParse` node).
+  closures); returns `{ params, prelude }`. Rejects parameter-properties (`constructor(private x:
+  ...)`). An **optional parameter** `a?: T` lowers to `T | undefined`; a **default parameter**
+  `a: T = expr` keeps `type = T` and carries `default` (codegen resolves it at entry); a **rest
+  parameter** `...xs: T[]` carries `rest: true` with the array `type` (codegen collects trailing
+  args). A **destructuring parameter** (`({ x }: P)` / `([a]: T[])`) becomes a synthetic param plus
+  desugared `let`s pushed into **`prelude`** (the same machinery as a destructuring `let`); callers
+  (`lowerFunction`/`lowerClass`/`lowerClosure`) **prepend `prelude`** to the body.
+- `lowerStatement(node, out)` — `let`/`const` (via `lowerVarDeclInto`, which handles destructuring),
+  `return`, `console.log(...)` (special-cased to a `log` stmt), bare call expressions (`exprStmt`),
+  and all the control-flow statements: `if`, `while`, `do…while`, C-style `for`, `for…of`/`for…in`
+  (helper `lowerForBindingName` — still requires a simple identifier; destructuring there is
+  deferred), `switch`, `break`/`continue`, labeled loops (`lowerLabeled` — rejects labeling a
+  non-loop), and `try` / `throw` (`lowerTry` / `lowerThrowValue`, where `throw new Error(msg)` lowers
+  to throwing `msg`).
+- `lowerVarDeclInto(decl, out)` / `lowerVarDecl(decl)` — a `let`/`const` binding. A simple identifier
+  goes through `lowerVarDecl` (one `let`; also the home of the `const x: T = JSON.parse(text)` idiom
+  — when annotated and the initializer is a `JSON.parse` call, the annotation supplies the parse
+  target type). A **destructuring** binding (`const [a, b] = …` / `const { x } = …`) is desugared by
+  `lowerVarDeclInto` → `lowerBindingPattern` / `lowerArrayPattern` / `lowerObjectPattern` into a
+  once-evaluated source temp (`stableSource`, named by `freshTemp`) plus per-binding `let`s — so the
+  rest of the pipeline only ever sees simple bindings. Array element **defaults** use a length-check
+  ternary, array **rest** uses `.slice(i)`, **holes** are skipped; object **rename**/**nesting** read
+  fields; object **rest** is a clean error (deferred).
 - `lowerType(node)` — TS `TypeNode` → IR `Type` (keywords incl. `null`/`undefined`, `T[]`,
   `Array<T>`, `Map<K, V>` / `Set<T>`, `Promise<T>` / `Promise<void>` → a promise type, `Response` →
   the `fetch` response type, object type literals, **function types** `(a: T) => R` (→ a `function`
@@ -124,6 +136,10 @@ A multi-file program is assembled from per-file `lower` results by `loadProgram`
   generators are clean v1 errors. A **call** lowers to: `methodCall` for `recv.m(args)`, `call` for a
   bare-identifier `f(args)` (codegen resolves it to a top-level function *or* a function-typed
   variable), and **`callValue`** for any other callee expression (`getFn()(x)`, `fns[0](x)`, an IIFE).
+  A **spread** element `...arg` in an array literal or a call/new argument list (`lowerArgs`) lowers
+  to a `spread` node (codegen splices it into the array / collects it into a rest parameter); an
+  array **hole** (`[, x]`) in a value literal is a clean error (holes are only meaningful in
+  destructuring patterns, handled in `lowerArrayPattern`).
 - `lowerBinaryOp(kind)` — operator token → `BinaryOp`.
 - `isConsoleLog(expr)` — recognizes the `console.log` callee.
 - `tryLowerJsonCall(node)` / `isJsonParseCall(node)` / `jsonParseNode(call, type)` — recognize and

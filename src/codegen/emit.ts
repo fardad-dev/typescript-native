@@ -77,7 +77,12 @@ type SetType = { kind: "set"; element: Type };
 type PromiseType = { kind: "promise"; value?: Type };
 type ResponseType = { kind: "response" };
 type UnionType = { kind: "union"; members: Type[] };
-type FunctionType = { kind: "function"; params: Type[]; ret: RetType };
+type FunctionType = {
+  kind: "function";
+  params: Type[];
+  ret: RetType;
+  restParam?: boolean;
+};
 
 function isArray(t: Type): t is ArrayType {
   return typeof t === "object" && t.kind === "array";
@@ -128,6 +133,14 @@ function byteCompare(a: string, b: string): number {
 // (so the body's `(name)->v` accesses, and any closure capturing `name`, share it).
 function boxArgName(name: string): string {
   return `_tsnarg_${name}`;
+}
+
+// The mangled incoming-argument name for a DEFAULT parameter: the function
+// receives the value at the boundary as `T | undefined` under this name, then
+// rebinds the user's parameter `name` to `T` at entry (the default expression when
+// the argument was omitted — `undefined` — else the passed value).
+function defaultArgName(name: string): string {
+  return `_tsndef_${name}`;
 }
 
 function displayType(t: RetType): string {
@@ -181,10 +194,12 @@ function sameType(a: Type, b: Type): boolean {
   }
   // Response is a singleton built-in type (no parameters).
   if (isResponse(a) || isResponse(b)) return isResponse(a) && isResponse(b);
-  // Function types: equal iff same arity, same parameter types, same return type.
+  // Function types: equal iff same arity, same parameter types, same rest-ness,
+  // and same return type.
   if (isFunction(a) || isFunction(b)) {
     if (!isFunction(a) || !isFunction(b)) return false;
     if (a.params.length !== b.params.length) return false;
+    if (!!a.restParam !== !!b.restParam) return false;
     if (!a.params.every((pa, i) => sameType(pa, b.params[i]))) return false;
     if (a.ret === "void" || b.ret === "void") return a.ret === b.ret;
     return sameType(a.ret, b.ret);
@@ -212,8 +227,20 @@ interface Value {
 }
 
 interface Sig {
-  params: Type[];
+  params: Param[];
   ret: RetType;
+}
+
+// A normalized call-site parameter slot, derived from a Param[] (named calls,
+// methods, ctors) or a function `Type` (function-value calls). `optional` ⇒ the
+// argument may be omitted (an optional `a?: T` or a defaulted `a: T = …` param);
+// `rest` ⇒ this is the trailing rest parameter (`type` is its `T[]`), which
+// collects zero or more trailing arguments. `type` is the *boundary* type — for a
+// defaulted param that's `T | undefined`, even though the body sees `T`.
+interface CallSlot {
+  type: Type;
+  optional: boolean;
+  rest: boolean;
 }
 
 // An enclosing breakable/continuable construct, tracked on a stack so `break` /
@@ -342,7 +369,7 @@ class Emitter {
       if (this.sigs.has(fn.name))
         throw new Error(`Duplicate function '${fn.name}'`);
       this.sigs.set(fn.name, {
-        params: fn.params.map((p) => p.type),
+        params: fn.params,
         ret: fn.returnType,
       });
     }
@@ -719,15 +746,21 @@ class Emitter {
     return this.slotType(p.type, this.reps.varRep(fnName, p.name));
   }
 
-  // `type name` declarators for a parameter list (used in definitions). A boxed
-  // (captured) parameter is received under a mangled name and copied into its cell
-  // at entry (see `bindParams`), so its declarator uses `boxArgName`.
+  // `type name` declarators for a parameter list (used in definitions).
+  //  - A **default** parameter is received at the boundary as `T | undefined`
+  //    under a mangled name (`defaultArgName`); the body rebinds it (see bindParams).
+  //  - A **boxed** (captured) parameter is received under `boxArgName` and copied
+  //    into its cell at entry.
+  //  - Everything else uses its slot type and own name.
   private declParams(funcKey: string, params: Param[]): string {
     return params
-      .map(
-        (p) =>
-          `${this.paramType(funcKey, p)} ${p.boxed ? boxArgName(p.name) : p.name}`,
-      )
+      .map((p) => {
+        if (p.default !== undefined) {
+          return `${this.cppType(this.optionalUnion(p.type))} ${defaultArgName(p.name)}`;
+        }
+        const name = p.boxed ? boxArgName(p.name) : p.name;
+        return `${this.paramType(funcKey, p)} ${name}`;
+      })
       .join(", ");
   }
 
@@ -738,15 +771,49 @@ class Emitter {
   // heap cell at entry, so the parameter and any closures over it share one binding.
   private bindParams(params: Param[]): void {
     for (const p of params) {
+      // A **default** parameter is resolved at entry: the passed value if present,
+      // else the default expression (emitted HERE — in the body's scope, with
+      // earlier params already bound, so it may reference them; evaluated left to
+      // right). The incoming arg is the boundary union `T | undefined`.
+      const valueCode = p.default !== undefined ? this.resolveDefault(p) : undefined;
       this.vars.set(p.name, p.type);
       if (p.boxed) {
+        // Captured: box the resolved/incoming value into a shared heap cell.
         this.boxed.add(p.name);
         const elem = this.boxElemType(p.type);
+        const init = valueCode ?? boxArgName(p.name);
         this.push(
-          `${this.boxType(p.type)} ${p.name} = tsn_make_rc<tsn_box<${elem}>>(tsn_box<${elem}>{${boxArgName(p.name)}});`,
+          `${this.boxType(p.type)} ${p.name} = tsn_make_rc<tsn_box<${elem}>>(tsn_box<${elem}>{${init}});`,
         );
+      } else if (valueCode !== undefined) {
+        // Defaulted, not captured: declare the body local `p: T` from the resolve.
+        const cpp = this.slotType(p.type, this.reps.varRep(this.funcKey, p.name));
+        this.push(`${cpp} ${p.name} = ${valueCode};`);
       }
+      // A plain parameter: the C++ parameter `p` is already the binding.
     }
+  }
+
+  // The C++ expression that resolves a **default** parameter at function entry:
+  // the default expression when the boundary argument is `undefined`, else the
+  // passed value. The default's type must be assignable to the declared type `T`.
+  // A union-typed default param is deferred (extracting the narrower union from the
+  // `T | undefined` boundary would need a runtime re-wrap — clean error).
+  private resolveDefault(p: Param): string {
+    if (isUnion(p.type)) {
+      throw new Error(
+        `A default value on a union-typed parameter ('${p.name}') is not supported yet (v1)`,
+      );
+    }
+    const def = this.emitExpr(p.default!);
+    if (!this.isAssignable(p.type, def.type)) {
+      throw new Error(
+        `Default value for '${p.name}': type '${displayType(def.type)}' is not assignable to '${displayType(p.type)}'`,
+      );
+    }
+    const arg = `(${defaultArgName(p.name)}).v()`;
+    const member = this.cppType(p.type); // the non-undefined union alternative
+    return `(std::holds_alternative<tsn_undefined>(${arg}) ? (${this.f64SlotCode(def)}) : std::get<${member}>(${arg}))`;
   }
 
   // The C++ element type a boxed variable's cell holds. A captured `number` is
@@ -2192,7 +2259,7 @@ class Emitter {
         // signature matches this `std::function<…>` exactly.)
         const sig = this.sigs.get(e.name);
         if (sig) {
-          const ft: Type = { kind: "function", params: sig.params, ret: sig.ret };
+          const ft = this.fnValueType(sig.params, sig.ret);
           return { code: `${this.cppType(ft)}(${e.name})`, type: ft };
         }
         throw new Error(`Unknown variable: ${e.name}`);
@@ -2240,29 +2307,14 @@ class Emitter {
           rep,
         };
       }
-      case "array": {
-        if (e.elements.length === 0) {
-          throw new Error(
-            "Empty array literals are not supported (element type cannot be inferred)",
-          );
-        }
-        const vals = e.elements.map((el) => this.emitExpr(el));
-        const element = vals[0].type;
-        for (const val of vals) {
-          if (!sameType(val.type, element)) {
-            throw new Error("All array elements must have the same type");
-          }
-        }
-        const arrType: ArrayType = { kind: "array", element };
-        const items = vals.map((v) => this.f64SlotCode(v)).join(", ");
-        // A reference-typed array: a shared_ptr to a heap vector (so `let b = a`
-        // aliases, mutations are shared, and `===` is identity — JS semantics).
-        const vec = this.vecType(arrType);
-        return {
-          code: `tsn_make_rc<${vec}>(${vec}{${items}})`,
-          type: arrType,
-        };
-      }
+      case "array":
+        return this.emitArrayLiteral(e.elements);
+      case "spread":
+        // A spread is only meaningful inside an array literal or a call's argument
+        // list (both handled by their emitters). Anywhere else it has no value.
+        throw new Error(
+          "Spread ('...x') is only valid in an array literal or a call argument (v1)",
+        );
       case "object": {
         const props = e.properties.map((p) => ({
           name: p.name,
@@ -2394,7 +2446,7 @@ class Emitter {
         if (!cls) throw new Error(`Unknown class: ${e.className}`);
         const args = this.checkArgs(
           e.className,
-          cls.ctor.params.map((p) => p.type),
+          this.slotsFromParams(cls.ctor.params),
           e.args,
         );
         return {
@@ -2554,6 +2606,78 @@ class Emitter {
     }
   }
 
+  // --- array literals (with spread) ---------------------------------------
+
+  // Emit an array literal whose `elements` may include `spread` nodes (`[...a]`).
+  // `knownElement` fixes the element type up front (used when collecting a rest
+  // parameter's trailing arguments, where the array may be empty); otherwise the
+  // element type is inferred from the first element / spread. A spread element's
+  // `arg` must be a `T[]` whose element matches. With no spreads this emits the
+  // same `tsn_make_rc<vec>(vec{...})` as before; with spreads it builds a *fresh*
+  // array at runtime via an IIFE (so `[...a]` is a copy), splicing each spread.
+  private emitArrayLiteral(elements: Expr[], knownElement?: Type): Value {
+    let element: Type | undefined = knownElement;
+    const note = (t: Type) => {
+      if (element === undefined) element = t;
+      else if (!sameType(element, t)) {
+        throw new Error("All array elements must have the same type");
+      }
+    };
+    const parts = elements.map((el) => {
+      if (el.kind === "spread") {
+        const v = this.emitExpr(el.arg);
+        if (!isArray(v.type)) {
+          throw new Error(
+            `Spread element must be an array, got '${displayType(v.type)}'`,
+          );
+        }
+        note(v.type.element);
+        return { spread: true, v };
+      }
+      const v = this.emitExpr(el);
+      note(v.type);
+      return { spread: false, v };
+    });
+    if (element === undefined) {
+      throw new Error(
+        "Empty array literals are not supported (element type cannot be inferred)",
+      );
+    }
+    const arrType: ArrayType = { kind: "array", element };
+    const vec = this.vecType(arrType);
+    const hasSpread = parts.some((p) => p.spread);
+    if (!hasSpread) {
+      // A reference-typed array: a tsn_rc to a heap vector (so `let b = a` aliases,
+      // mutations are shared, and `===` is identity — JS semantics).
+      if (parts.length === 0) {
+        return { code: `tsn_make_rc<${vec}>()`, type: arrType };
+      }
+      const items = parts.map((p) => this.f64SlotCode(p.v)).join(", ");
+      return { code: `tsn_make_rc<${vec}>(${vec}{${items}})`, type: arrType };
+    }
+    // The spread builder lowers into a C++ lambda body, where `co_await` can't go.
+    if (elements.some(containsAwait)) {
+      throw new Error(
+        "'await' inside a spread array literal is not supported (v1) — assign the awaited value to a variable first",
+      );
+    }
+    const id = this.ctrlUid++;
+    const t = `_tsn_arr${id}`;
+    const x = `_tsn_el${id}`;
+    const pieces: string[] = [`auto ${t} = tsn_make_rc<${vec}>();`];
+    for (const p of parts) {
+      if (p.spread) {
+        pieces.push(
+          `for (const auto& ${x} : *(${p.v.code})) ${t}->push_back(${x});`,
+        );
+      } else {
+        pieces.push(`${t}->push_back(${this.f64SlotCode(p.v)});`);
+      }
+    }
+    pieces.push(`return ${t};`);
+    return { code: `([&]{ ${pieces.join(" ")} }())`, type: arrType };
+  }
+
   // --- closures / first-class functions -----------------------------------
 
   // Emit a closure (arrow function / function expression) as a C++ lambda wrapped
@@ -2621,7 +2745,9 @@ class Emitter {
       retType = this.unifyReturns(this.inferredRets);
     }
     const retCpp = retType === "void" ? "void" : this.cppType(retType);
-    const fnType: Type = { kind: "function", params: e.params.map((p) => p.type), ret: retType };
+    // The closure's value type: boundary param types (a defaulted param becomes
+    // optional `T | undefined`), with `restParam` set if the last is a rest.
+    const fnType = this.fnValueType(e.params, retType);
     const bodyLines = this.body;
     const closeIndent = saved.indent;
 
@@ -2682,7 +2808,7 @@ class Emitter {
       );
     }
     const ft = callee.type;
-    const args = this.checkArgs("call", ft.params, e.args);
+    const args = this.checkArgs("call", this.slotsFromFunctionType(ft), e.args);
     if (ft.ret === "void" && !asStatement) {
       throw new Error("This function returns void and cannot be used as a value");
     }
@@ -2949,6 +3075,59 @@ class Emitter {
     return isUnion(p) && p.members.some((m) => m === "undefined");
   }
 
+  // `T | undefined`, flattening if `T` is already a union (so a default param's
+  // boundary type stays a flat union). Used as the boundary type of a defaulted /
+  // optional parameter — the caller widens its value into it (or omits it).
+  private optionalUnion(t: Type): Type {
+    if (t === "undefined") return t;
+    if (isUnion(t)) {
+      return t.members.some((m) => m === "undefined")
+        ? t
+        : { kind: "union", members: [...t.members, "undefined"] };
+    }
+    return { kind: "union", members: [t, "undefined"] };
+  }
+
+  // Normalize a callee's `Param[]` into call slots (the call-site view). A rest
+  // param keeps its `T[]` type and is marked `rest`; a defaulted param's boundary
+  // type widens to `T | undefined` and is optional; an `a?: T` param is already a
+  // `T | undefined` union (optional); everything else is a required slot.
+  private slotsFromParams(params: Param[]): CallSlot[] {
+    return params.map((p) => {
+      if (p.rest) return { type: p.type, optional: false, rest: true };
+      if (p.default !== undefined) {
+        return { type: this.optionalUnion(p.type), optional: true, rest: false };
+      }
+      return { type: p.type, optional: this.isOptionalParam(p.type), rest: false };
+    });
+  }
+
+  // Call slots for a function *value* (a closure / function-typed variable). Its
+  // `Type` carries boundary param types already; `restParam` marks the last as a
+  // rest parameter. (Defaults aren't tracked in a function type — a defaulted param
+  // surfaces as an optional `T | undefined` member there.)
+  private slotsFromFunctionType(ft: FunctionType): CallSlot[] {
+    return ft.params.map((t, i) => {
+      const rest = !!ft.restParam && i === ft.params.length - 1;
+      return { type: t, optional: !rest && this.isOptionalParam(t), rest };
+    });
+  }
+
+  // The function-value `Type` of a callee's params/return (for a bare top-level
+  // function name referenced as a value): boundary param types (a defaulted param
+  // becomes optional `T | undefined`), with `restParam` set if the last is a rest.
+  private fnValueType(params: Param[], ret: RetType): FunctionType {
+    const last = params[params.length - 1];
+    return {
+      kind: "function",
+      params: params.map((p) =>
+        p.default !== undefined ? this.optionalUnion(p.type) : p.type,
+      ),
+      ret,
+      restParam: last !== undefined && last.rest ? true : undefined,
+    };
+  }
+
   // Validate an argument count against [min, max] (max defaults to min for an
   // exact count; pass Infinity for "at least min"), throwing a clear error that
   // names `label` (a method/function name) on mismatch. Centralizes the arity
@@ -2987,38 +3166,70 @@ class Emitter {
     return v.code;
   }
 
-  // Type-check a call/ctor argument list against parameter types and return each
-  // argument's C++ code. Reps are reconciled by repr.ts (a float arg demotes the
-  // matching param slot), so no per-argument cast is needed here. A trailing
-  // optional parameter (`a?: T`) may be omitted — an `undefined` default is
-  // appended for it. (Optionals are trailing, enforced by stage 0.)
-  private checkArgs(who: string, params: Type[], args: Expr[]): string[] {
-    const firstOptional = params.findIndex((p) => this.isOptionalParam(p));
-    const min = firstOptional === -1 ? params.length : firstOptional;
-    if (args.length < min || args.length > params.length) {
-      const want =
-        min === params.length ? `${params.length}` : `${min}-${params.length}`;
+  // Type-check a call/ctor argument list against call slots and return each
+  // emitted C++ argument (one per slot). Reps are reconciled by repr.ts (a float
+  // arg demotes the matching param slot), so no per-argument cast is needed here.
+  //  - A trailing optional/defaulted slot may be omitted — an `undefined` default
+  //    is appended for it (the callee's body resolves a default; an optional param
+  //    just receives `undefined`).
+  //  - A trailing **rest** slot collects the remaining arguments into a fresh
+  //    `T[]`, which may include `...spread` args (`f(1, ...xs)`); zero rest args
+  //    give an empty array. A spread argument is allowed *only* in the rest region.
+  private checkArgs(who: string, slots: CallSlot[], args: Expr[]): string[] {
+    const hasRest = slots.length > 0 && slots[slots.length - 1].rest;
+    const fixed = hasRest ? slots.slice(0, -1) : slots;
+    const restSlot = hasRest ? slots[slots.length - 1] : undefined;
+
+    // Required fixed args = leading fixed slots that are neither optional nor a
+    // default (those are trailing among the fixed slots — stage 0 guarantees it).
+    const firstOptional = fixed.findIndex((s) => s.optional);
+    const minFixed = firstOptional === -1 ? fixed.length : firstOptional;
+
+    // A spread argument can only feed the rest region.
+    const firstSpread = args.findIndex((a) => a.kind === "spread");
+    if (firstSpread !== -1 && (!hasRest || firstSpread < fixed.length)) {
       throw new Error(
-        `'${who}' expects ${want} argument(s), got ${args.length}`,
+        `'${who}': a spread argument ('...x') is only allowed for a rest parameter (v1)`,
       );
     }
-    const out = args.map((a, i) => {
-      const val = this.emitExpr(a);
-      if (!this.isAssignable(params[i], val.type)) {
+
+    // Arity. With a rest parameter the maximum is unbounded.
+    const wantMsg = hasRest
+      ? `at least ${minFixed}`
+      : minFixed === fixed.length
+        ? `${fixed.length}`
+        : `${minFixed}-${fixed.length}`;
+    if (args.length < minFixed || (!hasRest && args.length > fixed.length)) {
+      throw new Error(
+        `'${who}' expects ${wantMsg} argument(s), got ${args.length}`,
+      );
+    }
+
+    const out: string[] = [];
+    // Fixed positional args (these are never spreads — guarded above).
+    const fixedCount = Math.min(args.length, fixed.length);
+    for (let i = 0; i < fixedCount; i++) {
+      const val = this.emitExpr(args[i]);
+      if (!this.isAssignable(fixed[i].type, val.type)) {
         throw new Error(
-          `Argument ${i + 1} of '${who}': type '${displayType(val.type)}' is not assignable to '${displayType(params[i])}'`,
+          `Argument ${i + 1} of '${who}': type '${displayType(val.type)}' is not assignable to '${displayType(fixed[i].type)}'`,
         );
       }
-      return this.coerceTo(val, params[i]);
-    });
-    // Omitted trailing optionals default to `undefined` (coerced into the union).
-    for (let i = args.length; i < params.length; i++) {
+      out.push(this.coerceTo(val, fixed[i].type));
+    }
+    // Omitted trailing optionals/defaults receive `undefined`.
+    for (let i = fixedCount; i < fixed.length; i++) {
       out.push(
-        this.coerceTo(
-          { code: "tsn_undefined{}", type: "undefined" },
-          params[i],
-        ),
+        this.coerceTo({ code: "tsn_undefined{}", type: "undefined" }, fixed[i].type),
       );
+    }
+    // Rest: collect the remaining arguments into a fresh T[] (spreads spliced in).
+    if (restSlot) {
+      if (!isArray(restSlot.type)) {
+        throw new Error(`Internal: rest parameter of '${who}' is not an array`);
+      }
+      const arr = this.emitArrayLiteral(args.slice(fixed.length), restSlot.type.element);
+      out.push(arr.code);
     }
     return out;
   }
@@ -3213,9 +3424,13 @@ class Emitter {
       }
       throw new Error(`Unknown function: ${e.callee}`);
     }
-    // Shared arg-checking (handles widening into a union param and omitted
-    // trailing optional params — `a?: T`).
-    const args = this.checkArgs(e.callee, sig.params, e.args);
+    // Shared arg-checking (handles union widening, omitted trailing optional /
+    // defaulted params, and rest-parameter collection / spread args).
+    const args = this.checkArgs(
+      e.callee,
+      this.slotsFromParams(sig.params),
+      e.args,
+    );
     if (sig.ret === "void" && !asStatement) {
       throw new Error(
         `'${e.callee}' returns void and cannot be used as a value`,
@@ -3264,7 +3479,11 @@ class Emitter {
     argExprs: Expr[],
     asStatement: boolean,
   ): { code: string; type: RetType } {
-    const args = this.checkArgs(`.${name}`, fieldType.params, argExprs);
+    const args = this.checkArgs(
+      `.${name}`,
+      this.slotsFromFunctionType(fieldType),
+      argExprs,
+    );
     if (fieldType.ret === "void" && !asStatement) {
       throw new Error(`'${name}' returns void and cannot be used as a value`);
     }
@@ -3651,7 +3870,7 @@ class Emitter {
     }
     const args = this.checkArgs(
       `${cls.name}.${e.method}`,
-      method.params.map((p) => p.type),
+      this.slotsFromParams(method.params),
       e.args,
     );
     if (method.returnType === "void" && !asStatement) {
@@ -3887,6 +4106,8 @@ function containsAwait(e: Expr): boolean {
       return containsAwait(e.receiver);
     case "callValue":
       return containsAwait(e.callee) || e.args.some(containsAwait);
+    case "spread":
+      return containsAwait(e.arg);
     case "closure":
       // A closure's body is a separate function — any `await` in it belongs to that
       // (async) closure's coroutine, not the enclosing one. Don't recurse.

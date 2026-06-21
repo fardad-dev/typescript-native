@@ -22,17 +22,8 @@ describe("closures: subset rejections (clean tsnc errors)", () => {
     ).toThrow(/async arrow/);
   });
 
-  it("rejects a default parameter value", () => {
-    expect(() => lowerSrc(`const f = (x: number = 5): number => x;`)).toThrow(
-      /Default parameter/,
-    );
-  });
-
-  it("rejects a rest parameter", () => {
-    expect(() =>
-      lowerSrc(`const f = (...xs: number[]): number => 0;`),
-    ).toThrow(/Rest parameters/);
-  });
+  // Default and rest parameters on closures are now SUPPORTED (see
+  // tests/cases/default-params.ts, rest-params.ts, and destructure-rest-default.test.ts).
 
   it("rejects `this` captured by an arrow inside a method", () => {
     const src = `

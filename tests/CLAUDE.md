@@ -13,6 +13,8 @@ tests/
   modules.test.ts    # module loader: asserts graph rejections (cycles, collisions, …)
   fetch.test.ts      # fetch: compile+run against a localhost server (network-hermetic)
   union.test.ts      # union types: asserts subset rejections (optional object fields, …)
+  closures.test.ts   # closures: asserts subset rejections (async arrow, this-in-closure, …)
+  destructure.test.ts # destructuring/spread/rest/default: asserts subset rejections (object rest, …)
   cases/
     <name>.ts        # a complete tsn program (the entry)
     <name>.expected  # its exact expected stdout

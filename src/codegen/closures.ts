@@ -59,6 +59,9 @@ class CaptureAnalysis {
     this.curOwner = owner;
     this.frames.push(new Map());
     for (const p of params) this.declare(p.name, false, () => (p.boxed = true));
+    // Default expressions run in the function body's scope: a capture inside one
+    // boxes the captured outer variable, and a closure inside one is analyzed too.
+    for (const p of params) if (p.default !== undefined) this.walkExpr(p.default);
     this.walkStmts(body, false);
     this.frames.pop();
     this.curOwner = saved;
@@ -207,6 +210,9 @@ class CaptureAnalysis {
       case "callValue":
         this.walkExpr(e.callee);
         for (const a of e.args) this.walkExpr(a);
+        return;
+      case "spread":
+        this.walkExpr(e.arg);
         return;
       case "binary":
         this.walkExpr(e.left);

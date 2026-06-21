@@ -168,6 +168,26 @@ instances are all reference types now, the boundary is uniform and simple:
   is no longer any mutation-through-param to reject.
 - **Returns:** `retSlotType` returns a reference type by value — a `tsn_rc`, i.e. the shared
   reference, not a deep copy. `return xs;` hands back the same array the caller can then alias.
+- **Default / rest / spread (call-site `checkArgs`).** Every call/ctor/method/value-call routes its
+  arguments through `checkArgs`, which works over normalized **`CallSlot`s** (`slotsFromParams` from a
+  `Param[]`, or `slotsFromFunctionType` from a function `Type`). A slot is `{ type, optional, rest }`:
+  - a **default** param's slot is optional with boundary type `T | undefined`; an `a?: T` param is
+    already a `T | undefined` optional; a **rest** param's slot is `{ type: T[], rest: true }`.
+  - Arity is checked against `[minFixed, fixedCount]` (unbounded with a rest); an omitted trailing
+    optional/default appends a `tsn_undefined{}`; the **rest** slot collects the remaining args into a
+    fresh `T[]` via `emitArrayLiteral` (so `f(1, ...xs, 2)` splices the spread). A **spread** argument
+    (`...x`) is allowed *only* in the rest region — spreading into a fixed parameter is a clean error.
+  - A **default** parameter is received at the boundary as `T | undefined` under a mangled name
+    (`defaultArgName`); `bindParams` rebinds the user's name to `T` at entry via `resolveDefault`
+    (`holds_alternative<tsn_undefined> ? <default> : std::get<T>`), emitting the default expression in
+    the body's scope so it may reference earlier params. A defaulted `number` param's body slot is f64
+    (`repr.ts` demotes it). A union-typed default param is a clean error (deferred).
+  - **Destructuring params** never reach codegen as patterns — lowering desugars them to a synthetic
+    param + body `let`s (the same as a destructuring `let`).
+- **Spread in array literals.** `emitArrayLiteral` handles `[...a, ...b, c]`: with no spreads it emits
+  the usual `tsn_make_rc<vec>(vec{...})`; with spreads it builds a *fresh* array via an IIFE that
+  `push_back`s each plain element and splices each spread array (so `[...a]` is a copy). It's also
+  what collects a rest parameter's trailing arguments (a known element type, possibly empty).
 
 ## Modules (entry globals + dependency records)
 
@@ -451,9 +471,9 @@ are empty tag structs `tsn_null` / `tsn_undefined`.
   case) emits `std::get<Member>((x).v())` when narrowed to one member (else keeps the variant, typed
   as the smaller union); **reassigning** a narrowed var drops its narrowing. `typeof e` itself is a
   first-class `string` (`tsn_typeof` via `std::visit` for a union; `staticTypeof` otherwise).
-- **Optional parameters** `(a?: T)` are `T | undefined` (lowering); `checkArgs` allows omitted
-  trailing optionals (arity is `min..max`, `min` = first optional param) and appends a
-  `tsn_undefined{}` default. `emitCall` shares `checkArgs`.
+- **Optional parameters** `(a?: T)` are `T | undefined` (lowering); `checkArgs` (over `CallSlot`s)
+  allows omitted trailing optionals/defaults and appends a `tsn_undefined{}`. (Default and rest
+  parameters reuse the same `CallSlot` machinery — see *Function boundaries*.)
 - **Deferred (clean `tsnc:` errors / structural-only):** optional object **fields** (`{ x?: T }` —
   need object-literal field-defaulting + nested coercion), a **ternary** whose branches have
   different types (no union-merge), and union-typed **array/Map/Set element** coercion. Member access
@@ -499,10 +519,14 @@ the same wherever it appears). The pieces:
   overloads of `tsn_truthy` (always true), `tsn_typeof_one` (`"function"`), `tsn_inspect`
   (`[Function (anonymous)]`, forward-declared before the array/map/set inspect templates so a
   function-valued element resolves), and `tsn_json_stringify` (`"null"`, for a function field).
-- **Deferred** (clean `tsnc:` errors): async arrow/function expressions, default/rest parameters,
-  `this` inside a closure, comparing function values with `===`/`!==`, and `JSON.stringify` of a
-  function (direct). Callback array methods / `Map`/`Set.forEach` / `new Promise(executor)` are now
-  unblocked but not yet implemented.
+- **Parameters.** Closures support default / rest / destructuring parameters like any function (see
+  *Function boundaries* — rest/default via `CallSlot`s, destructuring desugared in lowering). The
+  closure's function `Type` (`fnValueType`) uses boundary param types (a defaulted param → optional
+  `T | undefined`) and sets `restParam`, so `f()` / `f(...xs)` on a function value type-check.
+- **Deferred** (clean `tsnc:` errors): async arrow/function expressions, `this` inside a closure,
+  comparing function values with `===`/`!==`, and `JSON.stringify` of a function (direct). Callback
+  array methods / `Map`/`Set.forEach` / `new Promise(executor)` are now unblocked but not yet
+  implemented.
 
 ## Guard clauses
 

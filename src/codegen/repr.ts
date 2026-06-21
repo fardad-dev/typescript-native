@@ -185,7 +185,16 @@ class RepAnalyzer {
   ): void {
     for (const p of params) {
       scope.set(p.name, p.type);
-      if (p.boxed && p.type === "number") this.demote(varSlot(funcKey, p.name));
+      // A boxed (captured) OR defaulted number param uses the f64 cell / extracted
+      // boundary value, so its body slot is f64 — demote to match the emitter.
+      if (p.type === "number" && (p.boxed || p.default !== undefined)) {
+        this.demote(varSlot(funcKey, p.name));
+      }
+    }
+    // Default expressions are emitted in the body scope (so they may reference
+    // earlier params, all bound above) — walk them for nested calls / demotions.
+    for (const p of params) {
+      if (p.default !== undefined) this.visit(p.default, scope, funcKey);
     }
   }
 
@@ -476,10 +485,29 @@ class RepAnalyzer {
         return { type: "boolean", rep: "f64" }; // relational / equality / logical
       }
       case "array": {
-        const els = e.elements.map((el) => this.visit(el, scope, funcKey));
-        const element = (els[0]?.type ?? "number") as Type;
+        // Visit every element for its effects (nested calls, arg→param demotion).
+        // The element type comes from the first element: a spread's element type
+        // (it's a `T[]`), else the plain element's type.
+        let element: Type = "number";
+        let known = false;
+        for (const el of e.elements) {
+          const v = this.visit(el.kind === "spread" ? el.arg : el, scope, funcKey);
+          if (!known) {
+            if (el.kind === "spread") {
+              if (isKind(v.type, "array")) element = v.type.element;
+            } else {
+              element = v.type as Type;
+            }
+            known = true;
+          }
+        }
         return { type: { kind: "array", element }, rep: "f64" };
       }
+      case "spread":
+        // Reached when a spread appears in a call's argument list (array literals
+        // handle their spreads above). Surface the arg's nested calls; the type is
+        // the spread arg's (an array) — callers only use it for arg visiting.
+        return this.visit(e.arg, scope, funcKey);
       case "object": {
         const fields = e.properties.map((p) => ({
           name: p.name,
@@ -738,6 +766,10 @@ class RepAnalyzer {
         for (const p of e.params) {
           scope2.set(p.name, p.type);
           if (p.type === "number") this.demote(varSlot(key, p.name));
+        }
+        // Walk default expressions (a closure's number params are already f64).
+        for (const p of e.params) {
+          if (p.default !== undefined) this.visit(p.default, scope2, key);
         }
         const ret: RetType = e.returnType ?? "void";
         this.walkAll(e.body, scope2, key, ret);
