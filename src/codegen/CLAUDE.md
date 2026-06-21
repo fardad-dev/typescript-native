@@ -42,33 +42,42 @@ field names, the user's functions, `main`).
 | ------------------- | -------------------- | ------------------------------------------------------ |
 | `number`            | `double` or `long long` | f64 by default; integer-valued slots use the `i64` rep (`long long`) — see below. `cppType` returns `double` (the rep used for nested aggregates); `slotType` honors the slot's rep |
 | `boolean`           | `bool`               | `console.log` prints `true`/`false` via `tsn_inspect` (see *Printing* below) |
-| `string`            | `tsn_str`            | ref-counted immutable string (prelude struct); copy = pointer + refcount bump, so array shuffles don't copy chars. Every string expr is a `tsn_str` (literals too: `tsn_str("…")`); operators (`<` `==` `+` `<<`) and `.str()`/`.size()` are defined on it; methods → `tsn_*` helpers (take `const std::string&` via its conversion; mostly return `tsn_str`, but `split` returns a `std::shared_ptr<std::vector<tsn_str>>`) |
-| `T[]`               | `std::shared_ptr<std::vector<T>>` | **reference** type (`vecType` = the pointee `std::vector<T>`): literals `make_shared`, `let b = a` aliases, `===` is identity. `.length` → `(a)->size()` (i64); index derefs: `(*(a))[i]` (cast to `std::size_t`); methods run on `*recv`: `push`→`tsn_push` (new length, f64), `pop`→`tsn_pop` (element; empty → `T()`), `slice`→`make_shared(tsn_array_slice(...))` (new array), `indexOf`→`tsn_array_index_of` (f64, `==` on `T`), `join`→`tsn_join` (`string[]`/`number[]` → `tsn_str`) |
-| `{ ... }`           | `std::shared_ptr<struct>` | **reference** type: `structName()` dedupes the pointee struct by field shape; literals `make_shared<struct>(struct{...})`, field access `obj->f`, number fields use the f64 rep |
-| class `C`           | `std::shared_ptr<C>` | **reference** type: `struct C { fields; ctor; methods; }`, instance is a shared_ptr — `new` → `make_shared`, `.field`/`.method()` via `->`. See *Classes* below |
-| `Map<K, V>`         | `std::shared_ptr<tsn_map<Kc, Vc>>` | **reference** type (`mapPointee`): an insertion-ordered `tsn_map` (runtime). `new Map<K,V>()` → `make_shared`; methods (`set`/`get`/`has`/`del`/`clear`/`keys`/`values`) via `->`; `.size` like `.length` (i64). Keys/values use the f64 rep. See *Math / Map / Set* below |
-| `Set<T>`            | `std::shared_ptr<tsn_set<Tc>>` | **reference** type (`setPointee`): an insertion-ordered `tsn_set`. `new Set<T>(arr?)` → `make_shared` (the array seeds it); `add`/`has`/`del`/`clear`/`values` via `->`; iterable by `for…of`; `.size` (i64) |
-| `Promise<T>`        | `tsn_promise<Tc>` (C++20 coroutine type) | **reference** type: a handle wrapping a `shared_ptr` to promise state. An `async` function's declared return type — its body is a coroutine (`co_return`/`co_await`). `Promise<void>` → `tsn_promise<tsn_unit>`. Resolved numbers use the f64 rep. See *Async / await* below |
-| `Response`          | `std::shared_ptr<tsn_response>` | **reference** type: the `fetch(...)` result. Fields `status` (f64) / `ok` (bool); methods `text()` → `Promise<string>`, `json()` → `Promise<T>` (target type required). See *fetch / Response* below |
+| `string`            | `tsn_str`            | ref-counted immutable string (prelude struct); copy = pointer + refcount bump, so array shuffles don't copy chars. Every string expr is a `tsn_str` (literals too: `tsn_str("…")`); operators (`<` `==` `+` `<<`) and `.str()`/`.size()` are defined on it; methods → `tsn_*` helpers (take `const std::string&` via its conversion; mostly return `tsn_str`, but `split` returns a `tsn_rc<std::vector<tsn_str>>`) |
+| `T[]`               | `tsn_rc<std::vector<T>>` | **reference** type (`vecType` = the pointee `std::vector<T>`): literals `tsn_make_rc`, `let b = a` aliases, `===` is identity. `.length` → `(a)->size()` (i64); index derefs: `(*(a))[i]` (cast to `std::size_t`); methods run on `*recv`: `push`→`tsn_push` (new length, f64), `pop`→`tsn_pop` (element; empty → `T()`), `slice`→`tsn_make_rc(tsn_array_slice(...))` (new array), `indexOf`→`tsn_array_index_of` (f64, `==` on `T`), `join`→`tsn_join` (`string[]`/`number[]` → `tsn_str`) |
+| `{ ... }`           | `tsn_rc<struct>` | **reference** type: `structName()` dedupes the pointee struct by field shape; literals `tsn_make_rc<struct>(struct{...})`, field access `obj->f`, number fields use the f64 rep |
+| class `C`           | `tsn_rc<C>` | **reference** type: `struct C { fields; ctor; methods; }`, instance is a `tsn_rc` — `new` → `tsn_make_rc`, `.field`/`.method()` via `->`. See *Classes* below |
+| `Map<K, V>`         | `tsn_rc<tsn_map<Kc, Vc>>` | **reference** type (`mapPointee`): an insertion-ordered `tsn_map` (runtime). `new Map<K,V>()` → `tsn_make_rc`; methods (`set`/`get`/`has`/`del`/`clear`/`keys`/`values`) via `->`; `.size` like `.length` (i64). Keys/values use the f64 rep. See *Math / Map / Set* below |
+| `Set<T>`            | `tsn_rc<tsn_set<Tc>>` | **reference** type (`setPointee`): an insertion-ordered `tsn_set`. `new Set<T>(arr?)` → `tsn_make_rc` (the array seeds it); `add`/`has`/`del`/`clear`/`values` via `->`; iterable by `for…of`; `.size` (i64) |
+| `Promise<T>`        | `tsn_promise<Tc>` (C++20 coroutine type) | **reference** type: a handle wrapping a `std::shared_ptr` to promise state (the one aggregate left on `shared_ptr` — not a hot path). An `async` function's declared return type — its body is a coroutine (`co_return`/`co_await`). `Promise<void>` → `tsn_promise<tsn_unit>`. Resolved numbers use the f64 rep. See *Async / await* below |
+| `Response`          | `tsn_rc<tsn_response>` | **reference** type: the `fetch(...)` result. Fields `status` (f64) / `ok` (bool); methods `text()` → `Promise<string>`, `json()` → `Promise<T>` (target type required). See *fetch / Response* below |
 
-Arrays, objects and class instances are now **all reference types** (`std::shared_ptr<…>`), so JS
+Arrays, objects and class instances are **all reference types** (`tsn_rc<…>`), so JS
 semantics hold uniformly: copy/assign aliases, mutation through one alias is visible through the
-others, params are mutable (a `shared_ptr` copy aliases the caller's value), and `===`/`!==` is
+others, params are mutable (a `tsn_rc` copy aliases the caller's value), and `===`/`!==` is
 pointer identity. `isAggregate` (array||object) still distinguishes object/array *literals* from
 class instances where lowering/printing differs, but no longer implies a value type.
 
+**`tsn_rc`, not `std::shared_ptr`.** The reference pointer is `tsn_rc<T>` — a non-atomic,
+control-block ref-counted pointer (runtime header), a drop-in for the `shared_ptr` API codegen
+uses (`operator->`/`*`/`bool`, identity `==`/`!=`, `tsn_make_rc` ≈ `make_shared`). Generated
+programs are single-threaded, so `std::shared_ptr`'s atomic refcount is wasted work — and it
+*dominated* element-shuffling hot loops (every `a[j+1] = a[j]` swap is a pointer copy = an atomic
+inc/dec). Switching to a plain-`long` refcount (the same trick `tsn_str` already uses) made that
+copy as cheap as a value move: ~6× on the object-heavy leaderboard benchmark (tsnc/cpp 7.55× →
+1.24×), no semantics change. Only `tsn_promise`'s internal state stays `std::shared_ptr`.
+
 **Aggregates nest.** `T` (array element) and a field type may themselves be aggregates, so
-`cppType` recurses: `number[][]` → `std::shared_ptr<std::vector<std::shared_ptr<std::vector<double>>>>`,
-`{ pts: number[] }` → a struct with a `std::shared_ptr<std::vector<double>>` member,
-`{ inner: { x: number } }` → a struct whose member is a `shared_ptr` to another struct. Because
-struct *members* are now `shared_ptr`s (pointers to incomplete types are fine), struct order no
+`cppType` recurses: `number[][]` → `tsn_rc<std::vector<tsn_rc<std::vector<double>>>>`,
+`{ pts: number[] }` → a struct with a `tsn_rc<std::vector<double>>` member,
+`{ inner: { x: number } }` → a struct whose member is a `tsn_rc` to another struct. Because
+struct *members* are now `tsn_rc`s (pointers to incomplete types are fine), struct order no
 longer needs inner-before-outer — every struct is forward-declared (`struct tsn_ObjN;`) up front.
 Element/field values still pass through `f64SlotCode` (an aggregate value returns as-is; only
 `i64`-rep *numbers* get the `double` cast), and nested numbers stay f64.
 
 A `Value` is `{ code, type, rep? }` — the C++ expression text, its tsn `Type`, and (for
 `number`) its representation `"i64"`/`"f64"`. No length tracking is needed (arrays are real
-`std::vector`s behind a `shared_ptr`).
+`std::vector`s behind a `tsn_rc`).
 
 ## Number representation (`repr.ts`, run before emission)
 
@@ -150,11 +159,11 @@ instances are all reference types now, the boundary is uniform and simple:
 
 - **Params: by value, mutable.** `paramType` collapsed to one rule — `slotType` for every param
   (a `number` honors its i64/f64 rep; everything else is `cppType`). For a reference type that's a
-  `shared_ptr` copy: a refcount bump that **aliases** the caller's value, so a callee mutation
+  `tsn_rc` copy: a refcount bump that **aliases** the caller's value, so a callee mutation
   (`xs.push(v)`, `xs[i] = e`, `obj.f = e`) is visible to the caller — correct JS semantics. The old
   read-only-param apparatus (`readonlyParams` / `assertMutable` / `rootVarName`) is **gone**; there
   is no longer any mutation-through-param to reject.
-- **Returns:** `retSlotType` returns a reference type by value — a `shared_ptr`, i.e. the shared
+- **Returns:** `retSlotType` returns a reference type by value — a `tsn_rc`, i.e. the shared
   reference, not a deep copy. `return xs;` hands back the same array the caller can then alias.
 
 ## Modules (entry globals + dependency records)
@@ -168,7 +177,7 @@ top-level is split into the **entry** (`mod.main`) and **dependency modules** (`
   separately-compiled function body can read it (`this.vars` miss → `this.globals` fallback in the
   `var` / lvalue cases). Nested `let`s (inside a top-level loop/`if`) stay true locals.
 - **Dependency module → memoized `init()` returning a record.** `emitDepInit` compiles a
-  `DepModule` to `std::shared_ptr<tsn_ObjN> tsn_modN_init()` with `static rec; if (rec) return rec;
+  `DepModule` to `tsn_rc<tsn_ObjN> tsn_modN_init()` with `static rec; if (rec) return rec;
   rec = make_shared<…>(); <body>; return rec;`. The body's direct `let`s become record-field
   assignments (`rec->field = …`, through `f64SlotCode` since record fields are object-struct fields
   = f64); other statements run for side effects. It registers a **synthetic signature**
@@ -184,15 +193,15 @@ top-level is split into the **entry** (`mod.main`) and **dependency modules** (`
 ## Classes
 
 A class compiles to `struct C { fields; C(ctor); methods; };` and an **instance** to
-`std::shared_ptr<C>` (`cppType`). This is the roadmap's "heap + ref-counted" representation, and JS
+`tsn_rc<C>` (`cppType`). This is the roadmap's "heap + ref-counted" representation, and JS
 reference semantics fall out for free: copy/assign shares the pointee (aliases see each other's
-mutations), `===` is `shared_ptr::operator==` (identity), and the refcount frees the instance.
+mutations), `===` is `tsn_rc::operator==` (identity), and the refcount frees the instance.
 
 - **Emission order** (`emitModule`): forward-declare every class and object struct → object struct
   defs (`structDefs`) → class struct definitions (`emitClassStruct`: field members + ctor/method
   **declarations**) → out-of-line **definitions** (`emitClassDefs` → `emitCtorDef`/`emitMethodDef`)
   → functions → main (with the inspect fwd-decls/defs interleaved — see *Printing*). Forward decls
-  let any type reference any later/self type via `shared_ptr`; the out-of-line bodies see every type
+  let any type reference any later/self type via `tsn_rc`; the out-of-line bodies see every type
   complete. Building a class struct calls `cppType` on field types, which lazily generates any
   object structs they need.
 - **Methods/ctor are analyzed scopes.** They use scope keys `C#method` / `C#$ctor`
@@ -203,10 +212,10 @@ mutations), `===` is `shared_ptr::operator==` (identity), and the refcount frees
   retRep is queried. `emitCtorDef`/`emitMethodDef` set `currentClass` + bind params, then emit.
 - **`this` and receivers.** `thisValue()` yields `{code:"this", type: class}`; `emitReceiver(e)`
   shortcuts a `this` receiver to that (else `emitExpr`). Member access / method call are uniformly
-  `(code)->name` because both `shared_ptr<C>` and the raw `this` pointer use `->`. Bare `this` as a
+  `(code)->name` because both `tsn_rc<C>` and the raw `this` pointer use `->`. Bare `this` as a
   value is rejected (the `emitExpr` `case "this"` throws) — only `this.field` / `this.method()`.
 - **Params: by value, mutable** — like every parameter now (see *Function boundaries*). An instance
-  passes as a `std::shared_ptr<C>` copy (a refcount bump); mutation through the param (`p.x = …`) is
+  passes as a `tsn_rc<C>` copy (a refcount bump); mutation through the param (`p.x = …`) is
   visible to the caller — correct JS reference semantics, now shared by array/object params too.
   `new`/method args are type-checked by the shared `checkArgs` (no per-arg `f64SlotCode` cast — reps
   are reconciled by `repr.ts`).
@@ -220,9 +229,9 @@ mutations), `===` is `shared_ptr::operator==` (identity), and the refcount frees
 - **Fixed scalar overloads** (`inspectPrelude`): `tsn_inspect(double|long long|bool|const tsn_str&)`
   + a `tsn_quote` (single-quotes a string for *nested* contexts). Quote/escape chars are built from
   their byte values (`(char)39`, `(char)92`) so the generated C++ has **no backslashes**.
-- **Array / Map / Set templates** (in the runtime header): `tsn_inspect(const shared_ptr<vector<T>>&)`
-  → `[ e0, e1 ]`, `tsn_inspect(const shared_ptr<tsn_map<K,V>>&)` → `Map(n) { k => v, ... }`, and
-  `tsn_inspect(const shared_ptr<tsn_set<T>>&)` → `Set(n) { e0, ... }`, each recursing on its
+- **Array / Map / Set templates** (in the runtime header): `tsn_inspect(const tsn_rc<vector<T>>&)`
+  → `[ e0, e1 ]`, `tsn_inspect(const tsn_rc<tsn_map<K,V>>&)` → `Map(n) { k => v, ... }`, and
+  `tsn_inspect(const tsn_rc<tsn_set<T>>&)` → `Set(n) { e0, ... }`, each recursing on its
   element/key/value (object/class elements resolve via ADL at the instantiation point, like arrays).
 - **Per-struct / per-class overloads** (`aggregateInspectDefs` / `inspectBody`): one function per
   generated object struct (`{ k: v, ... }`) and per class (`Name { k: v, ... }`), knowing the field
@@ -275,7 +284,7 @@ carries the program-independent halves; codegen emits the program-dependent shap
   deduction sees one element type. `repr.ts` learned each method's return type.
 - **`Map`/`Set`** (`emitMapMethod` / `emitSetMethod`, constructed by the `mapNew`/`setNew` IR nodes;
   `mapPointee`/`setPointee` give the `tsn_map<Kc,Vc>` / `tsn_set<Tc>` pointee, keys/values/elements
-  in the f64 rep). They're reference types, so `cppType` wraps them in `shared_ptr` and `===`/`for…of`
+  in the f64 rep). They're reference types, so `cppType` wraps them in `tsn_rc` and `===`/`for…of`
   (Set) / `.size` reuse the array machinery. `set`/`add` return the receiver via the same by-value
   IIFE (chainable); `get` returns the value type (`tsn_map::get` yields the value **default** on a
   miss — the no-`undefined` divergence, which the transparent `!` non-null assertion in lowering lets
@@ -381,7 +390,7 @@ microtask loop has **no async I/O**, so `fetch` does a **blocking** libcurl GET 
 keeps the one-tick deferral, so JS ordering still holds.
 
 - **`fetch` node** → `tsn_fetch(url)` (verifies the URL is a string). The runtime
-  ([cpp/tsn_runtime.h](cpp/tsn_runtime.h)) buffers the body, then resolves `shared_ptr<tsn_response>{
+  ([cpp/tsn_runtime.h](cpp/tsn_runtime.h)) buffers the body, then resolves `tsn_rc<tsn_response>{
   status, ok = 200..=299, body }`; a **transport error rejects** (so `await` throws the reason
   string, catchable by `try`/`catch`), while an **HTTP error status resolves** with `ok === false`
   (matching real fetch). The curl include + `tsn_fetch` are `#ifdef TSN_ENABLE_FETCH`.

@@ -14,13 +14,13 @@ is added or changed.
   - `{ kind: "class"; name: string }` — a named class instance.
   - `{ kind: "map"; key: Type; value: Type }` / `{ kind: "set"; element: Type }` — `Map<K, V>` /
     `Set<T>`. Codegen compiles **all** of these composite shapes (array, object, class, map, set) to
-    `std::shared_ptr<…>` reference types — the `Type` union doesn't encode value-vs-reference; that's
-    a codegen decision.
+    `tsn_rc<…>` reference types (a non-atomic ref-counted pointer) — the `Type` union doesn't encode
+    value-vs-reference; that's a codegen decision.
   - `{ kind: "promise"; value?: Type }` — `Promise<T>` (the result type of an `async` function and a
     first-class value); `value` absent = `Promise<void>`. A reference type too (codegen → the C++20
     coroutine type `tsn_promise<…>`); resolved numbers use the f64 rep.
   - `{ kind: "response" }` — the `Response` of a `fetch(...)` — a built-in reference type
-    (codegen → `std::shared_ptr<tsn_response>`): fields `status`/`ok`, methods `text()`/`json()`.
+    (codegen → `tsn_rc<tsn_response>`): fields `status`/`ok`, methods `text()`/`json()`.
 - **`BinaryOp`** — `"+" | "-" | "*" | "/" | "%"`.
 - **`Expr`** (discriminated union) — `num`, `bool`, `str`, `var`, `binary`, `ternary`
   (`cond ? whenTrue : whenFalse`; branches share a type = the result type), `unary`, `array`,
@@ -55,7 +55,7 @@ is added or changed.
 ## Design notes
 
 - **Arrays carry only their element type**, not a length. Length is *value-level* — arrays
-  compile to `std::vector` (behind a `shared_ptr`), so `.length` is `.size()` at runtime.
+  compile to `std::vector` (behind a `tsn_rc`), so `.length` is `.size()` at runtime.
 - **Objects carry their fields in declaration order**, and that order **is** the struct layout
   used by codegen. Type *equality* is structural and order-independent, but the stored layout
   follows the object literal.
@@ -63,8 +63,9 @@ is added or changed.
   `length`, a Map/Set `size`, an object field load, or a class field load based on the value's type.
   Likewise `methodCall` dispatches on the receiver type (string/array/map/set helper vs instance method).
 - **Arrays, objects, class instances, Maps/Sets, and Promises are all *reference* types** in codegen
-  (each holds a `std::shared_ptr<…>`): aliasing, shared mutation, mutable params, identity `===`/`!==`.
-  (A `promise` is a `tsn_promise<…>` handle wrapping a `shared_ptr` to its state.) `this`
+  (each holds a `tsn_rc<…>`, a non-atomic ref-counted pointer): aliasing, shared mutation, mutable
+  params, identity `===`/`!==`. (A `promise` is a `tsn_promise<…>` handle wrapping a `std::shared_ptr`
+  to its state — the one exception.) `this`
   is only valid as `this.field` / `this.method()` (bare `this` as a value isn't modeled yet). The
   `class` `Type` carries just the name; the layout/methods live in the `ClassDecl` (looked up by
   name in codegen).

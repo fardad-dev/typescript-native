@@ -169,7 +169,8 @@ Implemented and tested end-to-end:
 - **Arrays & objects are reference types** (like classes, and like JS): `let b = a` aliases the
   same value, a mutation through one alias is visible through the other, a callee can mutate an
   array/object **parameter** (visible to the caller), and `===`/`!==` compare **identity** (two
-  distinct literals with equal contents are `!==`). They compile to `std::shared_ptr<…>`.
+  distinct literals with equal contents are `!==`). They compile to `tsn_rc<…>` — a non-atomic
+  ref-counted pointer (single-threaded, so cheaper than `std::shared_ptr`; see the rep notes).
 - **Arrays:** literals (incl. empty `[]` with an annotation); `xs.push(v)` (returns the new
   `length`, usable as a value); `xs.pop()` / `xs.shift()` → the removed last/first element (empty
   array → the element type's default, since the subset has no `undefined`); `xs.unshift(...items)` →
@@ -217,7 +218,7 @@ Implemented and tested end-to-end:
   `break`/`continue` **inside** a `finally` body (it runs from a destructor, which must not unwind).
 - **Functions:** top-level, typed params + return type, `return`, calls, `void`; recursion works.
   Params and returns may be **arrays and objects**, not just scalars. Every parameter passes **by
-  value** — for arrays/objects/instances that's a `shared_ptr` copy (a refcount bump) that aliases
+  value** — for arrays/objects/instances that's a `tsn_rc` copy (a refcount bump) that aliases
   the caller's value, so a callee mutation is visible to the caller (JS reference semantics);
   returns likewise hand back the shared reference.
 - **Async / await:** **`async` functions and methods**, **`await`**, the **`Promise<T>`** type
@@ -298,13 +299,13 @@ tsn types map onto C++ types (see [src/codegen/CLAUDE.md](src/codegen/CLAUDE.md)
 | number    | `double` or `long long` | IEEE f64 by default; **integer-valued numbers use a 64-bit int rep** (see below). Printed JS-style                                                   |
 | boolean   | `bool`                  | `console.log` prints `true` / `false` (via `tsn_inspect`)                                                                                            |
 | string    | `tsn_str`               | ref-counted immutable string; copy = pointer + refcount bump (no char copy); methods → `tsn_*` helpers                                               |
-| `T[]`     | `std::shared_ptr<std::vector<T>>` | **reference** type: heap vector, shared on copy/assign (aliasing, shared mutation, identity `===`); `.length` → `->size()`, index `(*a)[i]`, methods → `tsn_*` helpers on `*a` |
-| `{ ... }` | `std::shared_ptr<struct>` | **reference** type: heap struct (one per distinct field shape), shared on copy/assign; field access `obj->f`                                       |
-| class `C` | `std::shared_ptr<C>`    | **reference** type: `new C()` is heap + ref-counted; copy/assign aliases (shared mutation, identity via `==`); `struct C { fields; ctor; methods; }` |
-| `Map<K, V>` | `std::shared_ptr<tsn_map<K, V>>` | **reference** type: insertion-ordered `tsn_map` (runtime), shared on copy/assign; methods via `->`; `.size` → `->size()` (i64). Keys/values use the f64 rep |
-| `Set<T>` | `std::shared_ptr<tsn_set<T>>` | **reference** type: insertion-ordered `tsn_set`; iterable by `for…of`; methods via `->`; `.size` (i64) |
-| `Promise<T>` | `tsn_promise<T>` (a C++20 coroutine type) | **reference** type: a handle holding a `shared_ptr` to shared promise state. An `async` function returns one (its body is a coroutine using `co_return`/`co_await`); `await` is `co_await`. `Promise<void>` → `tsn_promise<tsn_unit>`. Resolved numbers use the f64 rep |
-| `Response` | `std::shared_ptr<tsn_response>` | **reference** type: the `fetch(...)` result (runtime `tsn_response { status; ok; body }`). Fields `status` (f64) / `ok` (bool); `text()` → `Promise<string>`, `json()` → `Promise<T>`. `tsn_fetch` (libcurl) is `#ifdef TSN_ENABLE_FETCH`; using it links `-lcurl` |
+| `T[]`     | `tsn_rc<std::vector<T>>` | **reference** type: heap vector behind a non-atomic ref-counted pointer (`tsn_rc`), shared on copy/assign (aliasing, shared mutation, identity `===`); `.length` → `->size()`, index `(*a)[i]`, methods → `tsn_*` helpers on `*a` |
+| `{ ... }` | `tsn_rc<struct>` | **reference** type: heap struct (one per distinct field shape), shared on copy/assign; field access `obj->f`                                       |
+| class `C` | `tsn_rc<C>`    | **reference** type: `new C()` is heap + ref-counted; copy/assign aliases (shared mutation, identity via `==`); `struct C { fields; ctor; methods; }` |
+| `Map<K, V>` | `tsn_rc<tsn_map<K, V>>` | **reference** type: insertion-ordered `tsn_map` (runtime), shared on copy/assign; methods via `->`; `.size` → `->size()` (i64). Keys/values use the f64 rep |
+| `Set<T>` | `tsn_rc<tsn_set<T>>` | **reference** type: insertion-ordered `tsn_set`; iterable by `for…of`; methods via `->`; `.size` (i64) |
+| `Promise<T>` | `tsn_promise<T>` (a C++20 coroutine type) | **reference** type: a handle holding a `std::shared_ptr` to shared promise state (the one aggregate still on `shared_ptr` — not a hot path). An `async` function returns one (its body is a coroutine using `co_return`/`co_await`); `await` is `co_await`. `Promise<void>` → `tsn_promise<tsn_unit>`. Resolved numbers use the f64 rep |
+| `Response` | `tsn_rc<tsn_response>` | **reference** type: the `fetch(...)` result (runtime `tsn_response { status; ok; body }`). Fields `status` (f64) / `ok` (bool); `text()` → `Promise<string>`, `json()` → `Promise<T>`. `tsn_fetch` (libcurl) is `#ifdef TSN_ENABLE_FETCH`; using it links `-lcurl` |
 
 - **`number` is f64, but integer-valued numbers use a 64-bit integer representation.** A
   pre-pass ([src/codegen/repr.ts](src/codegen/repr.ts)) infers, per variable / parameter / return,
@@ -328,23 +329,29 @@ tsn types map onto C++ types (see [src/codegen/CLAUDE.md](src/codegen/CLAUDE.md)
   tradeoff: every string is a heap allocation (no `std::string` small-string optimization), so
   string-creation-heavy code pays an alloc per value. The refcount is a plain (non-atomic) `long`
   — generated programs are single-threaded.
-- **Arrays/objects are reference types (`shared_ptr`), matching JS.** `let b = a` aliases the
+- **Arrays/objects are reference types (`tsn_rc`), matching JS.** `let b = a` aliases the
   same heap value, so `b.push(v)` / `b[i] = e` / `b.f = e` is visible through `a`; `===`/`!==`
   compare pointer identity (two distinct literals with equal contents are `!==`); and a function
-  can mutate an array/object parameter — the mutation is visible to the caller. The cost is one
-  `shared_ptr` indirection per element/field access (`(*a)[i]`, `obj->f`); `clang -O3` hoists the
-  invariant pointer out of hot loops, so the integer benchmark (no arrays) is unaffected and the
-  array-heavy word-sort pays only ~3% at the largest JIT-warm sizes (see the roadmap). This
-  replaces the earlier value-typed model (`std::vector`/`struct` by value, `const&` read-only
-  params) — that was a deliberate, documented divergence from JS that reference-typing removes.
+  can mutate an array/object parameter — the mutation is visible to the caller. They compile to
+  **`tsn_rc<…>`, a non-atomic ref-counted pointer** (like `tsn_str`), *not* `std::shared_ptr`:
+  generated programs are single-threaded, so `shared_ptr`'s atomic refcount is pure overhead — and
+  it **dominated** object/array-shuffling hot loops (every `a[j+1] = a[j]` swap was an atomic
+  inc/dec). Switching to a plain-`long` refcount made that copy as cheap as a value move: the
+  object-heavy leaderboard benchmark went from ~7.5× slower than hand-written C++ to ~1.2× (a ~6×
+  speedup), with no change to JS semantics. The remaining cost is one pointer indirection per
+  element/field access (`(*a)[i]`, `obj->f`); `clang -O3` hoists the invariant pointer out of hot
+  loops, so the integer benchmark (no arrays) is unaffected and the string word-sort (its swaps
+  copy `tsn_str`, already non-atomic) stays ~parity with V8. This reference-typed model replaces an
+  earlier value-typed one (`std::vector`/`struct` by value, `const&` read-only params) — a
+  deliberate divergence from JS that reference-typing removed.
 - **Function boundaries:** params and returns may be arrays/objects. Every parameter passes **by
-  value**; for a reference type (array/object/instance) that's a `shared_ptr` copy — a refcount
+  value**; for a reference type (array/object/instance) that's a `tsn_rc` copy — a refcount
   bump that aliases the caller's value, so callee mutations are visible to the caller (JS
-  semantics). Returns hand back the shared reference the same way (a `shared_ptr`, not a deep copy).
+  semantics). Returns hand back the shared reference the same way (a `tsn_rc`, not a deep copy).
 - **Aggregates nest:** object fields and array elements may themselves be aggregates —
   `{ pts: number[] }`, `{ inner: { x: number } }`, `number[][]`, `{ x: number }[]`. These map to
-  C++ as nested reference types (`std::shared_ptr<std::vector<std::shared_ptr<std::vector<double>>>>`,
-  a struct whose members are `shared_ptr`s), and `lowerType` / struct generation recurse through the
+  C++ as nested reference types (`tsn_rc<std::vector<tsn_rc<std::vector<double>>>>`,
+  a struct whose members are `tsn_rc`s), and `lowerType` / struct generation recurse through the
   shape. Nested _number_ fields and elements always use the f64 rep (`double`). Reading, mutating
   (`box.inner.x = 9`, `poly.pts[0] = 9`), and pushing onto a nested array (`poly.pts.push(v)`) all
   work; an empty array as a field (`{ pts: [] }`) still errors (no annotation to infer the element
@@ -721,6 +728,24 @@ pair** (red → green).
       live in [tests/fetch.test.ts](tests/fetch.test.ts), not a `cases/*` pair. **Deferred** (clean
       `tsnc:` errors): request options / non-GET (`fetch(url, {…})` — needs optional object fields,
       blocked on unions), `res.headers`/`blob()`/`statusText`, and a bare `res.json()` with no target.
+- [x] **Non-atomic ref-counting for aggregates (`tsn_rc`)** — a runtime-only perf fix that removed a
+      latent ~7× slowdown on object/array-heavy code. Arrays/objects/class-instances/Map/Set/Response
+      were represented as **`std::shared_ptr`**, whose refcount is **atomic** on macOS libc++ (always —
+      no single-threaded fast path). In an O(n²) insertion sort over an object array, every
+      `players[j+1] = players[j]` swap is a `shared_ptr` copy = an atomic inc/dec; a microbench isolated
+      the cost (N=40k: `shared_ptr` 5.58s, value `std::vector<Player>` 0.77s, raw `Player*` 0.36s — so
+      **~93% of the time was the atomic refcount**, not indirection). `tsn_str` *already* used a plain
+      (non-atomic) `long` refcount ("generated programs are single-threaded"), so the string word-sort
+      was fine (~3%) — but that invariant was never applied to the `shared_ptr`-based aggregates, and the
+      "~3%" figure was measured only on strings. The fix adds **`tsn_rc<T>`** to the runtime — a
+      drop-in, non-atomic, control-block ref-counted pointer (`operator->`/`*`/`bool`, identity
+      `==`/`!=`, `tsn_make_rc` mirroring `make_shared`) — and `cppType` + every `make_shared` site +
+      the per-type `tsn_inspect`/`tsn_json_stringify` overloads now emit `tsn_rc`/`tsn_make_rc` for all
+      six aggregate reference types (Promise's *internal* state stays `std::shared_ptr` — not hot). No
+      semantics change (aliasing, shared mutation, `===` identity all hold) and all 143 tests stay green;
+      the object-heavy leaderboard benchmark dropped **~6×** (tsnc/cpp 7.55× → 1.24×, now ~parity with
+      hand-written C++ and HotSpot C2), while the integer (primes) and string (word-sort) benchmarks are
+      unchanged. See `tsn_rc` in [src/codegen/cpp/tsn_runtime.h](src/codegen/cpp/tsn_runtime.h).
 
 ### todo
 

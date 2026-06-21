@@ -12,8 +12,8 @@ export type Type =
   | "string"
   | { kind: "array"; element: Type }
   | { kind: "object"; fields: Field[] }
-  // An instance of a named class. Unlike arrays/objects (value types), a class
-  // instance is a *reference* type — see codegen (compiles to std::shared_ptr<C>).
+  // An instance of a named class. Like arrays/objects, a class instance is a
+  // *reference* type — see codegen (compiles to tsn_rc<C>).
   | { kind: "class"; name: string }
   // `Map<K, V>` / `Set<T>` — reference types backed by an insertion-ordered
   // tsn_map / tsn_set (see codegen). Keys/values/elements may be any value type;
@@ -28,7 +28,7 @@ export type Type =
   // f64 rep (like array elements / object fields).
   | { kind: "promise"; value?: Type }
   // The `Response` of a `fetch(...)` — a built-in reference type (like Map/Set),
-  // compiled to `std::shared_ptr<tsn_response>`. Fields `status: number` /
+  // compiled to `tsn_rc<tsn_response>`. Fields `status: number` /
   // `ok: boolean`; methods `text(): Promise<string>` and `json(): Promise<T>`
   // (the body is buffered, so both return already-resolved promises). See codegen.
   | { kind: "response" };

@@ -98,7 +98,7 @@ function isPromise(t: Type): t is PromiseType {
 function isClass(t: Type): t is ClassType {
   return typeof t === "object" && t.kind === "class";
 }
-// A `fetch` Response (reference type → `std::shared_ptr<tsn_response>`).
+// A `fetch` Response (reference type → `tsn_rc<tsn_response>`).
 function isResponse(t: Type): t is ResponseType {
   return typeof t === "object" && t.kind === "response";
 }
@@ -299,9 +299,9 @@ class Emitter {
     const classDefs = mod.classes.flatMap((c) => this.emitClassDefs(c));
     const defs = mod.functions.map((fn) => this.emitFunction(fn));
     // Forward-declare every class and object struct so any type can reference any
-    // other (or itself) through `std::shared_ptr<…>` (a pointer to an incomplete
-    // type is fine). With reference-typed aggregates, struct *members* are also
-    // shared_ptrs, so struct order no longer needs inner-before-outer.
+    // other (or itself) through `tsn_rc<…>` (a pointer to an incomplete type is
+    // fine). With reference-typed aggregates, struct *members* are also tsn_rc
+    // pointers, so struct order no longer needs inner-before-outer.
     const classFwd = mod.classes.map((c) => `struct ${c.name};`);
     const structFwd = [...this.structNames.values()].map((n) => `struct ${n};`);
     // Per-type `tsn_inspect` overloads (computed after all structs are known, so
@@ -366,16 +366,19 @@ class Emitter {
   // --- type mapping -------------------------------------------------------
 
   // The *value* representation of a tsn type. Arrays, objects and class instances
-  // are all *reference* types — a `std::shared_ptr` to a heap value — so copy/assign
-  // aliases the same value (JS reference semantics) and `===` is pointer identity.
+  // are all *reference* types — a `tsn_rc` (non-atomic ref-counted pointer) to a
+  // heap value — so copy/assign aliases the same value (JS reference semantics) and
+  // `===` is pointer identity. `tsn_rc` is used instead of `std::shared_ptr` because
+  // generated programs are single-threaded: shared_ptr's atomic refcount is pure
+  // overhead and dominates element-shuffling hot loops (see tsn_rc in the runtime).
   // The pointee (the `std::vector<T>` / generated `struct`) is what `vecType` /
   // `structName` return.
   private cppType(t: Type): string {
-    if (isArray(t)) return `std::shared_ptr<${this.vecType(t)}>`;
-    if (isObject(t)) return `std::shared_ptr<${this.structName(t)}>`;
-    if (isClass(t)) return `std::shared_ptr<${t.name}>`; // reference-typed instance
-    if (isMap(t)) return `std::shared_ptr<${this.mapPointee(t)}>`;
-    if (isSet(t)) return `std::shared_ptr<${this.setPointee(t)}>`;
+    if (isArray(t)) return `tsn_rc<${this.vecType(t)}>`;
+    if (isObject(t)) return `tsn_rc<${this.structName(t)}>`;
+    if (isClass(t)) return `tsn_rc<${t.name}>`; // reference-typed instance
+    if (isMap(t)) return `tsn_rc<${this.mapPointee(t)}>`;
+    if (isSet(t)) return `tsn_rc<${this.setPointee(t)}>`;
     // A `Promise<T>` is a coroutine return type / awaitable (its own handle holds
     // a shared_ptr to the promise state, so it's a reference type). Promise<void>
     // resolves to `tsn_unit`. Resolved numbers use the f64 rep (like array elements).
@@ -383,14 +386,14 @@ class Emitter {
       return `tsn_promise<${t.value === undefined ? "tsn_unit" : this.cppType(t.value)}>`;
     }
     // A `fetch` Response — a reference-typed built-in (runtime `tsn_response`).
-    if (isResponse(t)) return "std::shared_ptr<tsn_response>";
+    if (isResponse(t)) return "tsn_rc<tsn_response>";
     if (t === "number") return "double"; // f64 rep — the default for nested aggregates
     if (t === "boolean") return "bool";
     return "tsn_str"; // string — a ref-counted immutable string (see prelude)
   }
 
   // The pointee vector type for an array reference (`std::vector<T>`), e.g. for
-  // `make_shared` and slice results. `cppType` wraps this in a `shared_ptr`.
+  // `tsn_make_rc` and slice results. `cppType` wraps this in a `tsn_rc`.
   private vecType(t: ArrayType): string {
     return `std::vector<${this.cppType(t.element)}>`;
   }
@@ -454,13 +457,13 @@ class Emitter {
   // need the field names. The array template resolves an object/class element
   // via ADL at its instantiation point in this generated code.
 
-  // `tsn_inspect(const std::shared_ptr<NAME>&)` forward declarations, one per
+  // `tsn_inspect(const tsn_rc<NAME>&)` forward declarations, one per
   // generated object struct and per class (a shared_ptr to an incomplete type is
   // fine in a declaration, so these can precede the full type definitions).
   private inspectFwdDecls(): string[] {
     const names = [...this.structFields.keys(), ...this.classes.keys()];
     return names.map(
-      (n) => `static std::string tsn_inspect(const std::shared_ptr<${n}>& v);`,
+      (n) => `static std::string tsn_inspect(const tsn_rc<${n}>& v);`,
     );
   }
 
@@ -483,14 +486,14 @@ class Emitter {
   private inspectBody(name: string, fields: Field[], prefix: string): string {
     if (fields.length === 0) {
       return [
-        `static std::string tsn_inspect(const std::shared_ptr<${name}>& v) {`,
+        `static std::string tsn_inspect(const tsn_rc<${name}>& v) {`,
         `  if (!v) return "null";`,
         `  return "${prefix}{}";`,
         `}`,
       ].join("\n");
     }
     const lines = [
-      `static std::string tsn_inspect(const std::shared_ptr<${name}>& v) {`,
+      `static std::string tsn_inspect(const tsn_rc<${name}>& v) {`,
       `  if (!v) return "null";`,
       `  std::string out = "${prefix}{ ";`,
     ];
@@ -513,12 +516,12 @@ class Emitter {
   // field names), but emits JSON: double-quoted keys, no spaces, and no class
   // name on an instance — `JSON.stringify(new Pt(1,2))` is `{"x":1,"y":2}`.
 
-  // `tsn_json_stringify(const std::shared_ptr<NAME>&)` forward declarations.
+  // `tsn_json_stringify(const tsn_rc<NAME>&)` forward declarations.
   private jsonStringifyFwdDecls(): string[] {
     const names = [...this.structFields.keys(), ...this.classes.keys()];
     return names.map(
       (n) =>
-        `static std::string tsn_json_stringify(const std::shared_ptr<${n}>& v);`,
+        `static std::string tsn_json_stringify(const tsn_rc<${n}>& v);`,
     );
   }
 
@@ -540,14 +543,14 @@ class Emitter {
   private jsonStringifyBody(name: string, fields: Field[]): string {
     if (fields.length === 0) {
       return [
-        `static std::string tsn_json_stringify(const std::shared_ptr<${name}>& v) {`,
+        `static std::string tsn_json_stringify(const tsn_rc<${name}>& v) {`,
         `  if (!v) return "null";`,
         `  return "{}";`,
         `}`,
       ].join("\n");
     }
     const lines = [
-      `static std::string tsn_json_stringify(const std::shared_ptr<${name}>& v) {`,
+      `static std::string tsn_json_stringify(const tsn_rc<${name}>& v) {`,
       `  if (!v) return "null";`,
       `  std::string out = "{";`,
     ];
@@ -680,7 +683,7 @@ class Emitter {
   // --- classes ------------------------------------------------------------
   //
   // A class `C` compiles to `struct C { fields; C(ctor); methods; }` and an
-  // instance to `std::shared_ptr<C>` (see cppType). Methods/ctor are analyzed by
+  // instance to `tsn_rc<C>` (see cppType). Methods/ctor are analyzed by
   // repr.ts under the scope keys below, so their number params/locals/returns get
   // the same i64/f64 treatment as free functions; the emitter uses the same keys.
   private methodKey(className: string, method: string): string {
@@ -865,13 +868,13 @@ class Emitter {
     }
     const recordType: ObjectType = { kind: "object", fields };
     this.sigs.set(fn, { params: [], ret: recordType });
-    const ptr = this.cppType(recordType); // std::shared_ptr<tsn_ObjN>
+    const ptr = this.cppType(recordType); // tsn_rc<tsn_ObjN>
     const struct = this.structName(recordType);
     const def = [
       `${ptr} ${fn}() {`,
       `  static ${ptr} rec;`,
       `  if (rec) return rec;`, // memoized — runs the body exactly once
-      `  rec = std::make_shared<${struct}>();`,
+      `  rec = tsn_make_rc<${struct}>();`,
       ...this.body,
       `  return rec;`,
       `}`,
@@ -906,7 +909,7 @@ class Emitter {
       this.globals.set(stmt.name, stmt.type);
       this.globalDecls.push(`${this.cppType(stmt.type)} ${stmt.name};`);
       this.push(
-        `${stmt.name} = std::make_shared<${this.vecType(stmt.type)}>();`,
+        `${stmt.name} = tsn_make_rc<${this.vecType(stmt.type)}>();`,
       );
       return;
     }
@@ -1102,7 +1105,7 @@ class Emitter {
         }
         this.vars.set(stmt.name, stmt.type);
         // A reference-typed array is a heap-allocated empty vector.
-        return `${this.cppType(stmt.type)} ${stmt.name} = std::make_shared<${this.vecType(stmt.type)}>()`;
+        return `${this.cppType(stmt.type)} ${stmt.name} = tsn_make_rc<${this.vecType(stmt.type)}>()`;
       }
       const init = this.emitExpr(stmt.init);
       // With an annotation, check assignability; without one, infer from the init.
@@ -1671,7 +1674,7 @@ class Emitter {
         // aliases, mutations are shared, and `===` is identity — JS semantics).
         const vec = this.vecType(arrType);
         return {
-          code: `std::make_shared<${vec}>(${vec}{${items}})`,
+          code: `tsn_make_rc<${vec}>(${vec}{${items}})`,
           type: arrType,
         };
       }
@@ -1695,7 +1698,7 @@ class Emitter {
         // reference types — alias, shared mutation, identity `===`).
         const struct = this.structName(objType);
         return {
-          code: `std::make_shared<${struct}>(${struct}{${items}})`,
+          code: `tsn_make_rc<${struct}>(${struct}{${items}})`,
           type: objType,
         };
       }
@@ -1810,7 +1813,7 @@ class Emitter {
           e.args,
         );
         return {
-          code: `std::make_shared<${e.className}>(${args.join(", ")})`,
+          code: `tsn_make_rc<${e.className}>(${args.join(", ")})`,
           type: { kind: "class", name: e.className },
         };
       }
@@ -1851,7 +1854,7 @@ class Emitter {
       case "mapNew": {
         const t: MapType = { kind: "map", key: e.key, value: e.value };
         return {
-          code: `std::make_shared<${this.mapPointee(t)}>()`,
+          code: `tsn_make_rc<${this.mapPointee(t)}>()`,
           type: t,
         };
       }
@@ -1866,12 +1869,12 @@ class Emitter {
           }
           // Seed from the array's elements (deref the shared_ptr to the vector).
           return {
-            code: `std::make_shared<${this.setPointee(t)}>(*(${init.code}))`,
+            code: `tsn_make_rc<${this.setPointee(t)}>(*(${init.code}))`,
             type: t,
           };
         }
         return {
-          code: `std::make_shared<${this.setPointee(t)}>()`,
+          code: `tsn_make_rc<${this.setPointee(t)}>()`,
           type: t,
         };
       }
@@ -2164,7 +2167,7 @@ class Emitter {
       const elem = this.extractJson(el, t.element);
       return (
         `([&](const tsn_json& ${a}) { ` +
-        `auto ${v} = std::make_shared<${vec}>(); ` +
+        `auto ${v} = tsn_make_rc<${vec}>(); ` +
         `for (const tsn_json& ${el} : ${a}.as_array()) { ${v}->push_back(${elem}); } ` +
         `return ${v}; }(${j}))`
       );
@@ -2185,7 +2188,7 @@ class Emitter {
         .join(" ");
       return (
         `([&](const tsn_json& ${o}) { ` +
-        `auto ${r} = std::make_shared<${struct}>(); ${assigns} ` +
+        `auto ${r} = tsn_make_rc<${struct}>(); ${assigns} ` +
         `return ${r}; }(${j}))`
       );
     }
@@ -2433,7 +2436,7 @@ class Emitter {
           const end = nums[1]?.code ?? "NAN";
           const vec = this.vecType(recv.type);
           return {
-            code: `std::make_shared<${vec}>(tsn_array_slice(${vecRecv}, ${start}, ${end}))`,
+            code: `tsn_make_rc<${vec}>(tsn_array_slice(${vecRecv}, ${start}, ${end}))`,
             type: recv.type,
           };
         }
@@ -2621,7 +2624,7 @@ class Emitter {
             acc = `tsn_array_concat(${acc}, *(${arg.code}))`;
           }
           const vec = this.vecType(recv.type);
-          return { code: `std::make_shared<${vec}>(${acc})`, type: recv.type };
+          return { code: `tsn_make_rc<${vec}>(${acc})`, type: recv.type };
         }
         default:
           throw new Error(`Unsupported array method '${e.method}'`);
@@ -2926,7 +2929,7 @@ class Emitter {
         const limit = argv.length === 2 ? argv[1].code : "NAN";
         // Returns a reference-typed string[] (a shared_ptr to the result vector).
         return {
-          code: `std::make_shared<std::vector<tsn_str>>(tsn_split(${s}, ${argv[0].code}, ${limit}))`,
+          code: `tsn_make_rc<std::vector<tsn_str>>(tsn_split(${s}, ${argv[0].code}, ${limit}))`,
           type: { kind: "array", element: "string" },
         };
       }

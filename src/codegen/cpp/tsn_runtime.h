@@ -109,6 +109,55 @@ inline bool operator!=(const tsn_str& a, const tsn_str& b) { return a.str() != b
 inline tsn_str operator+(const tsn_str& a, const tsn_str& b) { return tsn_str(a.str() + b.str()); }
 inline std::ostream& operator<<(std::ostream& os, const tsn_str& s) { return os << s.str(); }
 
+// A non-atomic, ref-counted shared pointer — the representation for every
+// aggregate REFERENCE type (arrays, object literals, class instances, Map/Set,
+// Response). It is a drop-in for the subset of std::shared_ptr codegen uses
+// (operator-> / operator* / operator bool / identity ==), but its refcount is a
+// plain `long`, not an atomic, exactly like tsn_str above. Generated programs are
+// single-threaded, so std::shared_ptr's atomic increment/decrement on every copy
+// is pure overhead — and it dominates element-shuffling hot loops (e.g. an
+// insertion sort's `a[j+1] = a[j]`, which copies the pointer once per step). A
+// non-atomic refcount makes that copy as cheap as a value move, recovering ~7x on
+// object/array-heavy code while keeping JS reference semantics (alias on copy,
+// shared mutation, `===` identity). Like tsn_str, the box holds the value inline
+// next to the count (one allocation, like std::make_shared).
+template <class T>
+struct tsn_rc {
+  struct Box { long n; T v; };
+  Box* b = nullptr;
+  tsn_rc() = default;
+  explicit tsn_rc(Box* x) noexcept : b(x) {}
+  tsn_rc(const tsn_rc& o) noexcept : b(o.b) { if (b) ++b->n; }
+  tsn_rc(tsn_rc&& o) noexcept : b(o.b) { o.b = nullptr; }
+  tsn_rc& operator=(const tsn_rc& o) noexcept {
+    if (o.b) ++o.b->n;
+    if (b && --b->n == 0) delete b;
+    b = o.b;
+    return *this;
+  }
+  tsn_rc& operator=(tsn_rc&& o) noexcept {
+    if (this != &o) { if (b && --b->n == 0) delete b; b = o.b; o.b = nullptr; }
+    return *this;
+  }
+  ~tsn_rc() { if (b && --b->n == 0) delete b; }
+  T* operator->() const noexcept { return &b->v; }
+  T& operator*() const noexcept { return b->v; }
+  explicit operator bool() const noexcept { return b != nullptr; }
+  // Identity (pointer) equality — backs `===` / `!==` on reference types, so two
+  // distinct literals with equal contents compare unequal (like std::shared_ptr).
+  bool operator==(const tsn_rc& o) const noexcept { return b == o.b; }
+  bool operator!=(const tsn_rc& o) const noexcept { return b != o.b; }
+};
+// Mirrors std::make_shared: one allocation holding the count + a freshly
+// constructed T. Variadic-forwards to T's constructor (a class) or to C++20
+// parenthesized aggregate init (an object/vector/Map/Set struct). Codegen usually
+// passes a fully-built temporary (e.g. tsn_make_rc<tsn_Obj0>(tsn_Obj0{...})),
+// which move-constructs into the box.
+template <class T, class... A>
+static tsn_rc<T> tsn_make_rc(A&&... a) {
+  return tsn_rc<T>(new typename tsn_rc<T>::Box{1, T(std::forward<A>(a)...)});
+}
+
 // --- async / await: promises + the microtask event loop -----------------
 //
 // An `async function` compiles to a C++20 coroutine returning `tsn_promise<T>`
@@ -249,9 +298,9 @@ static tsn_promise<T> tsn_reject(tsn_str reason) {
 // inputs already run concurrently (an async function starts when called), so the
 // in-order await still collects every result; the result array is in input order.
 template <class T>
-static tsn_promise<std::shared_ptr<std::vector<T>>> tsn_all(
-    std::shared_ptr<std::vector<tsn_promise<T>>> ps) {
-  auto out = std::make_shared<std::vector<T>>();
+static tsn_promise<tsn_rc<std::vector<T>>> tsn_all(
+    tsn_rc<std::vector<tsn_promise<T>>> ps) {
+  auto out = tsn_make_rc<std::vector<T>>();
   for (auto& p : *ps) out->push_back(co_await p);
   co_return out;
 }
@@ -261,7 +310,7 @@ static tsn_promise<std::shared_ptr<std::vector<T>>> tsn_all(
 // The microtask runtime has no async I/O, so `fetch(url)` does a *blocking*
 // libcurl GET and returns an already-settled promise. `await fetch(url)` still
 // defers one microtask tick (await_ready is always false), so JS ordering holds.
-// A `Response` is a reference type (shared_ptr<tsn_response>): `status`/`ok`
+// A `Response` is a reference type (tsn_rc<tsn_response>): `status`/`ok`
 // fields plus a buffered `body`; `text()`/`json()` (emitted by codegen) return
 // already-resolved promises over `body`. The struct itself is unconditional (it
 // only uses tsn_str), so a function signature mentioning `Response` compiles even
@@ -286,12 +335,12 @@ static size_t tsn_fetch_write(char* ptr, size_t size, size_t nmemb, void* ud) {
 // …) *rejects* the promise (so `await` throws the reason string, catchable with
 // try/catch); an HTTP error *status* (404/500) is not a failure — it resolves with
 // `ok === false`, matching real `fetch`.
-static tsn_promise<std::shared_ptr<tsn_response>> tsn_fetch(const tsn_str& url) {
+static tsn_promise<tsn_rc<tsn_response>> tsn_fetch(const tsn_str& url) {
   static bool inited = false;  // single-threaded, so a plain guard is fine
   if (!inited) { curl_global_init(CURL_GLOBAL_DEFAULT); inited = true; }
   CURL* curl = curl_easy_init();
   if (!curl) {
-    return tsn_reject<std::shared_ptr<tsn_response>>(
+    return tsn_reject<tsn_rc<tsn_response>>(
         tsn_str("fetch failed: could not initialize libcurl"));
   }
   std::string body;
@@ -304,16 +353,16 @@ static tsn_promise<std::shared_ptr<tsn_response>> tsn_fetch(const tsn_str& url) 
     tsn_str reason =
         tsn_str(std::string("fetch failed: ") + curl_easy_strerror(rc));
     curl_easy_cleanup(curl);
-    return tsn_reject<std::shared_ptr<tsn_response>>(reason);
+    return tsn_reject<tsn_rc<tsn_response>>(reason);
   }
   long code = 0;
   curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
   curl_easy_cleanup(curl);
-  auto resp = std::make_shared<tsn_response>();
+  auto resp = tsn_make_rc<tsn_response>();
   resp->status = (double)code;
   resp->ok = code >= 200 && code <= 299;
   resp->body = tsn_str(std::move(body));
-  return tsn_resolve<std::shared_ptr<tsn_response>>(resp);
+  return tsn_resolve<tsn_rc<tsn_response>>(resp);
 }
 #endif  // TSN_ENABLE_FETCH
 
@@ -360,6 +409,7 @@ static inline bool tsn_truthy(long long v) { return v != 0; }
 static inline bool tsn_truthy(bool b) { return b; }
 static inline bool tsn_truthy(const tsn_str& s) { return s.size() != 0; }
 template <class T> static inline bool tsn_truthy(const std::shared_ptr<T>& p) { return (bool)p; }
+template <class T> static inline bool tsn_truthy(const tsn_rc<T>& p) { return (bool)p; }
 
 // String methods, matching JS String.prototype semantics. Indices are JS
 // numbers (doubles): NaN (the sentinel an omitted optional arg lowers to)
@@ -662,7 +712,7 @@ static double tsn_array_last_index_of(const std::vector<T>& v, const T& x, doubl
 }
 
 // JS Array.prototype.reverse: reverse in place. Codegen returns the array
-// reference (the same shared_ptr) so `a.reverse()` can be chained / used as a value.
+// reference (the same tsn_rc) so `a.reverse()` can be chained / used as a value.
 template <class T>
 static void tsn_array_reverse(std::vector<T>& v) {
   std::reverse(v.begin(), v.end());
@@ -687,7 +737,7 @@ static void tsn_array_fill(std::vector<T>& v, const T& x, double startD, double 
 
 // JS Array.prototype.concat (array operands): a new vector = a then b. Codegen
 // folds a multi-argument concat into nested calls and wraps the result in a fresh
-// shared_ptr (a shallow copy with a new identity, matching JS).
+// tsn_rc (a shallow copy with a new identity, matching JS).
 template <class T>
 static std::vector<T> tsn_array_concat(const std::vector<T>& a, const std::vector<T>& b) {
   std::vector<T> out;
@@ -762,9 +812,9 @@ static inline double tsn_math_random() {
 // JS Map and Set are *insertion-ordered* and compare keys/elements by
 // SameValueZero (≈ identity for objects, value for primitives). These model that
 // with a plain ordered vector and linear lookup using the same `operator==` the
-// arrays use (so tsn_str compares by value, numbers by value, shared_ptr objects
+// arrays use (so tsn_str compares by value, numbers by value, tsn_rc objects
 // by identity). Linear scan is O(n) per op — clarity over a hashed structure, in
-// keeping with this learning compiler. Both are held behind a std::shared_ptr in
+// keeping with this learning compiler. Both are held behind a tsn_rc in
 // generated code, so they are reference types (alias, shared mutation, identity
 // `===`). Subset divergences: a NaN number key won't match (operator== semantics),
 // and a missing `get` yields the value type's default (there is no `undefined`).
@@ -797,13 +847,13 @@ struct tsn_map {
     return true;
   }
   void clear() { entries.clear(); }
-  std::shared_ptr<std::vector<K>> keys() const {
-    auto out = std::make_shared<std::vector<K>>();
+  tsn_rc<std::vector<K>> keys() const {
+    auto out = tsn_make_rc<std::vector<K>>();
     for (const auto& kv : entries) out->push_back(kv.first);
     return out;
   }
-  std::shared_ptr<std::vector<V>> values() const {
-    auto out = std::make_shared<std::vector<V>>();
+  tsn_rc<std::vector<V>> values() const {
+    auto out = tsn_make_rc<std::vector<V>>();
     for (const auto& kv : entries) out->push_back(kv.second);
     return out;
   }
@@ -831,8 +881,8 @@ struct tsn_set {
   void clear() { items.clear(); }
   const T& at(std::size_t i) const { return items[i]; }
   // Set.keys() and Set.values() are both the elements in insertion order.
-  std::shared_ptr<std::vector<T>> values() const {
-    return std::make_shared<std::vector<T>>(items);
+  tsn_rc<std::vector<T>> values() const {
+    return tsn_make_rc<std::vector<T>>(items);
   }
 };
 
@@ -875,10 +925,10 @@ static std::string tsn_inspect(const tsn_str& s) { return tsn_quote(s.str()); }
 // array fields; the definition below resolves scalar elements by ordinary
 // lookup and object/class elements by ADL at instantiation.
 template <class T>
-static std::string tsn_inspect(const std::shared_ptr<std::vector<T>>& a);
+static std::string tsn_inspect(const tsn_rc<std::vector<T>>& a);
 
 template <class T>
-static std::string tsn_inspect(const std::shared_ptr<std::vector<T>>& a) {
+static std::string tsn_inspect(const tsn_rc<std::vector<T>>& a) {
   if (!a || a->empty()) return "[]";
   std::string out = "[ ";
   for (std::size_t i = 0; i < a->size(); ++i) {
@@ -894,7 +944,7 @@ static std::string tsn_inspect(tsn_unit) { return "undefined"; }
 
 // A fetched Response: print its status/ok (Node prints a much richer object; this
 // keeps `console.log(res)` compiling and informative on the subset).
-static std::string tsn_inspect(const std::shared_ptr<tsn_response>& r) {
+static std::string tsn_inspect(const tsn_rc<tsn_response>& r) {
   if (!r) return "undefined";
   return "Response { status: " + tsn_num_to_string(r->status) +
          ", ok: " + (r->ok ? "true" : "false") + " }";
@@ -914,7 +964,7 @@ static std::string tsn_inspect(const tsn_promise<T>& p) {
 // `Set(3) { 1, 2, 3 }` (empty: `Map(0) {}` / `Set(0) {}`). Keys/values/elements
 // recurse through tsn_inspect (object/class elements resolve via ADL, like arrays).
 template <class K, class V>
-static std::string tsn_inspect(const std::shared_ptr<tsn_map<K, V>>& m) {
+static std::string tsn_inspect(const tsn_rc<tsn_map<K, V>>& m) {
   std::size_t n = m ? m->entries.size() : 0;
   std::string out = "Map(" + std::to_string(n) + ")";
   if (n == 0) return out + " {}";
@@ -929,7 +979,7 @@ static std::string tsn_inspect(const std::shared_ptr<tsn_map<K, V>>& m) {
   return out;
 }
 template <class T>
-static std::string tsn_inspect(const std::shared_ptr<tsn_set<T>>& s) {
+static std::string tsn_inspect(const tsn_rc<tsn_set<T>>& s) {
   std::size_t n = s ? s->items.size() : 0;
   std::string out = "Set(" + std::to_string(n) + ")";
   if (n == 0) return out + " {}";
@@ -1251,10 +1301,10 @@ static std::string tsn_json_stringify(long long v) { return std::to_string(v); }
 static std::string tsn_json_stringify(bool b) { return b ? "true" : "false"; }
 static std::string tsn_json_stringify(const tsn_str& s) { return tsn_json_quote(s.str()); }
 template <class T>
-static std::string tsn_json_stringify(const std::shared_ptr<std::vector<T>>& a);
+static std::string tsn_json_stringify(const tsn_rc<std::vector<T>>& a);
 
 template <class T>
-static std::string tsn_json_stringify(const std::shared_ptr<std::vector<T>>& a) {
+static std::string tsn_json_stringify(const tsn_rc<std::vector<T>>& a) {
   if (!a) return "null";
   std::string out = "[";
   for (std::size_t i = 0; i < a->size(); ++i) {
