@@ -79,9 +79,10 @@ A multi-file program is assembled from per-file `lower` results by `loadProgram`
 - `lowerClass(cls)` — fields (typed, no initializers), one constructor, methods. Rejects
   inheritance, `static`, accessors, parameter properties, field initializers, and a missing
   constructor; **ignores** access modifiers (public/private/…). Bodies lower via `lowerStatement`.
-- `lowerParams(params)` — shared typed-parameter lowering (functions, methods, constructors);
-  also rejects parameter-properties (`constructor(private x: ...)`). An **optional parameter**
-  `a?: T` lowers to `T | undefined` (an omitted trailing arg defaults to `undefined` in codegen).
+- `lowerParams(params)` — shared typed-parameter lowering (functions, methods, constructors, and
+  closures); also rejects parameter-properties (`constructor(private x: ...)`) and **default**
+  (`x = 5`) / **rest** (`...args`) parameters (clean v1 errors). An **optional parameter** `a?: T`
+  lowers to `T | undefined` (an omitted trailing arg defaults to `undefined` in codegen).
 - `lowerStatement(node, out)` — `let`/`const`, `return`, `console.log(...)` (special-cased to a
   `log` stmt), bare call expressions (`exprStmt`), and all the control-flow statements: `if`,
   `while`, `do…while`, C-style `for`, `for…of`/`for…in` (helper `lowerForBindingName`), `switch`,
@@ -92,10 +93,11 @@ A multi-file program is assembled from per-file `lower` results by `loadProgram`
   call, the annotation supplies the parse target type (→ a `jsonParse` node).
 - `lowerType(node)` — TS `TypeNode` → IR `Type` (keywords incl. `null`/`undefined`, `T[]`,
   `Array<T>`, `Map<K, V>` / `Set<T>`, `Promise<T>` / `Promise<void>` → a promise type, `Response` →
-  the `fetch` response type, object type literals, and **union types** `A | B | …` via
-  `canonicalizeUnion` — flatten/dedupe/collapse/stable-sort, so `number | string` ≡ `string |
-  number`; a **bare identifier** that isn't a known primitive/built-in → a `class` instance type).
-  An optional object field (`{ x?: T }`) is a clean error (deferred — see codegen).
+  the `fetch` response type, object type literals, **function types** `(a: T) => R` (→ a `function`
+  type; a parenthesized type `(…)` is unwrapped, so `(() => R)[]` lowers), and **union types**
+  `A | B | …` via `canonicalizeUnion` — flatten/dedupe/collapse/stable-sort, so `number | string` ≡
+  `string | number`; a **bare identifier** that isn't a known primitive/built-in → a `class` instance
+  type). An optional object field (`{ x?: T }`) is a clean error (deferred — see codegen).
 - `lowerExpr(node)` — TS `Expression` → IR `Expr` (literals incl. `null` / `undefined` and
   **`typeof e`**, identifiers, binary, ternary
   (`cond ? a : b`), unary, array/object literals, indexing, member access, calls, `new C(...)`,
@@ -116,6 +118,12 @@ A multi-file program is assembled from per-file `lower` results by `loadProgram`
   `JSON.parse(text) as T`: **`await res.json() as T`** (and `const x: T = await res.json()` in
   `lowerVarDecl`) — `Response.json()` is `Promise<any>`, so the target type is captured into a
   `responseJson` node (`responseJsonCall` / `responseJsonAwaitNode`), since the subset has no `any`.
+  **Arrow functions / function expressions** lower to a `closure` node (`lowerClosure`): params via
+  `lowerParams` (annotations required), the return type from an explicit annotation else inferred at
+  codegen, and an expression-bodied arrow's body desugared to a single `return`. Async arrows /
+  generators are clean v1 errors. A **call** lowers to: `methodCall` for `recv.m(args)`, `call` for a
+  bare-identifier `f(args)` (codegen resolves it to a top-level function *or* a function-typed
+  variable), and **`callValue`** for any other callee expression (`getFn()(x)`, `fns[0](x)`, an IIFE).
 - `lowerBinaryOp(kind)` — operator token → `BinaryOp`.
 - `isConsoleLog(expr)` — recognizes the `console.log` callee.
 - `tryLowerJsonCall(node)` / `isJsonParseCall(node)` / `jsonParseNode(call, type)` — recognize and

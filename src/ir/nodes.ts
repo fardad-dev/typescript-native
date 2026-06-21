@@ -45,7 +45,13 @@ export type Type =
   // `number | string` and `string | number` are the *same* type). Codegen maps it
   // to `tsn_union<…>` (a `std::variant`); a member value widens into it (coercion)
   // and `typeof`/`=== null`/truthiness guards narrow it back (see codegen).
-  | { kind: "union"; members: Type[] };
+  | { kind: "union"; members: Type[] }
+  // A first-class function value `(p0: T0, …) => R` — an arrow function, a function
+  // expression, or a reference to a top-level function used as a value. Codegen maps
+  // it to `std::function<Rc(P0c, …)>` (a reference type); a `number` parameter or
+  // return uses the **f64 rep** in the signature (like array elements / promise
+  // values), so a function value's C++ type is stable regardless of context.
+  | { kind: "function"; params: Type[]; ret: RetType };
 
 export type BinaryOp =
   // arithmetic (number -> number)
@@ -133,11 +139,38 @@ export type Expr =
   // "undefined"). For a union operand codegen emits a runtime `tsn_typeof` (the
   // active variant decides at runtime); the value also drives flow narrowing when
   // it appears as `typeof x === "…"` in an `if`/ternary condition (see codegen).
-  | { kind: "typeof"; operand: Expr };
+  | { kind: "typeof"; operand: Expr }
+  // A closure: an arrow function (`(x: T) => e` / `(x: T) => { … }`) or an anonymous
+  // function expression (`function (x: T) { … }`). `returnType` absent ⇒ inferred
+  // from the body at codegen (an expression-bodied arrow lowers its body to one
+  // `return`). `id` is assigned by a pre-pass (src/codegen/closures.ts) so codegen
+  // and repr.ts agree on the closure's rep-scope key. Codegen emits a C++ lambda
+  // wrapped in `std::function<…>`; captured locals are boxed for shared-mutable
+  // closure semantics (see the capture machinery in codegen).
+  | {
+      kind: "closure";
+      params: Param[];
+      returnType?: RetType;
+      body: Stmt[];
+      async: boolean;
+      id?: number;
+    }
+  // Call a function *value* `callee(args)` where `callee` is an arbitrary expression
+  // (a call result `getFn()(x)`, an indexed element `fns[0](x)`, …), as opposed to a
+  // direct named call (`call`) or a method call (`methodCall`). A bare identifier
+  // call stays a `call` node — codegen resolves it to a top-level function or a
+  // function-typed variable.
+  | { kind: "callValue"; callee: Expr; args: Expr[] };
 
+// Several binding sites below carry an optional `boxed` flag, set by the capture
+// pass (src/codegen/closures.ts) when a local variable is captured by a nested
+// closure. A boxed variable is stored in a heap `tsn_box` cell (a `tsn_rc`) so an
+// enclosing scope and its closures share one mutable binding — JS closure
+// semantics. Codegen reads/writes such a variable through the cell (see codegen).
 export type Stmt =
-  // `type` is the annotation; absent means infer from the initializer.
-  | { kind: "let"; name: string; type?: Type; init: Expr }
+  // `type` is the annotation; absent means infer from the initializer. `boxed` ⇒
+  // captured by a nested closure (stored in a shared cell).
+  | { kind: "let"; name: string; type?: Type; init: Expr; boxed?: boolean }
   | { kind: "log"; arg: Expr }
   | { kind: "return"; value?: Expr }
   // a bare expression evaluated for effect (e.g. a function call), result discarded
@@ -154,11 +187,17 @@ export type Stmt =
   // string's characters. `name` is bound fresh each iteration to the element /
   // one-char string. (The element/char type is resolved from `iterable` in
   // codegen, since lowering has no type info.)
-  | { kind: "forOf"; name: string; iterable: Expr; body: Stmt[] }
+  | { kind: "forOf"; name: string; iterable: Expr; body: Stmt[]; boxed?: boolean }
   // `for (let name in target) { body }` — iterate the *keys* of `target`: array /
   // string indices as strings ("0", "1", …), or an object/instance's field names.
   // `name` is always a `string`.
-  | { kind: "forIn"; name: string; target: Expr; body: Stmt[] }
+  | {
+      kind: "forIn";
+      name: string;
+      target: Expr;
+      body: Stmt[];
+      boxed?: boolean;
+    }
   // `switch (disc) { case t: …; default: … }`. A clause with no `test` is the
   // `default`. JS `switch` matches with `===` and *falls through* until a `break`,
   // so codegen lowers to a dispatch + labels (see emit.ts), not a value table.
@@ -183,6 +222,8 @@ export type Stmt =
       catchName?: string;
       catchBody?: Stmt[];
       finallyBody?: Stmt[];
+      // The caught binding is captured by a nested closure (stored in a cell).
+      catchBoxed?: boolean;
     };
 
 // One clause of a `switch`. `test` absent ⇒ the `default` clause. `body` are the
@@ -196,6 +237,8 @@ export type RetType = Type | "void";
 export interface Param {
   name: string;
   type: Type;
+  // Captured by a nested closure ⇒ stored in a shared cell (see `boxed` above).
+  boxed?: boolean;
 }
 
 export interface Func {

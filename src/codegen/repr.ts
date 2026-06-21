@@ -120,7 +120,7 @@ class RepAnalyzer {
       this.changed = false;
       for (const fn of this.mod.functions) {
         const scope = new Map<string, Type>();
-        for (const p of fn.params) scope.set(p.name, p.type);
+        this.bindParams(fn.params, scope, fn.name);
         this.walkAll(fn.body, scope, fn.name, fn.returnType);
       }
       // Class constructors and methods are analyzed as their own scopes (keys
@@ -130,11 +130,11 @@ class RepAnalyzer {
       for (const cls of this.mod.classes) {
         this.currentClass = cls;
         const ctorScope = new Map<string, Type>();
-        for (const p of cls.ctor.params) ctorScope.set(p.name, p.type);
+        this.bindParams(cls.ctor.params, ctorScope, ctorSlotKey(cls.name));
         this.walkAll(cls.ctor.body, ctorScope, ctorSlotKey(cls.name), "void");
         for (const m of cls.methods) {
           const scope = new Map<string, Type>();
-          for (const p of m.params) scope.set(p.name, p.type);
+          this.bindParams(m.params, scope, methodSlotKey(cls.name, m.name));
           this.walkAll(
             m.body,
             scope,
@@ -172,6 +172,27 @@ class RepAnalyzer {
       this.repOf.set(slot, "f64");
       this.changed = true;
     }
+  }
+
+  // Bind a parameter list into a scope. A **boxed** (captured) number parameter is
+  // stored in an f64 cell (boxed numbers use the f64 rep), so demote its slot to
+  // match the emitter; a non-boxed param keeps its inferred rep (demoted from float
+  // call-site arguments by demoteParamsFromArgs, or to f64 if used as a fn value).
+  private bindParams(
+    params: Param[],
+    scope: Map<string, Type>,
+    funcKey: string,
+  ): void {
+    for (const p of params) {
+      scope.set(p.name, p.type);
+      if (p.boxed && p.type === "number") this.demote(varSlot(funcKey, p.name));
+    }
+  }
+
+  // The function type of a top-level function (used when its name is referenced as
+  // a first-class value), so callers/closures see the same `(params) => ret` type.
+  private fnType(fn: Sig): Type {
+    return { kind: "function", params: fn.params.map((p) => p.type), ret: fn.ret };
   }
 
   // Visit each call/ctor/method argument (surfacing nested calls) and, where a
@@ -228,7 +249,9 @@ class RepAnalyzer {
           }
         } else {
           scope.set(s.name, type);
-          if (type === "number" && init.rep === "f64") {
+          // A captured (boxed) number local lives in an f64 cell; a fractional
+          // initializer also forces f64. Either way demote to match the emitter.
+          if (type === "number" && (init.rep === "f64" || s.boxed)) {
             this.demote(varSlot(funcKey, s.name));
           }
         }
@@ -408,7 +431,20 @@ class RepAnalyzer {
             rep: t === "number" ? this.getRep(globalSlot(e.name)) : "f64",
           };
         }
-        return { type: "number", rep: this.getRep(varSlot(funcKey, e.name)) };
+        // A bare reference to a top-level function name = a first-class function
+        // VALUE. It's called through std::function (not a direct call), so its
+        // signature must use the f64 number rep: demote its number params + return.
+        const fn = this.sigs.get(e.name);
+        if (fn) {
+          if (fn.ret === "number") this.demote(retSlot(e.name));
+          for (const p of fn.params) {
+            if (p.type === "number") this.demote(varSlot(e.name, p.name));
+          }
+          return { type: this.fnType(fn), rep: "f64" };
+        }
+        // Otherwise a captured (boxed) local referenced inside a closure (the
+        // enclosing scope isn't inherited here); its cell uses the f64 rep.
+        return { type: "number", rep: "f64" };
       }
       case "unary": {
         const v = this.visit(e.operand, scope, funcKey);
@@ -693,6 +729,32 @@ class RepAnalyzer {
         // jsonParse — the await yields f64 regardless.
         this.visit(e.receiver, scope, funcKey);
         return { type: { kind: "promise", value: e.type }, rep: "f64" };
+      case "closure": {
+        // Walk the body under the closure's own rep-scope key (`$closure<id>`,
+        // matching the emitter) so its locals get reps. A closure's number
+        // parameters and return use the f64 rep in its std::function signature.
+        const key = `$closure${e.id}`;
+        const scope2 = new Map<string, Type>();
+        for (const p of e.params) {
+          scope2.set(p.name, p.type);
+          if (p.type === "number") this.demote(varSlot(key, p.name));
+        }
+        const ret: RetType = e.returnType ?? "void";
+        this.walkAll(e.body, scope2, key, ret);
+        return {
+          type: { kind: "function", params: e.params.map((p) => p.type), ret },
+          rep: "f64",
+        };
+      }
+      case "callValue": {
+        // Call a function value: visit callee + args. Every function return uses
+        // the f64 rep, so the result is f64 (this also demotes any number slot it
+        // flows into — keeping things sound even when the callee type is unknown).
+        const callee = this.visit(e.callee, scope, funcKey);
+        e.args.forEach((a) => this.visit(a, scope, funcKey));
+        const ret = isKind(callee.type, "function") ? callee.type.ret : "number";
+        return { type: ret === "void" ? "number" : ret, rep: "f64" };
+      }
     }
   }
 }

@@ -34,6 +34,9 @@ backend/clang.ts    (4) clang++ .cpp -> native executable
 - [codegen/emit.ts](codegen/emit.ts) — IR → C++ source. See [codegen/CLAUDE.md](codegen/CLAUDE.md).
 - [codegen/repr.ts](codegen/repr.ts) — number-representation pass (`i64`/`f64`) the emitter runs
   first, so integer-valued numbers compile to `long long`. See [codegen/CLAUDE.md](codegen/CLAUDE.md).
+- [codegen/closures.ts](codegen/closures.ts) — closure-preparation pass (also run before emit):
+  assigns each closure an id and marks locals captured by a nested closure as `boxed`. See
+  [codegen/CLAUDE.md](codegen/CLAUDE.md).
 - [codegen/cpp/tsn_runtime.h](codegen/cpp/tsn_runtime.h) — the fixed C++ runtime (`tsn_str`,
   numeric/string/array helpers, `tsn_inspect`); every emitted `.cpp` `#include`s it instead of
   inlining it. See [codegen/CLAUDE.md](codegen/CLAUDE.md).

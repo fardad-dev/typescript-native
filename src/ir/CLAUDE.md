@@ -27,6 +27,10 @@ is added or changed.
     coroutine type `tsn_promise<…>`); resolved numbers use the f64 rep.
   - `{ kind: "response" }` — the `Response` of a `fetch(...)` — a built-in reference type
     (codegen → `tsn_rc<tsn_response>`): fields `status`/`ok`, methods `text()`/`json()`.
+  - `{ kind: "function"; params: Type[]; ret: RetType }` — a first-class function value
+    `(p: T, …) => R` (arrow / function expression / top-level-function reference). A reference type
+    (codegen → `std::function<Rc(Pc…)>`); number params/returns use the f64 rep (a context-stable
+    signature).
 - **`BinaryOp`** — `"+" | "-" | "*" | "/" | "%"`.
 - **`Expr`** (discriminated union) — `num`, `bool`, `str`, `var`, `binary`, `ternary`
   (`cond ? whenTrue : whenFalse`; branches share a type = the result type), `unary`, `array`,
@@ -40,15 +44,21 @@ is added or changed.
   `promiseAll` (`{ arg }` — `Promise.all`), and the fetch pair `fetch` (`{ url }` — a blocking GET
   returning a settled `Promise<Response>`) / `responseJson` (`{ receiver; type }` — `res.json()` as
   a `Promise<T>`; the target `type` is captured up front since `Response.json()` is `Promise<any>`),
-  the `null` / `undefined` literals, and `typeof` (`{ operand }` — a `string`; on a union resolved
-  at runtime, and as `typeof x === "…"` in a guard it drives flow narrowing in codegen).
+  the `null` / `undefined` literals, `typeof` (`{ operand }` — a `string`; on a union resolved
+  at runtime, and as `typeof x === "…"` in a guard it drives flow narrowing in codegen), `closure`
+  (`{ params; returnType?; body; async; id? }` — an arrow / function expression; `returnType` absent
+  ⇒ inferred at codegen; `id` is set by the closure pass), and `callValue` (`{ callee; args }` —
+  calling a function *value*, as opposed to a named `call` or a `methodCall`).
 - **`Stmt`** — `let`, `log`, `return`, `exprStmt` (a bare expression evaluated for effect),
   `assign`, and the control-flow statements: `if`, `while`, `for`, `doWhile`, `forOf`
   (`{ name; iterable; body }`), `forIn` (`{ name; target; body }`), `switch` (`{ disc; cases }`
   where `SwitchCase = { test?; body }`, `test` absent = `default`), `break`/`continue`
   (optional `label`), `labeled` (`{ label; body }` — wraps a loop), `throw` (`{ value }`, a
   string), and `try` (`{ block; catchName?; catchBody?; finallyBody? }`). `switch` + labeled
-  break/continue are lowered to `goto`s in codegen, not modeled with a value table.
+  break/continue are lowered to `goto`s in codegen, not modeled with a value table. Several binding
+  sites carry an optional **`boxed`** flag (`let`, `Param`, `forOf`/`forIn`, and a `try`'s
+  `catchBoxed`), set by the closure pass when the binding is captured by a nested closure (codegen
+  then stores it in a shared `tsn_box` cell).
 - **`RetType`** — `Type | "void"` (functions may return nothing; values never have `void` type).
   An `async` function's `returnType` is a `promise` `Type` (`Promise<void>` is a promise with no
   `value` — not `"void"`).

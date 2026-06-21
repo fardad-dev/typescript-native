@@ -160,6 +160,18 @@ static tsn_rc<T> tsn_make_rc(A&&... a) {
   return tsn_rc<T>(new typename tsn_rc<T>::Box{1, T(std::forward<A>(a)...)});
 }
 
+// A heap cell holding one variable, used to back a CAPTURED local. A C++ lambda's
+// default capture (`[=]`) copies the automatic variables it uses, which would give
+// each closure its own snapshot — wrong for a JS closure that must share (and see
+// later writes to) an enclosing local. So codegen boxes a captured local in a
+// `tsn_rc<tsn_box<T>>`: the cell is one heap value, `[=]` copies the (shared) tsn_rc
+// pointer, and every access goes through `->v`, so the enclosing scope and all its
+// closures read and write one binding (`makeCounter`, shared mutable state, …).
+template <class T>
+struct tsn_box {
+  T v;
+};
+
 // --- async / await: promises + the microtask event loop -----------------
 //
 // An `async function` compiles to a C++20 coroutine returning `tsn_promise<T>`
@@ -451,6 +463,8 @@ static inline bool tsn_truthy(bool b) { return b; }
 static inline bool tsn_truthy(const tsn_str& s) { return s.size() != 0; }
 template <class T> static inline bool tsn_truthy(const std::shared_ptr<T>& p) { return (bool)p; }
 template <class T> static inline bool tsn_truthy(const tsn_rc<T>& p) { return (bool)p; }
+// A function value (closure) is always truthy (every live function is).
+template <class R, class... A> static inline bool tsn_truthy(const std::function<R(A...)>& f) { return (bool)f; }
 static inline bool tsn_truthy(tsn_null) { return false; }
 static inline bool tsn_truthy(tsn_undefined) { return false; }
 // A union is truthy iff its active member is (JS — null/undefined/0/NaN/"" falsy).
@@ -469,6 +483,9 @@ static inline tsn_str tsn_typeof_one(tsn_null) { return tsn_str("object"); }
 static inline tsn_str tsn_typeof_one(tsn_undefined) { return tsn_str("undefined"); }
 template <class T>
 static inline tsn_str tsn_typeof_one(const tsn_rc<T>&) { return tsn_str("object"); }
+// `typeof aFunction === "function"`.
+template <class R, class... A>
+static inline tsn_str tsn_typeof_one(const std::function<R(A...)>&) { return tsn_str("function"); }
 // `typeof` of a union — decided at runtime by the active variant.
 template <class... Ts>
 static inline tsn_str tsn_typeof(const tsn_union<Ts...>& u) {
@@ -992,6 +1009,11 @@ static std::string tsn_inspect(tsn_undefined) { return "undefined"; }
 // lookup and object/class elements by ADL at instantiation.
 template <class T>
 static std::string tsn_inspect(const tsn_rc<std::vector<T>>& a);
+// Forward declaration of the function-value overload (defined below) so the array /
+// map / set inspect templates can print a function-valued element (it isn't found
+// by ADL — `std::function`'s namespace is `std`).
+template <class R, class... A>
+static std::string tsn_inspect(const std::function<R(A...)>&);
 // A union prints its active member (resolved at runtime via std::visit); element
 // overloads (incl. generated object/class ones) resolve by ADL at instantiation.
 template <class... Ts>
@@ -1029,6 +1051,13 @@ static std::string tsn_inspect(const tsn_rc<std::vector<T>>& a) {
 
 // A Promise<void> value prints as `undefined` when nested (e.g. `[ undefined ]`).
 static std::string tsn_inspect(tsn_unit) { return "undefined"; }
+
+// A function value. Node prints `[Function: name]` / `[Function (anonymous)]`; the
+// subset doesn't track the binding name, so every function value prints anonymous.
+template <class R, class... A>
+static std::string tsn_inspect(const std::function<R(A...)>&) {
+  return "[Function (anonymous)]";
+}
 
 // A fetched Response: print its status/ok (Node prints a much richer object; this
 // keeps `console.log(res)` compiling and informative on the subset).
@@ -1395,6 +1424,12 @@ static std::string tsn_json_stringify(tsn_null) { return "null"; }
 static std::string tsn_json_stringify(tsn_undefined) { return "null"; }
 template <class T>
 static std::string tsn_json_stringify(const tsn_rc<std::vector<T>>& a);
+// A function value has no JSON form. JS *omits* a function-valued object property
+// and yields `undefined` at top level; the subset can't omit a key once emitted, so
+// a function field serializes as `null` (a direct JSON.stringify of a function is a
+// clean `tsnc:` error — see emit.ts). A documented edge-case divergence.
+template <class R, class... A>
+static std::string tsn_json_stringify(const std::function<R(A...)>&) { return "null"; }
 // A union serializes its active member (resolved at runtime).
 template <class... Ts>
 static std::string tsn_json_stringify(const tsn_union<Ts...>& u) {

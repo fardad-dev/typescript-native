@@ -37,6 +37,7 @@ import {
   SwitchCase,
 } from "../ir/nodes";
 import { analyze, RepTable, Rep, litRep, combineRep, MAIN_KEY } from "./repr";
+import { prepareClosures } from "./closures";
 
 // Absolute path to the fixed C++ runtime header every generated program
 // #includes (see emitModule). It lives as real C++ under src/codegen/cpp/; the
@@ -76,6 +77,7 @@ type SetType = { kind: "set"; element: Type };
 type PromiseType = { kind: "promise"; value?: Type };
 type ResponseType = { kind: "response" };
 type UnionType = { kind: "union"; members: Type[] };
+type FunctionType = { kind: "function"; params: Type[]; ret: RetType };
 
 function isArray(t: Type): t is ArrayType {
   return typeof t === "object" && t.kind === "array";
@@ -107,6 +109,10 @@ function isResponse(t: Type): t is ResponseType {
 function isUnion(t: Type): t is UnionType {
   return typeof t === "object" && t.kind === "union";
 }
+// A first-class function value (reference type → `std::function<…>`).
+function isFunction(t: Type): t is FunctionType {
+  return typeof t === "object" && t.kind === "function";
+}
 function isAggregate(t: Type): boolean {
   return isArray(t) || isObject(t);
 }
@@ -115,6 +121,13 @@ function isAggregate(t: Type): boolean {
 // comparators — `<`/`>`, not `localeCompare`, so the ordering is byte-stable.
 function byteCompare(a: string, b: string): number {
   return a < b ? -1 : a > b ? 1 : 0;
+}
+
+// The mangled incoming-argument name for a BOXED parameter: the function receives
+// the value under this name, then copies it into a cell named after the parameter
+// (so the body's `(name)->v` accesses, and any closure capturing `name`, share it).
+function boxArgName(name: string): string {
+  return `_tsnarg_${name}`;
 }
 
 function displayType(t: RetType): string {
@@ -128,6 +141,10 @@ function displayType(t: RetType): string {
   }
   if (isResponse(t)) return "Response";
   if (isUnion(t)) return t.members.map((m) => displayType(m)).join(" | ");
+  if (isFunction(t)) {
+    const ps = t.params.map((p) => displayType(p)).join(", ");
+    return `(${ps}) => ${t.ret === "void" ? "void" : displayType(t.ret)}`;
+  }
   if (isObject(t)) {
     return `{ ${t.fields.map((f) => `${f.name}: ${displayType(f.type)}`).join("; ")} }`;
   }
@@ -164,6 +181,14 @@ function sameType(a: Type, b: Type): boolean {
   }
   // Response is a singleton built-in type (no parameters).
   if (isResponse(a) || isResponse(b)) return isResponse(a) && isResponse(b);
+  // Function types: equal iff same arity, same parameter types, same return type.
+  if (isFunction(a) || isFunction(b)) {
+    if (!isFunction(a) || !isFunction(b)) return false;
+    if (a.params.length !== b.params.length) return false;
+    if (!a.params.every((pa, i) => sameType(pa, b.params[i]))) return false;
+    if (a.ret === "void" || b.ret === "void") return a.ret === b.ret;
+    return sameType(a.ret, b.ret);
+  }
   if (isArray(a) && isArray(b)) return sameType(a.element, b.element);
   if (isObject(a) && isObject(b)) {
     if (a.fields.length !== b.fields.length) return false;
@@ -266,7 +291,18 @@ class Emitter {
   // `std::get`). Installed by the `if`/ternary emitters, restored on block exit,
   // and dropped on reassignment (see `analyzeGuard` / the `var` read).
   private narrowed = new Map<string, Type>();
+  // Names (in the current scope) that are BOXED — captured by a nested closure, so
+  // stored in a `tsn_rc<tsn_box<…>>` cell. A read/write of such a variable goes
+  // through the cell (`(name)->v`). Set when a boxed binding is declared (its node
+  // carries the `boxed` flag from the capture pass), inherited into closures (whose
+  // `[=]` captures the shared cell), and dropped when the binding leaves scope.
+  private boxed = new Set<string>();
   private curReturn: RetType = "void";
+  // When emitting a closure with no declared return type, the return type is
+  // INFERRED from its `return` statements: `inferRet` switches the `return` emitter
+  // into collect-mode and `inferredRets` accumulates the returned value types.
+  private inferRet = false;
+  private inferredRets: RetType[] = [];
   // True while emitting an async function/method body — a C++20 coroutine, so a
   // `return` is `co_return` and `await` is `co_await` (and is rejected elsewhere).
   private curAsync = false;
@@ -285,6 +321,9 @@ class Emitter {
   private ctrlUid = 0;
 
   emitModule(mod: Module): string {
+    // Assign closure ids + mark captured locals as boxed (before repr/emit, which
+    // both rely on `closure.id` and the `boxed` flags). See codegen/closures.ts.
+    prepareClosures(mod);
     this.reps = analyze(mod); // decide each number slot's representation
     // Does any function/method use async? If so, main() drains the microtask queue
     // after the synchronous top-level (the event loop). Non-async programs skip it.
@@ -416,6 +455,14 @@ class Emitter {
     // deterministic, rename-stable order (see `unionMemberCpps`) so two structurally
     // equal unions always produce byte-identical C++ type text.
     if (isUnion(t)) return `tsn_union<${this.unionMemberCpps(t).join(", ")}>`;
+    // A function value → `std::function<Ret(P0, …)>`. Number params/returns use the
+    // f64 rep (`cppType` maps number→double), so the C++ type is context-stable: a
+    // function value's signature is the same wherever it appears.
+    if (isFunction(t)) {
+      const ret = t.ret === "void" ? "void" : this.cppType(t.ret);
+      const params = t.params.map((p) => this.cppType(p)).join(", ");
+      return `std::function<${ret}(${params})>`;
+    }
     if (t === "null") return "tsn_null";
     if (t === "undefined") return "tsn_undefined";
     if (t === "number") return "double"; // f64 rep — the default for nested aggregates
@@ -482,6 +529,7 @@ class Emitter {
     if (t === "string") return "string";
     if (t === "boolean") return "boolean";
     if (t === "undefined") return "undefined";
+    if (isFunction(t)) return "function";
     return "object"; // null, array, object, class, map, set, promise, response
   }
 
@@ -671,18 +719,45 @@ class Emitter {
     return this.slotType(p.type, this.reps.varRep(fnName, p.name));
   }
 
-  // `type name` declarators for a parameter list (used in definitions).
+  // `type name` declarators for a parameter list (used in definitions). A boxed
+  // (captured) parameter is received under a mangled name and copied into its cell
+  // at entry (see `bindParams`), so its declarator uses `boxArgName`.
   private declParams(funcKey: string, params: Param[]): string {
     return params
-      .map((p) => `${this.paramType(funcKey, p)} ${p.name}`)
+      .map(
+        (p) =>
+          `${this.paramType(funcKey, p)} ${p.boxed ? boxArgName(p.name) : p.name}`,
+      )
       .join(", ");
   }
 
   // Register parameters as local variables. Every parameter is mutable now —
   // arrays/objects are reference types (a `shared_ptr` alias), so a callee
-  // mutation is visible to the caller, exactly like JS.
+  // mutation is visible to the caller, exactly like JS. A **boxed** (captured)
+  // parameter is received under a mangled name (see `declParams`) and copied into a
+  // heap cell at entry, so the parameter and any closures over it share one binding.
   private bindParams(params: Param[]): void {
-    for (const p of params) this.vars.set(p.name, p.type);
+    for (const p of params) {
+      this.vars.set(p.name, p.type);
+      if (p.boxed) {
+        this.boxed.add(p.name);
+        const elem = this.boxElemType(p.type);
+        this.push(
+          `${this.boxType(p.type)} ${p.name} = tsn_make_rc<tsn_box<${elem}>>(tsn_box<${elem}>{${boxArgName(p.name)}});`,
+        );
+      }
+    }
+  }
+
+  // The C++ element type a boxed variable's cell holds. A captured `number` is
+  // stored in the f64 rep (`double`), like array elements / closure params — so a
+  // box never needs the i64/f64 distinction.
+  private boxElemType(t: Type): string {
+    return t === "number" ? "double" : this.cppType(t);
+  }
+  // The cell type for a boxed variable: `tsn_rc<tsn_box<elem>>`.
+  private boxType(t: Type): string {
+    return `tsn_rc<tsn_box<${this.boxElemType(t)}>>`;
   }
 
   private prototype(fn: Func): string {
@@ -693,8 +768,11 @@ class Emitter {
     this.body = [];
     this.vars = new Map();
     this.narrowed = new Map();
+    this.boxed = new Set();
     this.curReturn = ret;
     this.curAsync = false;
+    this.inferRet = false;
+    this.inferredRets = [];
     this.funcKey = funcKey;
     this.currentClass = undefined;
     this.indent = "  ";
@@ -1399,35 +1477,79 @@ class Emitter {
 
   // --- statements ---------------------------------------------------------
 
+  // Compute a `let`'s declared type and initializer Value. Handles the empty-array
+  // literal (whose element type comes from the annotation) and the
+  // annotation-widens-the-init rule (a union slot keeps its union type). Does NOT
+  // register the variable — callers do that (inlineStmt / emitBoxedLet).
+  private letInit(stmt: { name: string; type?: Type; init: Expr }): {
+    declared: Type;
+    init: Value;
+  } {
+    if (stmt.init.kind === "array" && stmt.init.elements.length === 0) {
+      if (!stmt.type || !isArray(stmt.type)) {
+        throw new Error("Empty array literal needs an array type annotation");
+      }
+      return {
+        declared: stmt.type,
+        init: {
+          code: `tsn_make_rc<${this.vecType(stmt.type)}>()`,
+          type: stmt.type,
+        },
+      };
+    }
+    const init = this.emitExpr(stmt.init);
+    if (stmt.type !== undefined && !this.isAssignable(stmt.type, init.type)) {
+      throw new Error(
+        `Type '${displayType(init.type)}' is not assignable to '${displayType(stmt.type)}'`,
+      );
+    }
+    const declared =
+      stmt.type !== undefined && !sameType(stmt.type, init.type)
+        ? stmt.type
+        : init.type;
+    return { declared, init };
+  }
+
+  // A captured (boxed) `let` in statement position. Emitted in two steps —
+  // allocate the empty cell, then assign — so a self-referential closure
+  // (`const f = (n) => f(n - 1)`, which must be type-annotated) captures the cell
+  // before it is filled. An annotated binding is pre-registered so that closure can
+  // resolve the name while its body is emitted.
+  private emitBoxedLet(stmt: { name: string; type?: Type; init: Expr }): void {
+    if (stmt.type !== undefined) {
+      this.vars.set(stmt.name, stmt.type);
+      this.boxed.add(stmt.name);
+    }
+    const { declared, init } = this.letInit(stmt);
+    this.vars.set(stmt.name, declared);
+    this.boxed.add(stmt.name);
+    const elem = this.boxElemType(declared);
+    const stored = isUnion(declared)
+      ? this.coerceTo(init, declared)
+      : this.f64SlotCode(init);
+    this.push(
+      `${this.boxType(declared)} ${stmt.name} = tsn_make_rc<tsn_box<${elem}>>();`,
+    );
+    this.push(`(${stmt.name})->v = ${stored};`);
+  }
+
   // A `let`/`assign` rendered as a C++ fragment without trailing `;` (also used
   // inline inside a `for (...)` header). `let` registers the variable.
   private inlineStmt(stmt: Stmt): string {
     if (stmt.kind === "let") {
-      // Empty array literal: element type can't be inferred from `[]`, so take
-      // it from the declared annotation (e.g. `let xs: number[] = []`).
-      if (stmt.init.kind === "array" && stmt.init.elements.length === 0) {
-        if (!stmt.type || !isArray(stmt.type)) {
-          throw new Error("Empty array literal needs an array type annotation");
-        }
-        this.vars.set(stmt.name, stmt.type);
-        // A reference-typed array is a heap-allocated empty vector.
-        return `${this.cppType(stmt.type)} ${stmt.name} = tsn_make_rc<${this.vecType(stmt.type)}>()`;
-      }
-      const init = this.emitExpr(stmt.init);
-      // With an annotation, check assignability; without one, infer from the init.
-      if (stmt.type !== undefined && !this.isAssignable(stmt.type, init.type)) {
-        throw new Error(
-          `Type '${displayType(init.type)}' is not assignable to '${displayType(stmt.type)}'`,
-        );
-      }
-      // Bind the *declared* type when the annotation widens the initializer (a
-      // union slot must keep its union type, not narrow to the init's member);
-      // otherwise bind the initializer's exact type (preserving aggregate shape).
-      const declared =
-        stmt.type !== undefined && !sameType(stmt.type, init.type)
-          ? stmt.type
-          : init.type;
+      const { declared, init } = this.letInit(stmt);
       this.vars.set(stmt.name, declared);
+      // A captured (boxed) let — used here only for a for-loop counter (statement
+      // position uses the self-ref-safe two-step form, `emitBoxedLet`). One step is
+      // fine for a counter: its initializer can't be a closure over the counter.
+      if (stmt.boxed) {
+        this.boxed.add(stmt.name);
+        const elem = this.boxElemType(declared);
+        const stored = isUnion(declared)
+          ? this.coerceTo(init, declared)
+          : this.f64SlotCode(init);
+        return `${this.boxType(declared)} ${stmt.name} = tsn_make_rc<tsn_box<${elem}>>(tsn_box<${elem}>{${stored}})`;
+      }
       // The variable's C++ type follows its inferred number representation (a
       // safe-integer initializer that's never assigned a fraction stays i64); an
       // i64 init code widens harmlessly into a demoted (double) slot.
@@ -1477,7 +1599,12 @@ class Emitter {
           throw new Error(
             `Cannot assign to undeclared variable '${target.name}'`,
           );
-        return { code: target.name, type };
+        // A captured (boxed) variable is written through its cell, so the write is
+        // visible to every closure sharing it.
+        const code = this.boxed.has(target.name)
+          ? `(${target.name})->v`
+          : target.name;
+        return { code, type };
       }
       case "index": {
         const arr = this.emitExpr(target.arr);
@@ -1524,6 +1651,13 @@ class Emitter {
   private emitStmt(stmt: Stmt): void {
     switch (stmt.kind) {
       case "let":
+        // A captured (boxed) `let` is emitted in two self-ref-safe steps.
+        if (stmt.boxed) {
+          this.emitBoxedLet(stmt);
+          return;
+        }
+        this.push(`${this.inlineStmt(stmt)};`);
+        return;
       case "assign": {
         this.push(`${this.inlineStmt(stmt)};`);
         return;
@@ -1554,6 +1688,19 @@ class Emitter {
           this.emitAsyncReturn(stmt);
           return;
         }
+        // Inferring a closure's return type: collect each return's value type
+        // (unified afterward) and emit the value without coercing to a known type.
+        if (this.inferRet) {
+          if (!stmt.value) {
+            this.inferredRets.push("void");
+            this.push(`return;`);
+            return;
+          }
+          const val = this.emitExpr(stmt.value);
+          this.inferredRets.push(val.type);
+          this.push(`return ${this.f64SlotCode(val)};`);
+          return;
+        }
         if (this.curReturn === "void") {
           if (stmt.value)
             throw new Error("Cannot return a value from a void function");
@@ -1575,6 +1722,8 @@ class Emitter {
         let code: string;
         if (stmt.expr.kind === "call") {
           code = this.emitCall(stmt.expr, /*asStatement*/ true).code;
+        } else if (stmt.expr.kind === "callValue") {
+          code = this.emitCallValue(stmt.expr, /*asStatement*/ true).code;
         } else if (stmt.expr.kind === "methodCall") {
           code = this.emitMethodCall(stmt.expr, /*asStatement*/ true).code;
         } else if (stmt.expr.kind === "await") {
@@ -1650,8 +1799,12 @@ class Emitter {
         }
         this.exitLoop(ctx);
         // A `let`-introduced loop variable is scoped to the loop in C++; drop it.
-        if (stmt.init && stmt.init.kind === "let")
+        // (A captured counter is boxed once in the header — shared across iterations,
+        // i.e. JS `var`-like capture, a documented divergence from per-iteration `let`.)
+        if (stmt.init && stmt.init.kind === "let") {
           this.vars.delete(stmt.init.name);
+          this.boxed.delete(stmt.init.name);
+        }
         return;
       }
       case "forOf":
@@ -1702,6 +1855,7 @@ class Emitter {
     name: string;
     iterable: Expr;
     body: Stmt[];
+    boxed?: boolean;
   }): void {
     const ctx = this.enterLoop();
     const iter = this.emitExpr(stmt.iterable);
@@ -1738,7 +1892,18 @@ class Emitter {
     const incr = ctx.goto ? "" : `${i}++`;
     this.push(`for (std::size_t ${i} = 0; ${i} < ${sizeExpr}; ${incr}) {`);
     this.withIndent(() => {
-      this.push(`${elemCpp} ${stmt.name} = ${elemCode};`);
+      // A captured loop variable gets a FRESH cell each iteration — so closures
+      // created in different iterations capture distinct bindings (JS `let`
+      // per-iteration semantics: `for (const i of …) fns.push(() => i)`).
+      if (stmt.boxed) {
+        const elem = this.boxElemType(elemType);
+        this.push(
+          `${this.boxType(elemType)} ${stmt.name} = tsn_make_rc<tsn_box<${elem}>>(tsn_box<${elem}>{${elemCode}});`,
+        );
+        this.boxed.add(stmt.name);
+      } else {
+        this.push(`${elemCpp} ${stmt.name} = ${elemCode};`);
+      }
       this.vars.set(stmt.name, elemType);
       for (const s of stmt.body) this.emitStmt(s);
       if (ctx.goto) {
@@ -1746,6 +1911,7 @@ class Emitter {
         this.push(`${i}++;`);
       }
       this.vars.delete(stmt.name);
+      if (stmt.boxed) this.boxed.delete(stmt.name);
     });
     this.push(`}`);
     this.exitLoop(ctx);
@@ -1753,7 +1919,12 @@ class Emitter {
 
   // `for (let k in target)` — iterate the *keys* (always strings). Array/string
   // keys are the indices "0".."n-1"; object/instance keys are the field names.
-  private emitForIn(stmt: { name: string; target: Expr; body: Stmt[] }): void {
+  private emitForIn(stmt: {
+    name: string;
+    target: Expr;
+    body: Stmt[];
+    boxed?: boolean;
+  }): void {
     const ctx = this.enterLoop();
     const tgt = this.emitExpr(stmt.target);
     const id = this.ctrlUid++;
@@ -1782,7 +1953,15 @@ class Emitter {
     const incr = ctx.goto ? "" : `${i}++`;
     this.push(`for (std::size_t ${i} = 0; ${i} < ${sizeExpr}; ${incr}) {`);
     this.withIndent(() => {
-      this.push(`tsn_str ${stmt.name} = ${keyCode};`);
+      // A captured key gets a fresh cell each iteration (see emitForOf).
+      if (stmt.boxed) {
+        this.push(
+          `tsn_rc<tsn_box<tsn_str>> ${stmt.name} = tsn_make_rc<tsn_box<tsn_str>>(tsn_box<tsn_str>{${keyCode}});`,
+        );
+        this.boxed.add(stmt.name);
+      } else {
+        this.push(`tsn_str ${stmt.name} = ${keyCode};`);
+      }
       this.vars.set(stmt.name, "string");
       for (const s of stmt.body) this.emitStmt(s);
       if (ctx.goto) {
@@ -1790,6 +1969,7 @@ class Emitter {
         this.push(`${i}++;`);
       }
       this.vars.delete(stmt.name);
+      if (stmt.boxed) this.boxed.delete(stmt.name);
     });
     this.push(`}`);
     this.exitLoop(ctx);
@@ -1867,6 +2047,7 @@ class Emitter {
     catchName?: string;
     catchBody?: Stmt[];
     finallyBody?: Stmt[];
+    catchBoxed?: boolean;
   }): void {
     const hasFinally = stmt.finallyBody !== undefined;
     const hasCatch = stmt.catchBody !== undefined;
@@ -1886,10 +2067,25 @@ class Emitter {
         this.push(`try {`);
         this.emitBlock(stmt.block);
         const cname = stmt.catchName ?? `_tsn_ex${this.ctrlUid++}`;
-        this.push(`} catch (const tsn_str& ${cname}) {`);
-        if (stmt.catchName) this.vars.set(stmt.catchName, "string");
+        // A captured catch binding is received under a mangled name and boxed into
+        // the user's name, so a closure in the catch body shares the binding.
+        const boxedCatch = !!stmt.catchBoxed && stmt.catchName !== undefined;
+        const recvName = boxedCatch ? boxArgName(cname) : cname;
+        this.push(`} catch (const tsn_str& ${recvName}) {`);
+        if (stmt.catchName) {
+          this.vars.set(stmt.catchName, "string");
+          if (boxedCatch) {
+            this.boxed.add(stmt.catchName);
+            this.push(
+              `  tsn_rc<tsn_box<tsn_str>> ${cname} = tsn_make_rc<tsn_box<tsn_str>>(tsn_box<tsn_str>{${recvName}});`,
+            );
+          }
+        }
         this.emitBlock(stmt.catchBody!);
-        if (stmt.catchName) this.vars.delete(stmt.catchName);
+        if (stmt.catchName) {
+          this.vars.delete(stmt.catchName);
+          if (boxedCatch) this.boxed.delete(stmt.catchName);
+        }
         this.push(`}`);
       } else {
         // finally-only: the RAII guard already covers exceptions/returns.
@@ -1950,6 +2146,9 @@ class Emitter {
         };
       }
       case "var": {
+        // A captured (boxed) variable lives in a heap cell — read through `->v`.
+        const boxedAccess = this.boxed.has(e.name);
+        const access = boxedAccess ? `(${e.name})->v` : e.name;
         // A flow-narrowed union variable: when narrowed to a single member, read
         // it through `std::get<Member>` (the active alternative — sound because the
         // stage-0 checker proved the guard holds on this path); when narrowed to a
@@ -1957,31 +2156,44 @@ class Emitter {
         const narrowedType = this.narrowed.get(e.name);
         if (narrowedType !== undefined && this.declaredUnion(e.name)) {
           if (isUnion(narrowedType)) {
-            return { code: e.name, type: narrowedType };
+            return { code: access, type: narrowedType };
           }
           const mcpp = this.cppType(narrowedType);
           return {
-            code: `std::get<${mcpp}>((${e.name}).v())`,
+            code: `std::get<${mcpp}>((${access}).v())`,
             type: narrowedType,
             rep: narrowedType === "number" ? "f64" : undefined,
           };
         }
-        // A local binding shadows a same-named global, so check `vars` first.
+        // A local binding shadows a same-named global, so check `vars` first. A
+        // boxed local's cell holds the f64 rep for numbers (see `boxElemType`).
         const local = this.vars.get(e.name);
         if (local !== undefined) {
           const rep =
             local === "number"
-              ? this.reps.varRep(this.funcKey, e.name)
+              ? boxedAccess
+                ? "f64"
+                : this.reps.varRep(this.funcKey, e.name)
               : undefined;
-          return { code: e.name, type: local, rep };
+          return { code: access, type: local, rep };
         }
         // Otherwise it may be a module-level global (a promoted top-level var),
-        // visible here even from inside a function/method body.
+        // visible here even from inside a function/method body. (Globals are never
+        // boxed — they are already file-scope, so a closure references them directly.)
         const global = this.globals.get(e.name);
         if (global !== undefined) {
           const rep =
             global === "number" ? this.reps.globalRep(e.name) : undefined;
           return { code: e.name, type: global, rep };
+        }
+        // A bare reference to a top-level function name = a first-class function
+        // VALUE: wrap the function in a `std::function` of its type. (repr.ts forces
+        // such a function's number params/return to the f64 rep, so its C++
+        // signature matches this `std::function<…>` exactly.)
+        const sig = this.sigs.get(e.name);
+        if (sig) {
+          const ft: Type = { kind: "function", params: sig.params, ret: sig.ret };
+          return { code: `${this.cppType(ft)}(${e.name})`, type: ft };
         }
         throw new Error(`Unknown variable: ${e.name}`);
       }
@@ -2208,12 +2420,19 @@ class Emitter {
         // have no JSON form here (Node serializes them as `{}`); reject cleanly
         // rather than emit a C++ overload error.
         const v = this.emitExpr(e.arg);
-        if (isMap(v.type) || isSet(v.type) || isPromise(v.type)) {
+        if (
+          isMap(v.type) ||
+          isSet(v.type) ||
+          isPromise(v.type) ||
+          isFunction(v.type)
+        ) {
           const what = isMap(v.type)
             ? "Map"
             : isSet(v.type)
               ? "Set"
-              : "Promise";
+              : isFunction(v.type)
+                ? "function"
+                : "Promise";
           throw new Error(`JSON.stringify of a ${what} is not supported (v1)`);
         }
         return { code: `tsn_json_stringify(${v.code})`, type: "string" };
@@ -2324,7 +2543,150 @@ class Emitter {
           type: { kind: "promise", value: e.type },
         };
       }
+      case "closure":
+        return this.emitClosure(e);
+      case "callValue": {
+        const v = this.emitCallValue(e, /*asStatement*/ false);
+        // A function value's return uses the f64 rep for numbers.
+        const rep = v.type === "number" ? "f64" : undefined;
+        return { code: v.code, type: v.type as Type, rep };
+      }
     }
+  }
+
+  // --- closures / first-class functions -----------------------------------
+
+  // Emit a closure (arrow function / function expression) as a C++ lambda wrapped
+  // in a `std::function<Ret(P…)>`. The lambda uses default capture `[=]`, which
+  // copies the (boxed) cells of any captured locals by value — so all closures
+  // sharing a captured variable share its one heap cell (see the capture pass).
+  // Parameters and the return type use the f64 number rep (a function value's
+  // signature is context-stable). The return type is taken from the annotation or
+  // inferred from the body's `return`s. Emitting the body swaps the whole
+  // per-function emitter state, restoring it afterward (closures nest).
+  private emitClosure(e: {
+    params: Param[];
+    returnType?: RetType;
+    body: Stmt[];
+    id?: number;
+  }): Value {
+    // Save the enclosing function's scratch state.
+    const saved = {
+      body: this.body,
+      vars: this.vars,
+      boxed: this.boxed,
+      narrowed: this.narrowed,
+      curReturn: this.curReturn,
+      curAsync: this.curAsync,
+      inferRet: this.inferRet,
+      inferredRets: this.inferredRets,
+      funcKey: this.funcKey,
+      breakStack: this.breakStack,
+      pendingLabel: this.pendingLabel,
+      indent: this.indent,
+      ctrlUid: this.ctrlUid,
+    };
+
+    // Set up the closure's own scope. Inherit `vars`/`boxed` so the body can resolve
+    // the types of (and read through the cells of) captured outer variables; start
+    // fresh for narrowing / loops / labels. A closure is never a coroutine here
+    // (async closures are rejected in lowering).
+    this.body = [];
+    this.vars = new Map(saved.vars);
+    this.boxed = new Set(saved.boxed);
+    this.narrowed = new Map();
+    this.curAsync = false;
+    this.funcKey = `$closure${e.id}`;
+    this.breakStack = [];
+    this.pendingLabel = undefined;
+    this.indent = saved.indent + "  ";
+    this.ctrlUid = 0;
+
+    const declParams = this.declParams(this.funcKey, e.params);
+    let retType: RetType;
+    if (e.returnType !== undefined) {
+      this.inferRet = false;
+      this.curReturn = e.returnType;
+      this.bindParams(e.params);
+      for (const s of e.body) this.emitStmt(s);
+      retType = e.returnType;
+    } else {
+      // Infer the return type from the body's `return`s (unified like ternary
+      // branches; no returns ⇒ void).
+      this.inferRet = true;
+      this.inferredRets = [];
+      this.curReturn = "void";
+      this.bindParams(e.params);
+      for (const s of e.body) this.emitStmt(s);
+      retType = this.unifyReturns(this.inferredRets);
+    }
+    const retCpp = retType === "void" ? "void" : this.cppType(retType);
+    const fnType: Type = { kind: "function", params: e.params.map((p) => p.type), ret: retType };
+    const bodyLines = this.body;
+    const closeIndent = saved.indent;
+
+    // Restore the enclosing state.
+    this.body = saved.body;
+    this.vars = saved.vars;
+    this.boxed = saved.boxed;
+    this.narrowed = saved.narrowed;
+    this.curReturn = saved.curReturn;
+    this.curAsync = saved.curAsync;
+    this.inferRet = saved.inferRet;
+    this.inferredRets = saved.inferredRets;
+    this.funcKey = saved.funcKey;
+    this.breakStack = saved.breakStack;
+    this.pendingLabel = saved.pendingLabel;
+    this.indent = saved.indent;
+    this.ctrlUid = saved.ctrlUid;
+
+    const lambda = [
+      `${this.cppType(fnType)}([=](${declParams}) -> ${retCpp} {`,
+      ...bodyLines,
+      `${closeIndent}})`,
+    ].join("\n");
+    return { code: lambda, type: fnType };
+  }
+
+  // Unify the return-value types collected while inferring a closure's return type:
+  // they must all be the same type (no union-merge, like ternary branches); no
+  // returns ⇒ `void`.
+  private unifyReturns(rets: RetType[]): RetType {
+    if (rets.length === 0) return "void";
+    const first = rets[0];
+    for (const r of rets) {
+      const same =
+        first === "void" || r === "void"
+          ? first === r
+          : sameType(first, r);
+      if (!same) {
+        throw new Error(
+          `A closure's return values must share a type, got '${displayType(first)}' and '${displayType(r)}'`,
+        );
+      }
+    }
+    return first;
+  }
+
+  // Call a function VALUE: `(callee)(args)` where `callee` is any function-typed
+  // expression. The argument types are checked against the function type's
+  // parameters; a `void`-returning value call is valid only in statement position.
+  private emitCallValue(
+    e: { callee: Expr; args: Expr[] },
+    asStatement: boolean,
+  ): { code: string; type: RetType } {
+    const callee = this.emitExpr(e.callee);
+    if (!isFunction(callee.type)) {
+      throw new Error(
+        `Cannot call a value of type '${displayType(callee.type)}'`,
+      );
+    }
+    const ft = callee.type;
+    const args = this.checkArgs("call", ft.params, e.args);
+    if (ft.ret === "void" && !asStatement) {
+      throw new Error("This function returns void and cannot be used as a value");
+    }
+    return { code: `(${callee.code})(${args.join(", ")})`, type: ft.ret };
   }
 
   // Emit an `await`. Returns the C++ `co_await …` expression and the awaited
@@ -2746,6 +3108,12 @@ class Emitter {
       if (isUnion(l.type) || isUnion(r.type)) {
         return this.emitUnionEquality(e.op, l, r);
       }
+      // `std::function` has no `==`; comparing function values isn't in the subset.
+      if (isFunction(l.type) || isFunction(r.type)) {
+        throw new Error(
+          `Function values cannot be compared with '${e.op}' (v1)`,
+        );
+      }
       if (!sameType(l.type, r.type)) {
         throw new Error(
           `Cannot compare '${displayType(l.type)}' and '${displayType(r.type)}' with '${e.op}'`,
@@ -2830,7 +3198,21 @@ class Emitter {
     asStatement: boolean,
   ): { code: string; type: RetType } {
     const sig = this.sigs.get(e.callee);
-    if (!sig) throw new Error(`Unknown function: ${e.callee}`);
+    if (!sig) {
+      // Not a top-level function: maybe a function-typed variable (a closure or a
+      // function value stored in a let/param/global) — call it as a value.
+      const vt = this.vars.get(e.callee) ?? this.globals.get(e.callee);
+      if (vt !== undefined) {
+        if (!isFunction(vt)) {
+          throw new Error(`'${e.callee}' is not a function`);
+        }
+        return this.emitCallValue(
+          { callee: { kind: "var", name: e.callee }, args: e.args },
+          asStatement,
+        );
+      }
+      throw new Error(`Unknown function: ${e.callee}`);
+    }
     // Shared arg-checking (handles widening into a union param and omitted
     // trailing optional params — `a?: T`).
     const args = this.checkArgs(e.callee, sig.params, e.args);
@@ -2860,9 +3242,36 @@ class Emitter {
     if (isMap(recv.type)) return this.emitMapMethod(recv, e, asStatement);
     if (isSet(recv.type)) return this.emitSetMethod(recv, e, asStatement);
     if (isResponse(recv.type)) return this.emitResponseMethod(recv, e);
+    // `obj.fn(args)` where `fn` is a function-VALUED field (not a method) — call it.
+    if (isObject(recv.type)) {
+      const field = recv.type.fields.find((f) => f.name === e.method);
+      if (field && isFunction(field.type)) {
+        return this.emitFieldCall(recv.code, field.type, e.method, e.args, asStatement);
+      }
+    }
     throw new Error(
       `Type '${displayType(recv.type)}' has no method '${e.method}'`,
     );
+  }
+
+  // Call a function-valued field/property: `((recv)->name)(args)`. Shared by an
+  // object's function field and a class instance's function field (where the name
+  // isn't a method). Arg types are checked against the field's function type.
+  private emitFieldCall(
+    recvCode: string,
+    fieldType: FunctionType,
+    name: string,
+    argExprs: Expr[],
+    asStatement: boolean,
+  ): { code: string; type: RetType } {
+    const args = this.checkArgs(`.${name}`, fieldType.params, argExprs);
+    if (fieldType.ret === "void" && !asStatement) {
+      throw new Error(`'${name}' returns void and cannot be used as a value`);
+    }
+    return {
+      code: `((${recvCode})->${name})(${args.join(", ")})`,
+      type: fieldType.ret,
+    };
   }
 
   // Emit an array method call (push/pop/slice/indexOf/join/includes/reverse/…).
@@ -3227,6 +3636,17 @@ class Emitter {
     const cls = this.classes.get((recv.type as ClassType).name)!;
     const method = cls.methods.find((m) => m.name === e.method);
     if (!method) {
+      // Not a method: maybe a function-valued field (`this.cb = …; inst.cb(x)`).
+      const field = cls.fields.find((f) => f.name === e.method);
+      if (field && isFunction(field.type)) {
+        return this.emitFieldCall(
+          recv.code,
+          field.type,
+          e.method,
+          e.args,
+          asStatement,
+        );
+      }
       throw new Error(`Class '${cls.name}' has no method '${e.method}'`);
     }
     const args = this.checkArgs(
@@ -3465,6 +3885,12 @@ function containsAwait(e: Expr): boolean {
       return containsAwait(e.url);
     case "responseJson":
       return containsAwait(e.receiver);
+    case "callValue":
+      return containsAwait(e.callee) || e.args.some(containsAwait);
+    case "closure":
+      // A closure's body is a separate function — any `await` in it belongs to that
+      // (async) closure's coroutine, not the enclosing one. Don't recurse.
+      return false;
     default:
       return false; // num / bool / str / var / this / mathConst / mapNew
   }

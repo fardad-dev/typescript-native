@@ -74,6 +74,16 @@ function lowerParams(params: ts.NodeArray<ts.ParameterDeclaration>): Param[] {
         "Constructor parameter properties are not supported (v1) — declare the field explicitly",
       );
     }
+    // Rest (`...args`) and default (`x = 5`) parameters need extra machinery
+    // (variadic packing / default-value insertion) — out of subset for now.
+    if (p.dotDotDotToken) {
+      throw new Error("Rest parameters ('...args') are not supported yet (v1)");
+    }
+    if (p.initializer) {
+      throw new Error(
+        `Default parameter values are not supported yet (v1) — '${p.name.text}' cannot have a default`,
+      );
+    }
     if (!p.type) {
       throw new Error(`Parameter '${p.name.text}' needs a type annotation`);
     }
@@ -651,6 +661,30 @@ function lowerType(node: ts.TypeNode): Type {
   if (ts.isUnionTypeNode(node)) {
     return canonicalizeUnion(node.types.map(lowerType));
   }
+  // `(T)` — a parenthesized type (e.g. around a function type in `(() => R)[]`).
+  if (ts.isParenthesizedTypeNode(node)) return lowerType(node.type);
+  // `(a: T, b: U) => R` — a function type. Parameter names are irrelevant to the
+  // type; an optional param `(a?: T)` widens to `T | undefined` (like a value param).
+  if (ts.isFunctionTypeNode(node)) {
+    const params = node.parameters.map((p) => {
+      if (p.dotDotDotToken) {
+        throw new Error(
+          "Rest parameters in function types are not supported yet (v1)",
+        );
+      }
+      if (!p.type) {
+        throw new Error("Function type parameters need a type annotation");
+      }
+      let t = lowerType(p.type);
+      if (p.questionToken) t = canonicalizeUnion([t, "undefined"]);
+      return t;
+    });
+    const ret: RetType =
+      node.type.kind === ts.SyntaxKind.VoidKeyword
+        ? "void"
+        : lowerType(node.type);
+    return { kind: "function", params, ret };
+  }
   // `T[]`
   if (ts.isArrayTypeNode(node)) {
     return { kind: "array", element: lowerType(node.elementType) };
@@ -771,6 +805,8 @@ function typeKey(t: Type): string {
       return "response";
     case "union":
       return `union<${t.members.map(typeKey).sort().join("|")}>`;
+    case "function":
+      return `fn(${t.params.map(typeKey).join(",")})=>${t.ret === "void" ? "void" : typeKey(t.ret)}`;
   }
 }
 
@@ -884,6 +920,10 @@ function lowerExpr(node: ts.Expression): Expr {
   // guard it also drives flow narrowing (see codegen).
   if (ts.isTypeOfExpression(node)) {
     return { kind: "typeof", operand: lowerExpr(node.expression) };
+  }
+  // Arrow functions and (anonymous) function expressions become closures.
+  if (ts.isArrowFunction(node) || ts.isFunctionExpression(node)) {
+    return lowerClosure(node);
   }
   if (ts.isNewExpression(node)) return lowerNew(node);
   // `await e` — suspend the enclosing async function until `e`'s promise settles
@@ -1029,7 +1069,8 @@ function lowerCall(node: ts.CallExpression): Expr {
   if (promise) return promise;
   const fetched = tryLowerFetchCall(node);
   if (fetched) return fetched;
-  // `recv.method(args)` -> methodCall (e.g. xs.push(v)).
+  // `recv.method(args)` -> methodCall (e.g. xs.push(v)). Codegen disambiguates a
+  // genuine method from a call of a function-valued field (`obj.fn(args)`).
   if (ts.isPropertyAccessExpression(node.expression)) {
     return {
       kind: "methodCall",
@@ -1038,14 +1079,55 @@ function lowerCall(node: ts.CallExpression): Expr {
       args: node.arguments.map(lowerExpr),
     };
   }
-  if (!ts.isIdentifier(node.expression)) {
-    throw new Error("Only direct calls to named functions are supported (v1)");
+  // `f(args)` where `f` is a bare identifier — a direct named call (codegen resolves
+  // it to a top-level function or a function-typed variable).
+  if (ts.isIdentifier(node.expression)) {
+    return {
+      kind: "call",
+      callee: node.expression.text,
+      args: node.arguments.map(lowerExpr),
+    };
   }
+  // `expr(args)` where `expr` is any other expression (a call result `getFn()(x)`,
+  // an indexed element `fns[0](x)`, an IIFE, …) — call a function *value*.
   return {
-    kind: "call",
-    callee: node.expression.text,
+    kind: "callValue",
+    callee: lowerExpr(node.expression),
     args: node.arguments.map(lowerExpr),
   };
+}
+
+// Lower an arrow function or function expression to a `closure` IR node. Parameters
+// need type annotations (lowering doesn't thread the checker's contextual types);
+// the return type is taken from an explicit annotation, else inferred at codegen.
+// An expression-bodied arrow `(x) => e` lowers its body to a single `return e`.
+function lowerClosure(
+  node: ts.ArrowFunction | ts.FunctionExpression,
+): Expr {
+  if (hasAsync(node)) {
+    throw new Error(
+      "async arrow functions / function expressions are not supported yet (v1)",
+    );
+  }
+  if (ts.isFunctionExpression(node) && node.asteriskToken) {
+    throw new Error("Generator functions are not supported (v1)");
+  }
+  const params = lowerParams(node.parameters);
+  let returnType: RetType | undefined;
+  if (node.type) {
+    returnType =
+      node.type.kind === ts.SyntaxKind.VoidKeyword
+        ? "void"
+        : lowerType(node.type);
+  }
+  let body: Stmt[];
+  if (ts.isBlock(node.body)) {
+    body = lowerStmts(node.body.statements);
+  } else {
+    // Expression-bodied arrow: the body expression is the (single) return value.
+    body = [{ kind: "return", value: lowerExpr(node.body) }];
+  }
+  return { kind: "closure", params, returnType, body, async: false };
 }
 
 function lowerBinaryOp(kind: ts.SyntaxKind): BinaryOp {

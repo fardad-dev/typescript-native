@@ -105,8 +105,8 @@ npm test            # run the e2e suite once (vitest run)
 npm run test:watch  # re-run on change — the TDD red->green loop
 ```
 
-The suite (currently **121 e2e cases** + a stage-0 type-checker test file + a module-loader test
-file + a `fetch` test file + a union-rejection test file, all green) auto-discovers every
+The suite (currently **136 e2e cases** + a stage-0 type-checker test file + a module-loader test
+file + a `fetch` test file + union- and closure-rejection test files, all green) auto-discovers every
 `tests/cases/*.ts`, compiles it to a real native binary,
 runs it, and diffs stdout against the matching `.expected` file. **Every feature gets a
 `tests/cases/*.ts` + `.expected` pair**, ideally written first (red), then implemented to green.
@@ -240,6 +240,28 @@ Implemented and tested end-to-end:
   value** — for arrays/objects/instances that's a `tsn_rc` copy (a refcount bump) that aliases
   the caller's value, so a callee mutation is visible to the caller (JS reference semantics);
   returns likewise hand back the shared reference.
+- **Closures & first-class functions:** **arrow functions** (`(x: T) => e` / `(x: T) => { … }`)
+  and **anonymous function expressions** (`function (x: T) { … }`); **function-type annotations**
+  `(a: T, b: U) => R` (incl. `() => void`) on variables, parameters, returns, fields, and array
+  elements; and **function values** — store in a variable, pass as an argument (user-defined
+  higher-order functions), return one, put one in an array/object, reference a top-level function by
+  name as a value, and **call** one (`f(x)`, `getFn()(x)`, `fns[0](x)`, `obj.cb(x)`). A function value
+  compiles to **`std::function<R(P…)>`** (number params/returns use the **f64 rep**, so a function
+  value's C++ type is context-stable). **Closures capture by reference with full JS semantics:** a
+  local captured by a nested closure is **boxed** in a heap cell (`tsn_rc<tsn_box<T>>`, see the
+  capture pass [src/codegen/closures.ts](src/codegen/closures.ts)) that the enclosing scope and every
+  closure over it share — so `makeAdder` (read-only capture), `makeCounter` (a closure mutating its
+  own captured state), and two closures sharing one mutable variable all behave exactly like JS.
+  Closure parameters need **type annotations** (lowering doesn't thread the checker's contextual
+  types); the **return type is inferred** from the body (or taken from an explicit annotation). A
+  captured **`for…of`/`for…in`** loop variable is re-boxed each iteration (correct `let`
+  per-iteration capture); `typeof f === "function"`; `console.log(f)` prints `[Function (anonymous)]`.
+  **Deferred** (clean `tsnc:` errors): **async** arrow/function expressions, **default**/​**rest**
+  parameters, comparing function values with `===`/`!==`, `this` inside a closure (lexical-`this`
+  capture), and `JSON.stringify` of a function. The callback array methods (`map`/`filter`/`reduce`/
+  …), `Map`/`Set.forEach`, `new Promise(executor)`, and `Promise.reject`/`race` are now *unblocked*
+  by closures but not yet implemented (still clean errors). A **C-style `for` counter** captured by a
+  closure is a single shared cell (JS `var`-like — a documented divergence from per-iteration `let`).
 - **Async / await:** **`async` functions and methods**, **`await`**, the **`Promise<T>`** type
   (a first-class value — storable, passable, returnable; `Promise<void>` too), and the static
   builtins **`Promise.resolve(x)`** and **`Promise.all(xs)`**. This is a **faithful event-loop**
@@ -327,6 +349,7 @@ tsn types map onto C++ types (see [src/codegen/CLAUDE.md](src/codegen/CLAUDE.md)
 | `Response` | `tsn_rc<tsn_response>` | **reference** type: the `fetch(...)` result (runtime `tsn_response { status; ok; body }`). Fields `status` (f64) / `ok` (bool); `text()` → `Promise<string>`, `json()` → `Promise<T>`. `tsn_fetch` (libcurl) is `#ifdef TSN_ENABLE_FETCH`; using it links `-lcurl` |
 | `null` / `undefined` | `tsn_null` / `tsn_undefined` | empty tag structs (one value each), distinct types so a union variant discriminates them and `typeof` differs (`typeof null === "object"`); mostly a union member / the optional-`?:` desugar |
 | `A \| B \| …` (union) | `tsn_union<M0, M1, …>` | a `std::variant` **wrapper** (so ADL finds our overloads for an all-scalar union). Members canonical + rep-stable (`undefined`/`null` first → the default alternative). A member **widens** in via `std::in_place_type` (`coerceTo`); a narrower union widens via `tsn_union_widen`. `===` is holds-and-equals; **narrowing** (`typeof`/`=== null`/truthiness/`&&`) reads a member via `std::get<Member>`. Number members are f64 |
+| `(P…) => R` (function) | `std::function<Rc(Pc…)>` | **reference** type: a first-class function value (arrow / function expression / top-level-function reference). Number params/returns use the **f64 rep** (context-stable signature). A **captured local** is **boxed** (`tsn_rc<tsn_box<T>>`) so closures share its one cell (full JS capture). Call via `(f)(args)`; `typeof` is `"function"`; `===`/`json` unsupported (clean errors) |
 
 - **`number` is f64, but integer-valued numbers use a 64-bit integer representation.** A
   pre-pass ([src/codegen/repr.ts](src/codegen/repr.ts)) infers, per variable / parameter / return,
@@ -395,12 +418,12 @@ Not yet supported:
 | Tuple                | `[number, string]`            | Only homogeneous `T[]` arrays are supported.          |
 | Literal / enum       | `"a" \| "b"`, `enum E {}`     | No literal types or enums (a union of *types* is fine — see _Union types & narrowing_). |
 | Intersection         | `A & B`                       | No type composition.                                  |
-| Function type        | `(x: number) => number`       | No first-class function values / closures.            |
 | Generic / type param | `<T>(x: T) => T`, `Box<T>`     | Only built-in `Array<T>` / `Map<K, V>` / `Set<T>` / `Promise<T>` are special-cased; user generics aren't. |
 
-`null` / `undefined` and **union types** (`number | string`, `T | null`) **are** supported now —
-see _Union types & narrowing_ above. Optional **parameters** (`a?: T`) work; optional object
-**fields** (`{ x?: T }`) are still rejected (clean error — they need object-literal field-defaulting).
+`null` / `undefined`, **union types** (`number | string`, `T | null`), and **function types**
+(`(x: number) => number` — see _Closures & first-class functions_) **are** supported now. Optional
+**parameters** (`a?: T`) work; optional object **fields** (`{ x?: T }`) are still rejected (clean
+error — they need object-literal field-defaulting).
 
 ## Conventions
 
@@ -443,6 +466,36 @@ pair** (red → green).
 
 ### Done
 
+- [x] **Closures + first-class functions** — arrow functions (`(x: T) => e` / `(x: T) => { … }`),
+      anonymous function expressions, function-type annotations (`(a: T, b: U) => R`, `() => void`),
+      and function VALUES: storable / passable (user-defined higher-order functions) / returnable / in
+      arrays & objects / a top-level function referenced by name, and callable in every position
+      (`f(x)`, `getFn()(x)`, `fns[0](x)`, `obj.cb(x)`). A function value compiles to
+      **`std::function<R(P…)>`** (number params/returns forced to the **f64 rep** so the C++ type is
+      context-stable — `repr.ts` demotes a function referenced as a value, and closure params/returns,
+      to f64). The headline decision was **capture fidelity**: rather than by-value `[=]` snapshots
+      (which silently diverge when closures share a mutable variable), a **capture pass**
+      ([src/codegen/closures.ts](src/codegen/closures.ts)) marks every local captured by a nested
+      closure as **boxed** — stored in a heap cell `tsn_rc<tsn_box<T>>` that the enclosing scope and
+      all its closures share through `->v`, with the C++ lambda's `[=]` copying the (shared) cell
+      pointer. So `makeAdder` (read-only capture), `makeCounter` (a closure mutating its own captured
+      counter, persisting across calls), two closures sharing one mutable variable, and a
+      mutation-after-capture all match JS exactly. A captured **`for…of`/`for…in`** variable is
+      re-boxed per iteration (correct `let` capture); a captured **C-style `for` counter** is one
+      shared cell (JS `var`-like — a documented divergence). Closure **parameters need annotations**
+      (lowering doesn't thread the checker's contextual types — so `arr.map(x => …)` needs
+      `(x: number) => …`); the **return type is inferred** from the body (unified like a ternary) or
+      taken from an annotation. Threaded across the usual files: a `function` `Type`, a `closure` +
+      `callValue` `Expr`, `boxed` flags on binding nodes, the capture pass + closure-id assignment
+      (run before `repr`/`emit`), `lower` (arrows/function-exprs/function-types/value-calls/
+      function-refs), `repr.ts` (boxed-and-closure slots are f64), the module `Renamer`, the runtime
+      (`tsn_box` + `std::function` overloads for `tsn_inspect`/`tsn_truthy`/`tsn_typeof`), and
+      `emit.ts` (closure emission with full per-function state save/restore, boxing of params/lets/
+      loop-vars/catch-bindings, value calls, function-field calls). Non-closure programs are
+      byte-identical. **Deferred** (clean `tsnc:` errors): async arrow/function expressions,
+      default/rest parameters, `this` inside a closure, function `===`/`!==`, and `JSON.stringify` of
+      a function. Tests: `tests/cases/closure-*.ts`, `function-{value,expr,typeof,log}.ts`,
+      `class-fn-field.ts` + [tests/closures.test.ts](tests/closures.test.ts) (rejections).
 - [x] **`if` / `while` / `for`** — control flow (+ comparison/logical operators, recursion).
 - [x] **Assignment** — `x = e`, `a[i] = e`, `obj.f = e`, compound `+= …`, `i++` / `i--`.
 - [x] **`f64` numbers** — `number` is IEEE double (`5 / 2 === 2.5`); `%` via `std::fmod`, with
@@ -824,8 +877,10 @@ currently clean `tsnc:` errors.
 done (see _Done_). Still open:
 
 - [ ] **Callback array methods** — `map` / `filter` / `reduce` / `forEach` / `some` / `every` /
-      `sort`(comparator) / `find` / `findIndex`. Blocked on closures / first-class functions (see
-      _Later_); `Map.forEach` / `Set.forEach` wait on the same.
+      `sort`(comparator) / `find` / `findIndex`. **Now unblocked** — closures / first-class functions
+      shipped (see _Done_) — but not yet implemented (each is still a clean "unsupported array method"
+      error). `Map.forEach` / `Set.forEach` and `new Promise(executor)` / `Promise.reject`/`race` are
+      likewise unblocked by closures and still to do.
 
 ### Blocked on the type system
 
@@ -851,12 +906,10 @@ see _Done_), which unblocks most of what was here. Still open:
       `private`/`public`/`protected`/`readonly` visibility, `static` members, get/set accessors,
       parameter properties, and field initializers (default member init). (Bare `this` as a value is
       **out of scope** — see _will never support_.)
-- [ ] **Closures + first-class functions** — arrow functions / function expressions, function-typed
-      values (`(x: number) => number`), default/rest params, and the capture machinery. (`import`/
-      `export` modules shipped — see _Done_; a module variable is already usable inside that module's
-      function bodies, via the module record. **Async/await also shipped without this** — the faithful
-      event loop uses C++20 coroutine handles, not user closures — but closures are what unblock the
-      callback array methods, `Map`/`Set.forEach`, `new Promise(executor)`, and `Promise.reject`/`race`.)
+- [x] **Closures + first-class functions** — done (arrows / function expressions / function-typed
+      values / boxed capture machinery; see _Done_). Still open as follow-ups: **default/rest params**
+      and **async arrow/function expressions** (clean errors today), and the callback array methods /
+      `new Promise(executor)` / `Promise.reject`/`race` that closures unblock (see _todo_).
 - [ ] **Destructuring + spread/rest** — array/object binding patterns in `let` and params, and spread
       in array literals and calls (all currently rejected: only simple identifier bindings,
       [src/frontend/lower.ts](src/frontend/lower.ts)).

@@ -52,6 +52,7 @@ field names, the user's functions, `main`).
 | `Response`          | `tsn_rc<tsn_response>` | **reference** type: the `fetch(...)` result. Fields `status` (f64) / `ok` (bool); methods `text()` → `Promise<string>`, `json()` → `Promise<T>` (target type required). See *fetch / Response* below |
 | `null` / `undefined` | `tsn_null` / `tsn_undefined` | empty tag structs (distinct types so a union variant discriminates them; `typeof null === "object"`). Mostly a union member / the optional-`?:` desugar |
 | `A \| B \| …` (union) | `tsn_union<M0, …>` | a `std::variant` **wrapper** (ADL). Members rep-stable + `undefined`/`null`-first (the default alternative). See *Union types & narrowing* below |
+| `(P…) => R` (function) | `std::function<Rc(Pc…)>` | **reference** type: a first-class function value. Number params/returns are the **f64 rep** (context-stable). A captured local is **boxed** (`tsn_rc<tsn_box<T>>`). See *Closures / first-class functions* below |
 
 Arrays, objects and class instances are **all reference types** (`tsn_rc<…>`), so JS
 semantics hold uniformly: copy/assign aliases, mutation through one alias is visible through the
@@ -457,6 +458,51 @@ are empty tag structs `tsn_null` / `tsn_undefined`.
   need object-literal field-defaulting + nested coercion), a **ternary** whose branches have
   different types (no union-merge), and union-typed **array/Map/Set element** coercion. Member access
   / arithmetic on an *un-narrowed* union is caught at stage 0 (TS), never miscompiled.
+
+## Closures / first-class functions
+
+A function value (`(P…) => R`) compiles to **`std::function<Rc(Pc…)>`** (`cppType`), where number
+params/returns use the **f64 rep** (so the C++ type is context-stable — a function value's type is
+the same wherever it appears). The pieces:
+
+- **The capture pass** ([closures.ts](closures.ts), run before `repr`/`emit` from `emitModule`)
+  assigns each `closure` node an `id` (its rep-scope key `$closure<id>`) and marks every local
+  **captured** by a nested closure as `boxed`. Capture is a name reference that crosses a function
+  boundary into an enclosing scope; top-level (entry / dependency) module variables are file-scope and
+  never boxed.
+- **Boxing.** A boxed binding is stored in a heap cell `tsn_rc<tsn_box<T>>` (`boxType`/`boxElemType`;
+  a captured `number` cell holds the f64 rep). The emitter tracks the in-scope boxed names in
+  `this.boxed`; a read/write of a boxed variable goes through `(name)->v` (the `var` / `emitLValue`
+  cases). A boxed **parameter** is received under a mangled name (`boxArgName`) and copied into its
+  cell at entry (`bindParams`/`declParams`); a boxed **`let`** in statement position uses a two-step
+  (alloc then assign) form (`emitBoxedLet`) so a self-referential closure captures the cell before it
+  is filled; a captured **`for…of`/`for…in`** variable is re-boxed each iteration (correct `let`
+  per-iteration capture); a captured **C-style `for` counter** is one shared cell (JS `var`-like — a
+  documented divergence). The C++ lambda's default capture `[=]` copies the (shared) cell pointer, so
+  the enclosing scope and all its closures see one binding — full JS closure semantics (`makeCounter`,
+  shared mutable state).
+- **`emitClosure`** swaps the entire per-function emitter scratch (`body`/`vars`/`boxed`/`narrowed`/
+  `curReturn`/`funcKey`/`breakStack`/…), inheriting `vars`+`boxed` so the body resolves captured
+  outer variables, then emits the body and restores. The return type is the annotation, else
+  **inferred** from the body's `return`s (`inferRet`/`inferredRets`, unified by `unifyReturns` like a
+  ternary). The result is `std::function<…>([=](decls) -> Ret { body })`. Closures nest (the
+  save/restore is reentrant); async closures are rejected in lowering.
+- **Calling.** `emitCallValue` emits `(callee)(args)` for any function-typed expression (the
+  `callValue` node, and `emitCall`'s fallback when a bare-identifier callee is a function-typed
+  variable rather than a top-level function). `emitFieldCall` handles `obj.fn(args)` / `inst.fn(args)`
+  where `fn` is a function-VALUED field (not a method). A **bare reference to a top-level function
+  name** in value position becomes `std::function<…>(name)` (the `var` case) — and `repr.ts` demotes
+  that function's number params/return to f64 so its real C++ signature matches.
+- **`repr.ts`** keeps boxed locals and closure params/returns at the f64 rep (a captured number is
+  always f64), and demotes a function's params/return to f64 wherever its name is used as a value.
+- **Runtime** ([cpp/tsn_runtime.h](cpp/tsn_runtime.h)): `tsn_box<T>` (the cell) plus `std::function`
+  overloads of `tsn_truthy` (always true), `tsn_typeof_one` (`"function"`), `tsn_inspect`
+  (`[Function (anonymous)]`, forward-declared before the array/map/set inspect templates so a
+  function-valued element resolves), and `tsn_json_stringify` (`"null"`, for a function field).
+- **Deferred** (clean `tsnc:` errors): async arrow/function expressions, default/rest parameters,
+  `this` inside a closure, comparing function values with `===`/`!==`, and `JSON.stringify` of a
+  function (direct). Callback array methods / `Map`/`Set.forEach` / `new Promise(executor)` are now
+  unblocked but not yet implemented.
 
 ## Guard clauses
 

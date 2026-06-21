@@ -452,6 +452,22 @@ class Renamer {
       case "promiseAll":
         e.arg = this.expr(e.arg, locals);
         return e;
+      case "closure": {
+        // A closure introduces its own scope: its parameters shadow the table, so
+        // only genuinely free references in its body are rewritten.
+        const inner = new Set(locals);
+        for (const p of e.params) {
+          this.type(p.type);
+          inner.add(p.name);
+        }
+        if (e.returnType && e.returnType !== "void") this.type(e.returnType);
+        e.body = this.body(e.body, inner);
+        return e;
+      }
+      case "callValue":
+        e.callee = this.expr(e.callee, locals);
+        e.args = e.args.map((a) => this.expr(a, locals));
+        return e;
       case "await":
         e.expr = this.expr(e.expr, locals);
         return e;
@@ -499,7 +515,10 @@ class Renamer {
       return; // built-in, no nested type-refs
     else if (t.kind === "union")
       for (const m of t.members) this.type(m); // resolve class refs in members
-    else for (const f of t.fields) this.type(f.type);
+    else if (t.kind === "function") {
+      for (const p of t.params) this.type(p); // resolve class refs in params/ret
+      if (t.ret !== "void") this.type(t.ret);
+    } else for (const f of t.fields) this.type(f.type);
   }
 }
 
