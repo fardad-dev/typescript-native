@@ -20,27 +20,22 @@ codegen/emit.ts     (3) IR -> C++ source text (the .cpp)                 ◄─�
 backend/clang.ts    (4) clang++ .cpp -> native executable
 ```
 
-- [index.ts](index.ts) — entry; only CLI concerns. Defers all work to `driver.compile`.
-- [driver.ts](driver.ts) — `compile(opts)` glues the stages (type-check → load+lower → emit → build);
-  owns where the `.cpp` is written.
-- [frontend/check.ts](frontend/check.ts) — (0) semantic type-check with `ts.Program` + `TypeChecker`;
-  throws TypeScript diagnostics before lowering. Resolves the whole import graph (cross-module
-  checking). See [frontend/CLAUDE.md](frontend/CLAUDE.md).
-- [frontend/modules.ts](frontend/modules.ts) — (1) module loader/linker: resolves the `import` graph
-  from the entry, lowers every reachable file, and merges into one IR `Module` (bundling). See
-  [frontend/CLAUDE.md](frontend/CLAUDE.md).
-- [frontend/lower.ts](frontend/lower.ts) — one file's TypeScript AST → our IR. See [frontend/CLAUDE.md](frontend/CLAUDE.md).
-- [ir/nodes.ts](ir/nodes.ts) — IR node definitions. See [ir/CLAUDE.md](ir/CLAUDE.md).
-- [codegen/emit.ts](codegen/emit.ts) — IR → C++ source. See [codegen/CLAUDE.md](codegen/CLAUDE.md).
-- [codegen/repr.ts](codegen/repr.ts) — number-representation pass (`i64`/`f64`) the emitter runs
-  first, so integer-valued numbers compile to `long long`. See [codegen/CLAUDE.md](codegen/CLAUDE.md).
-- [codegen/closures.ts](codegen/closures.ts) — closure-preparation pass (also run before emit):
-  assigns each closure an id and marks locals captured by a nested closure as `boxed`. See
-  [codegen/CLAUDE.md](codegen/CLAUDE.md).
-- [codegen/cpp/tsn_runtime.h](codegen/cpp/tsn_runtime.h) — the fixed C++ runtime (`tsn_str`,
-  numeric/string/array helpers, `tsn_inspect`); every emitted `.cpp` `#include`s it instead of
-  inlining it. See [codegen/CLAUDE.md](codegen/CLAUDE.md).
-- [backend/clang.ts](backend/clang.ts) — compile + link via clang++. See [backend/CLAUDE.md](backend/CLAUDE.md).
+Each folder below has its own `CLAUDE.md` with detail.
+
+- [index.ts](index.ts) — CLI entry; defers all work to `driver.compile`.
+- [driver.ts](driver.ts) — `compile(opts)` glues the stages and owns where the `.cpp` is written.
+- [frontend/check.ts](frontend/check.ts) — (0) type-check with `ts.Program` + `TypeChecker` over the
+  whole import graph; throws TS diagnostics before lowering.
+- [frontend/modules.ts](frontend/modules.ts) — (1) resolve the `import` graph, lower every reachable
+  file, merge into one IR `Module`.
+- [frontend/lower.ts](frontend/lower.ts) — one file's TypeScript AST → our IR.
+- [ir/nodes.ts](ir/nodes.ts) — IR node definitions.
+- [codegen/emit.ts](codegen/emit.ts) — IR → C++ source.
+- [codegen/repr.ts](codegen/repr.ts) — number-representation pass (`i64`/`f64`), run before emit.
+- [codegen/closures.ts](codegen/closures.ts) — closure-capture pass, run before emit.
+- [codegen/cpp/tsn_runtime.h](codegen/cpp/tsn_runtime.h) — the fixed C++ runtime; every emitted `.cpp`
+  `#include`s it.
+- [backend/clang.ts](backend/clang.ts) — compile + link via clang++.
 
 ## Adding a language feature (the repeated 3-touch pattern)
 
