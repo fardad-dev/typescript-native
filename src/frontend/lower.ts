@@ -619,6 +619,22 @@ function lowerType(node: ts.TypeNode): Type {
   if (node.kind === ts.SyntaxKind.NumberKeyword) return "number";
   if (node.kind === ts.SyntaxKind.BooleanKeyword) return "boolean";
   if (node.kind === ts.SyntaxKind.StringKeyword) return "string";
+  // `null` / `undefined` type keywords (also reachable as union members and the
+  // optional `?:` desugar). `undefined` is a `LiteralType` wrapping the keyword.
+  if (node.kind === ts.SyntaxKind.NullKeyword) return "null";
+  if (node.kind === ts.SyntaxKind.UndefinedKeyword) return "undefined";
+  if (
+    ts.isLiteralTypeNode(node) &&
+    node.literal.kind === ts.SyntaxKind.NullKeyword
+  ) {
+    return "null";
+  }
+  // `A | B | …` — a union. Lower each member, then canonicalize (flatten nested
+  // unions, dedupe, collapse a singleton, reject empty, sort into a stable order)
+  // so `number | string` and `string | number` produce the *same* IR type.
+  if (ts.isUnionTypeNode(node)) {
+    return canonicalizeUnion(node.types.map(lowerType));
+  }
   // `T[]`
   if (ts.isArrayTypeNode(node)) {
     return { kind: "array", element: lowerType(node.elementType) };
@@ -687,6 +703,87 @@ function lowerType(node: ts.TypeNode): Type {
   throw new Error(`Unsupported type annotation: ${ts.SyntaxKind[node.kind]}`);
 }
 
+// A stable structural key for a type — used to dedupe and order union members.
+// Order-independent for objects/unions (fields/members sorted), so structurally
+// equal types share a key regardless of source order.
+function typeKey(t: Type): string {
+  if (typeof t === "string") return t;
+  switch (t.kind) {
+    case "array":
+      return `array<${typeKey(t.element)}>`;
+    case "set":
+      return `set<${typeKey(t.element)}>`;
+    case "map":
+      return `map<${typeKey(t.key)},${typeKey(t.value)}>`;
+    case "object":
+      return `object{${t.fields
+        .map((f) => `${f.name}:${typeKey(f.type)}`)
+        .sort()
+        .join(";")}}`;
+    case "class":
+      return `class:${t.name}`;
+    case "promise":
+      return `promise<${t.value ? typeKey(t.value) : "void"}>`;
+    case "response":
+      return "response";
+    case "union":
+      return `union<${t.members.map(typeKey).sort().join("|")}>`;
+  }
+}
+
+// Ordinal that sorts scalars (with `undefined`/`null` FIRST) ahead of composite
+// kinds. Putting `undefined` (else `null`) at member 0 makes a union's default
+// (e.g. a `Map.get` miss with a `T | undefined` value) the JS-correct value.
+function typeKindOrdinal(t: Type): number {
+  if (t === "undefined") return 0;
+  if (t === "null") return 1;
+  if (t === "boolean") return 2;
+  if (t === "number") return 3;
+  if (t === "string") return 4;
+  const order: Record<string, number> = {
+    array: 5,
+    object: 6,
+    class: 7,
+    map: 8,
+    set: 9,
+    promise: 10,
+    response: 11,
+    union: 12,
+  };
+  return order[t.kind] ?? 99;
+}
+
+// Canonicalize a union's members: flatten nested unions, dedupe (structurally),
+// collapse a single-member union to that member, reject empty, and sort into a
+// stable order (scalars first, `undefined`/`null` at the front). Codegen re-sorts
+// the C++ type text by the post-rename C++ type, so two equal unions always emit
+// identical `tsn_union<…>` text regardless of class-name mangling.
+function canonicalizeUnion(rawMembers: Type[]): Type {
+  const flat: Type[] = [];
+  const seen = new Set<string>();
+  const add = (m: Type) => {
+    if (typeof m === "object" && m.kind === "union") {
+      m.members.forEach(add);
+      return;
+    }
+    const k = typeKey(m);
+    if (!seen.has(k)) {
+      seen.add(k);
+      flat.push(m);
+    }
+  };
+  rawMembers.forEach(add);
+  if (flat.length === 0) throw new Error("Empty union type");
+  flat.sort((a, b) => {
+    const d = typeKindOrdinal(a) - typeKindOrdinal(b);
+    if (d !== 0) return d;
+    const ka = typeKey(a);
+    const kb = typeKey(b);
+    return ka < kb ? -1 : ka > kb ? 1 : 0;
+  });
+  return flat.length === 1 ? flat[0] : { kind: "union", members: flat };
+}
+
 function lowerExpr(node: ts.Expression): Expr {
   if (ts.isNumericLiteral(node)) {
     return { kind: "num", value: Number(node.text) };
@@ -726,8 +823,20 @@ function lowerExpr(node: ts.Expression): Expr {
     return { kind: "bool", value: true };
   if (node.kind === ts.SyntaxKind.FalseKeyword)
     return { kind: "bool", value: false };
+  // `null` literal and the `undefined` identifier — value types `null`/`undefined`,
+  // used mostly as union members (`T | null`) and the optional `?:` desugar.
+  if (node.kind === ts.SyntaxKind.NullKeyword) return { kind: "null" };
   if (node.kind === ts.SyntaxKind.ThisKeyword) return { kind: "this" };
-  if (ts.isIdentifier(node)) return { kind: "var", name: node.text };
+  if (ts.isIdentifier(node)) {
+    if (node.text === "undefined") return { kind: "undefined" };
+    return { kind: "var", name: node.text };
+  }
+  // `typeof e` — a `string` ("number"/"string"/"boolean"/"object"/"undefined").
+  // For a union operand codegen resolves it at runtime; as `typeof x === "…"` in a
+  // guard it also drives flow narrowing (see codegen).
+  if (ts.isTypeOfExpression(node)) {
+    return { kind: "typeof", operand: lowerExpr(node.expression) };
+  }
   if (ts.isNewExpression(node)) {
     if (!ts.isIdentifier(node.expression)) {
       throw new Error("'new' requires a class name (v1)");

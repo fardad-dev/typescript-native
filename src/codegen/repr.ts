@@ -332,6 +332,13 @@ class RepAnalyzer {
         return { type: "string", rep: "f64" };
       case "bool":
         return { type: "boolean", rep: "f64" };
+      case "null":
+        return { type: "null", rep: "f64" };
+      case "undefined":
+        return { type: "undefined", rep: "f64" };
+      case "typeof":
+        this.visit(e.operand, scope, fk); // surface nested calls
+        return { type: "string", rep: "f64" };
       case "this":
         return {
           type: this.currentClass

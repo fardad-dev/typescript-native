@@ -75,6 +75,7 @@ type MapType = { kind: "map"; key: Type; value: Type };
 type SetType = { kind: "set"; element: Type };
 type PromiseType = { kind: "promise"; value?: Type };
 type ResponseType = { kind: "response" };
+type UnionType = { kind: "union"; members: Type[] };
 
 function isArray(t: Type): t is ArrayType {
   return typeof t === "object" && t.kind === "array";
@@ -102,6 +103,10 @@ function isClass(t: Type): t is ClassType {
 function isResponse(t: Type): t is ResponseType {
   return typeof t === "object" && t.kind === "response";
 }
+// A union `A | B | …` (value type → `tsn_union<…>`, a `std::variant` wrapper).
+function isUnion(t: Type): t is UnionType {
+  return typeof t === "object" && t.kind === "union";
+}
 function isAggregate(t: Type): boolean {
   return isArray(t) || isObject(t);
 }
@@ -116,6 +121,7 @@ function displayType(t: RetType): string {
     return `Promise<${t.value === undefined ? "void" : displayType(t.value)}>`;
   }
   if (isResponse(t)) return "Response";
+  if (isUnion(t)) return t.members.map((m) => displayType(m)).join(" | ");
   if (isObject(t)) {
     return `{ ${t.fields.map((f) => `${f.name}: ${displayType(f.type)}`).join("; ")} }`;
   }
@@ -123,6 +129,13 @@ function displayType(t: RetType): string {
 }
 
 function sameType(a: Type, b: Type): boolean {
+  // Unions: equal iff same member set (order-independent — canonicalization keeps
+  // them ordered, but compare as sets so a hand-built union still matches).
+  if (isUnion(a) || isUnion(b)) {
+    if (!isUnion(a) || !isUnion(b)) return false;
+    if (a.members.length !== b.members.length) return false;
+    return a.members.every((ma) => b.members.some((mb) => sameType(ma, mb)));
+  }
   // Class instances are nominal: equal iff they name the same class.
   if (isClass(a) || isClass(b))
     return isClass(a) && isClass(b) && a.name === b.name;
@@ -387,9 +400,79 @@ class Emitter {
     }
     // A `fetch` Response — a reference-typed built-in (runtime `tsn_response`).
     if (isResponse(t)) return "tsn_rc<tsn_response>";
+    // A union → `tsn_union<…>` (a `std::variant` wrapper). Members are emitted in a
+    // deterministic, rename-stable order (see `unionMemberCpps`) so two structurally
+    // equal unions always produce byte-identical C++ type text.
+    if (isUnion(t)) return `tsn_union<${this.unionMemberCpps(t).join(", ")}>`;
+    if (t === "null") return "tsn_null";
+    if (t === "undefined") return "tsn_undefined";
     if (t === "number") return "double"; // f64 rep — the default for nested aggregates
     if (t === "boolean") return "bool";
     return "tsn_str"; // string — a ref-counted immutable string (see prelude)
+  }
+
+  // The C++ member types of a union, in a deterministic order: `undefined`/`null`
+  // first (so the variant's default alternative — used for a `Map.get` miss on a
+  // `T | undefined` value — is the JS-correct default), then the rest sorted by
+  // their C++ type text. Sorting by the *final* (post-rename) C++ type makes the
+  // order rename-stable, so `number | string` and `string | number` emit the same
+  // `tsn_union<double, tsn_str>`.
+  private unionMemberCpps(t: UnionType): string[] {
+    const rank = (m: Type) =>
+      m === "undefined" ? 0 : m === "null" ? 1 : 2;
+    return t.members
+      .map((m) => ({ m, cpp: this.cppType(m) }))
+      .sort((a, b) => rank(a.m) - rank(b.m) || (a.cpp < b.cpp ? -1 : a.cpp > b.cpp ? 1 : 0))
+      .map((x) => x.cpp);
+  }
+
+  // Whether a value of type `source` may be stored in a slot of type `target`,
+  // beyond exact `sameType`: a member widens into a union (`number` → `number |
+  // string`), and a union widens into a union whose members are a superset. The
+  // reverse (a wider union into a narrower target/member) is NOT assignable — it
+  // needs explicit narrowing (`typeof`). Widening is top-level only; nested element
+  // unions must match structurally (so `number[]` is not assignable to
+  // `(number | string)[]` — that would need a runtime element rebuild).
+  private isAssignable(target: Type, source: Type): boolean {
+    if (sameType(target, source)) return true;
+    if (isUnion(target)) {
+      if (isUnion(source)) {
+        return source.members.every((sm) =>
+          target.members.some((tm) => sameType(tm, sm)),
+        );
+      }
+      return target.members.some((tm) => sameType(tm, source));
+    }
+    return false;
+  }
+
+  // Code for `value` stored in a slot of type `target`. Identity when the types
+  // already match; when widening a member into a union, construct the variant
+  // explicitly with `std::in_place_type<Member>` — this avoids `std::variant`'s
+  // converting-constructor ambiguity (e.g. `double` vs `bool` both accept an int).
+  // A number member stores in the f64 rep (an i64 value is cast).
+  private coerceTo(value: Value, target: Type): string {
+    if (sameType(value.type, target) || !isUnion(target)) return value.code;
+    if (isUnion(value.type)) {
+      // Narrower union → wider union: deferred (Phase 4). The C++ variant types
+      // differ, so this needs a std::visit re-wrap rather than a plain construction.
+      throw new Error(
+        `Widening '${displayType(value.type)}' to '${displayType(target)}' is not supported (v1) — assign through a matching member`,
+      );
+    }
+    const mcpp = this.cppType(value.type);
+    const inner = this.f64SlotCode(value); // i64 number → double for the f64 member
+    return `${this.cppType(target)}(std::in_place_type<${mcpp}>, ${inner})`;
+  }
+
+  // The JS `typeof` string for a non-union type (statically known). Note the JS
+  // quirk: `typeof null === "object"`. Every reference type is `"object"`.
+  private staticTypeof(t: Type): string {
+    if (t === "number") return "number";
+    if (t === "string") return "string";
+    if (t === "boolean") return "boolean";
+    if (t === "undefined") return "undefined";
+    return "object"; // null, array, object, class, map, set, promise, response
   }
 
   // The pointee vector type for an array reference (`std::vector<T>`), e.g. for
@@ -660,9 +743,13 @@ class Emitter {
     }
     if (!stmt.value) throw new Error("Missing return value");
     const val = this.emitExpr(stmt.value);
-    if (sameType(val.type, valueType)) {
-      // Resolved values store in the f64 rep for numbers (cast an i64 value).
-      this.push(`co_return ${this.f64SlotCode(val)};`);
+    if (this.isAssignable(valueType, val.type)) {
+      // Resolved values store in the f64 rep for numbers (cast an i64 value);
+      // a member widens into a union-resolved promise via coerceTo.
+      const code = isUnion(valueType)
+        ? this.coerceTo(val, valueType)
+        : this.f64SlotCode(val);
+      this.push(`co_return ${code};`);
       return;
     }
     // `return somePromise` where the function resolves to the same type: adopt the
@@ -850,18 +937,28 @@ class Emitter {
     for (const s of d.body) {
       if (s.kind === "let") {
         const init = this.emitExpr(s.init);
-        if (s.type !== undefined && !sameType(s.type, init.type)) {
+        if (s.type !== undefined && !this.isAssignable(s.type, init.type)) {
           throw new Error(
             `Type '${displayType(init.type)}' is not assignable to '${displayType(s.type)}'`,
           );
         }
-        fields.push({ name: s.name, type: init.type });
+        // Keep the declared type when it widens the init (a union module variable
+        // stays a union), else the init's exact type. (See `emitGlobalLet`.)
+        const fieldType =
+          s.type !== undefined && !sameType(s.type, init.type)
+            ? s.type
+            : init.type;
+        fields.push({ name: s.name, type: fieldType });
         this.sigs.set(fn, {
           params: [],
           ret: { kind: "object", fields: [...fields] },
         });
-        // Record fields are object fields (f64 for numbers), so cast an i64 init.
-        this.push(`rec->${s.name} = ${this.f64SlotCode(init)};`);
+        // Record fields are object fields (f64 for numbers), so cast an i64 init;
+        // a member widens into a union field via coerceTo.
+        const stored = isUnion(fieldType)
+          ? this.coerceTo(init, fieldType)
+          : this.f64SlotCode(init);
+        this.push(`rec->${s.name} = ${stored};`);
       } else {
         this.emitStmt(s);
       }
@@ -914,18 +1011,24 @@ class Emitter {
       return;
     }
     const init = this.emitExpr(stmt.init);
-    if (stmt.type !== undefined && !sameType(stmt.type, init.type)) {
+    if (stmt.type !== undefined && !this.isAssignable(stmt.type, init.type)) {
       throw new Error(
         `Type '${displayType(init.type)}' is not assignable to '${displayType(stmt.type)}'`,
       );
     }
-    this.globals.set(stmt.name, init.type);
+    // Bind the declared type when it widens the init (a union global keeps its
+    // union type); otherwise the init's exact type. (See the local `let` above.)
+    const declared =
+      stmt.type !== undefined && !sameType(stmt.type, init.type)
+        ? stmt.type
+        : init.type;
+    this.globals.set(stmt.name, declared);
     // The global's C++ type follows its inferred number rep (a safe-integer global
     // never assigned a fraction stays `long long`); an i64 initializer widens
     // harmlessly into a demoted (double) global.
-    const declType = this.slotType(init.type, this.reps.globalRep(stmt.name));
+    const declType = this.slotType(declared, this.reps.globalRep(stmt.name));
     this.globalDecls.push(`${declType} ${stmt.name};`);
-    this.push(`${stmt.name} = ${init.code};`);
+    this.push(`${stmt.name} = ${this.coerceTo(init, declared)};`);
   }
 
   // --- emission helpers ---------------------------------------------------
@@ -1109,31 +1212,37 @@ class Emitter {
       }
       const init = this.emitExpr(stmt.init);
       // With an annotation, check assignability; without one, infer from the init.
-      if (stmt.type !== undefined && !sameType(stmt.type, init.type)) {
+      if (stmt.type !== undefined && !this.isAssignable(stmt.type, init.type)) {
         throw new Error(
           `Type '${displayType(init.type)}' is not assignable to '${displayType(stmt.type)}'`,
         );
       }
-      // Bind the initializer's type (for aggregates, its field/element shape).
-      this.vars.set(stmt.name, init.type);
+      // Bind the *declared* type when the annotation widens the initializer (a
+      // union slot must keep its union type, not narrow to the init's member);
+      // otherwise bind the initializer's exact type (preserving aggregate shape).
+      const declared =
+        stmt.type !== undefined && !sameType(stmt.type, init.type)
+          ? stmt.type
+          : init.type;
+      this.vars.set(stmt.name, declared);
       // The variable's C++ type follows its inferred number representation (a
       // safe-integer initializer that's never assigned a fraction stays i64); an
       // i64 init code widens harmlessly into a demoted (double) slot.
       const cpp = this.slotType(
-        init.type,
+        declared,
         this.reps.varRep(this.funcKey, stmt.name),
       );
-      return `${cpp} ${stmt.name} = ${init.code}`;
+      return `${cpp} ${stmt.name} = ${this.coerceTo(init, declared)}`;
     }
     if (stmt.kind === "assign") {
       const target = this.emitLValue(stmt.target);
       const val = this.emitExpr(stmt.value);
-      if (!sameType(target.type, val.type)) {
+      if (!this.isAssignable(target.type, val.type)) {
         throw new Error(
           `Type '${displayType(val.type)}' is not assignable to '${displayType(target.type)}'`,
         );
       }
-      return `${target.code} = ${val.code}`;
+      return `${target.code} = ${this.coerceTo(val, target.type)}`;
     }
     throw new Error(`Statement '${stmt.kind}' is not valid here`);
   }
@@ -1223,6 +1332,10 @@ class Emitter {
           out = val.code;
         } else if (val.type === "number") {
           out = val.rep === "i64" ? val.code : `tsn_num_to_string(${val.code})`;
+        } else if (isUnion(val.type)) {
+          // A union prints its active member with top-level semantics (a string
+          // bare, like the `string` case above; everything else via tsn_inspect).
+          out = `tsn_console_union(${val.code})`;
         } else {
           out = `tsn_inspect(${val.code})`;
         }
@@ -1241,12 +1354,12 @@ class Emitter {
         } else {
           if (!stmt.value) throw new Error("Missing return value");
           const val = this.emitExpr(stmt.value);
-          if (!sameType(val.type, this.curReturn)) {
+          if (!this.isAssignable(this.curReturn, val.type)) {
             throw new Error(
               `Type '${displayType(val.type)}' is not assignable to return type '${displayType(this.curReturn)}'`,
             );
           }
-          this.push(`return ${val.code};`);
+          this.push(`return ${this.coerceTo(val, this.curReturn)};`);
         }
         return;
       }
@@ -1597,6 +1710,23 @@ class Emitter {
           code: `tsn_str(${cppStringLiteral(e.value)})`,
           type: "string",
         };
+      case "null":
+        return { code: "tsn_null{}", type: "null" };
+      case "undefined":
+        return { code: "tsn_undefined{}", type: "undefined" };
+      case "typeof": {
+        // `typeof e` → a `string`. For a union it's decided at runtime (the active
+        // variant); for any other type it's known statically. (Narrowing reads the
+        // *unlowered* form via analyzeGuard — see the `if`/ternary emitters.)
+        const operand = this.emitExpr(e.operand);
+        if (isUnion(operand.type)) {
+          return { code: `tsn_typeof(${operand.code})`, type: "string" };
+        }
+        return {
+          code: `tsn_str(${cppStringLiteral(this.staticTypeof(operand.type))})`,
+          type: "string",
+        };
+      }
       case "var": {
         // A local binding shadows a same-named global, so check `vars` first.
         const local = this.vars.get(e.name);
@@ -2224,12 +2354,12 @@ class Emitter {
     }
     return args.map((a, i) => {
       const val = this.emitExpr(a);
-      if (!sameType(val.type, params[i])) {
+      if (!this.isAssignable(params[i], val.type)) {
         throw new Error(
           `Argument ${i + 1} of '${who}': type '${displayType(val.type)}' is not assignable to '${displayType(params[i])}'`,
         );
       }
-      return val.code;
+      return this.coerceTo(val, params[i]);
     });
   }
 
@@ -2300,6 +2430,13 @@ class Emitter {
       return { code, type: "boolean" };
     }
     if (EQUALITY.has(e.op)) {
+      // Union operands: compare the underlying variant when both are the same
+      // union (std::variant's `==`), or test "holds this member and equals it"
+      // when one side is a member of the other (the common `x === null` / `x === 42`
+      // form, which also drives narrowing — see analyzeGuard).
+      if (isUnion(l.type) || isUnion(r.type)) {
+        return this.emitUnionEquality(e.op, l, r);
+      }
       if (!sameType(l.type, r.type)) {
         throw new Error(
           `Cannot compare '${displayType(l.type)}' and '${displayType(r.type)}' with '${e.op}'`,
@@ -2347,6 +2484,33 @@ class Emitter {
     return { code: iife, type: l.type, rep };
   }
 
+  // `===` / `!==` where at least one operand is a union.
+  //  - union === union (same canonical type): compare the underlying variants.
+  //  - union === member: test the variant holds that member AND equals it; this is
+  //    the `x === null` / `x === 42` form. Single-eval the union side via an IIFE.
+  private emitUnionEquality(op: BinaryOp, l: Value, r: Value): Value {
+    const neg = (s: string) => (op === "===" ? s : `(!${s})`);
+    if (isUnion(l.type) && isUnion(r.type)) {
+      if (!sameType(l.type, r.type)) {
+        throw new Error(
+          `Cannot compare '${displayType(l.type)}' and '${displayType(r.type)}' with '${op}' — different unions (v1)`,
+        );
+      }
+      return { code: neg(`((${l.code}).v() == (${r.code}).v())`), type: "boolean" };
+    }
+    const [u, m] = isUnion(l.type) ? [l, r] : [r, l];
+    const ut = u.type as UnionType;
+    if (!ut.members.some((mem) => sameType(mem, m.type))) {
+      throw new Error(
+        `Cannot compare '${displayType(l.type)}' and '${displayType(r.type)}' with '${op}'`,
+      );
+    }
+    const mcpp = this.cppType(m.type);
+    const mcode = this.f64SlotCode(m); // number member stored as double
+    const held = `([&]{ auto&& _u = (${u.code}).v(); return std::holds_alternative<${mcpp}>(_u) && std::get<${mcpp}>(_u) == ${mcode}; }())`;
+    return { code: neg(held), type: "boolean" };
+  }
+
   // Emit a function call. In statement position a void call is allowed; in value
   // position a void call is an error.
   private emitCall(
@@ -2362,12 +2526,12 @@ class Emitter {
     }
     const args = e.args.map((a, i) => {
       const val = this.emitExpr(a);
-      if (!sameType(val.type, sig.params[i])) {
+      if (!this.isAssignable(sig.params[i], val.type)) {
         throw new Error(
           `Argument ${i + 1} of '${e.callee}': type '${displayType(val.type)}' is not assignable to '${displayType(sig.params[i])}'`,
         );
       }
-      return val.code;
+      return this.coerceTo(val, sig.params[i]);
     });
     if (sig.ret === "void" && !asStatement) {
       throw new Error(

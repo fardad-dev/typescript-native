@@ -31,7 +31,9 @@
 #include <iostream>
 #include <memory>
 #include <string>
+#include <type_traits>
 #include <utility>
+#include <variant>
 #include <vector>
 
 // A scope guard backing `try { … } finally { … }`. `try`'s `finally` block must
@@ -200,6 +202,32 @@ inline void tsn_run_microtasks() {
 // The value of a `Promise<void>` — the subset has no `undefined`, so a void
 // promise resolves to this empty unit (an async `void` function `co_return`s it).
 struct tsn_unit {};
+
+// The `null` / `undefined` value types — empty tag structs so a union variant can
+// discriminate them and `typeof` can tell them apart. Distinct from `tsn_unit`
+// (the Promise<void> resolution), though `undefined` and unit both print
+// "undefined". A union member, never used outside a `tsn_union`'s alternatives.
+struct tsn_null {};
+struct tsn_undefined {};
+inline bool operator==(tsn_null, tsn_null) { return true; }
+inline bool operator!=(tsn_null, tsn_null) { return false; }
+inline bool operator==(tsn_undefined, tsn_undefined) { return true; }
+inline bool operator!=(tsn_undefined, tsn_undefined) { return false; }
+
+// A typed union `A | B | …` — a thin wrapper over `std::variant` so that (a) our
+// `tsn_inspect`/`tsn_json_stringify`/`tsn_typeof` overloads are found by ADL even
+// for an all-scalar union (e.g. `number | string`, whose alternatives are
+// built-in types with no associated namespace of ours), and (b) member→union
+// widening uses the inherited variant constructors. `.v()` exposes the base
+// variant for `std::visit` / `std::get` / `std::holds_alternative`. Codegen orders
+// the alternatives so `undefined`/`null` (if present) come first — the default
+// alternative is then the JS-correct value for a `Map.get` miss on such a union.
+template <class... Ts>
+struct tsn_union : std::variant<Ts...> {
+  using std::variant<Ts...>::variant;
+  const std::variant<Ts...>& v() const { return *this; }
+  std::variant<Ts...>& v() { return *this; }
+};
 
 // The shared, heap-allocated state behind a promise (a `tsn_promise<T>` is a
 // thin handle to it, so copies alias — JS reference semantics, identity `===`).
@@ -410,6 +438,29 @@ static inline bool tsn_truthy(bool b) { return b; }
 static inline bool tsn_truthy(const tsn_str& s) { return s.size() != 0; }
 template <class T> static inline bool tsn_truthy(const std::shared_ptr<T>& p) { return (bool)p; }
 template <class T> static inline bool tsn_truthy(const tsn_rc<T>& p) { return (bool)p; }
+static inline bool tsn_truthy(tsn_null) { return false; }
+static inline bool tsn_truthy(tsn_undefined) { return false; }
+// A union is truthy iff its active member is (JS — null/undefined/0/NaN/"" falsy).
+template <class... Ts>
+static inline bool tsn_truthy(const tsn_union<Ts...>& u) {
+  return std::visit([](auto&& m) { return tsn_truthy(m); }, u.v());
+}
+
+// `typeof` of one (already-extracted) value — the JS string for each member type.
+// Note the JS quirk: `typeof null === "object"`; every reference type is "object".
+static inline tsn_str tsn_typeof_one(double) { return tsn_str("number"); }
+static inline tsn_str tsn_typeof_one(long long) { return tsn_str("number"); }
+static inline tsn_str tsn_typeof_one(bool) { return tsn_str("boolean"); }
+static inline tsn_str tsn_typeof_one(const tsn_str&) { return tsn_str("string"); }
+static inline tsn_str tsn_typeof_one(tsn_null) { return tsn_str("object"); }
+static inline tsn_str tsn_typeof_one(tsn_undefined) { return tsn_str("undefined"); }
+template <class T>
+static inline tsn_str tsn_typeof_one(const tsn_rc<T>&) { return tsn_str("object"); }
+// `typeof` of a union — decided at runtime by the active variant.
+template <class... Ts>
+static inline tsn_str tsn_typeof(const tsn_union<Ts...>& u) {
+  return std::visit([](auto&& m) { return tsn_typeof_one(m); }, u.v());
+}
 
 // String methods, matching JS String.prototype semantics. Indices are JS
 // numbers (doubles): NaN (the sentinel an omitted optional arg lowers to)
@@ -921,11 +972,35 @@ static std::string tsn_inspect(double v) { return tsn_num_to_string(v); }
 static std::string tsn_inspect(long long v) { return std::to_string(v); }
 static std::string tsn_inspect(bool b) { return b ? "true" : "false"; }
 static std::string tsn_inspect(const tsn_str& s) { return tsn_quote(s.str()); }
+static std::string tsn_inspect(tsn_null) { return "null"; }
+static std::string tsn_inspect(tsn_undefined) { return "undefined"; }
 // Forward declaration so the per-struct/class inspects (generated) can print
 // array fields; the definition below resolves scalar elements by ordinary
 // lookup and object/class elements by ADL at instantiation.
 template <class T>
 static std::string tsn_inspect(const tsn_rc<std::vector<T>>& a);
+// A union prints its active member (resolved at runtime via std::visit); element
+// overloads (incl. generated object/class ones) resolve by ADL at instantiation.
+template <class... Ts>
+static std::string tsn_inspect(const tsn_union<Ts...>& u) {
+  return std::visit([](auto&& m) { return tsn_inspect(m); }, u.v());
+}
+
+// Top-level `console.log` of a union: the active member is printed exactly as a
+// top-level console.log argument would be — a *string* bare (no surrounding
+// quotes), everything else via the nested `tsn_inspect` (so a string *inside* a
+// logged object is still quoted). Mirrors the `log`-statement scalar special-case.
+template <class... Ts>
+static std::string tsn_console_union(const tsn_union<Ts...>& u) {
+  return std::visit(
+      [](auto&& m) -> std::string {
+        if constexpr (std::is_same_v<std::decay_t<decltype(m)>, tsn_str>)
+          return m.str();
+        else
+          return tsn_inspect(m);
+      },
+      u.v());
+}
 
 template <class T>
 static std::string tsn_inspect(const tsn_rc<std::vector<T>>& a) {
@@ -1300,8 +1375,18 @@ static std::string tsn_json_stringify(double v) {
 static std::string tsn_json_stringify(long long v) { return std::to_string(v); }
 static std::string tsn_json_stringify(bool b) { return b ? "true" : "false"; }
 static std::string tsn_json_stringify(const tsn_str& s) { return tsn_json_quote(s.str()); }
+// `null` → "null". `undefined` → "null" too: JSON has no undefined, and that's how
+// JS serializes an undefined *array element* (a top-level `JSON.stringify(undefined)`
+// is `undefined` in JS, which a string-returning subset can't represent).
+static std::string tsn_json_stringify(tsn_null) { return "null"; }
+static std::string tsn_json_stringify(tsn_undefined) { return "null"; }
 template <class T>
 static std::string tsn_json_stringify(const tsn_rc<std::vector<T>>& a);
+// A union serializes its active member (resolved at runtime).
+template <class... Ts>
+static std::string tsn_json_stringify(const tsn_union<Ts...>& u) {
+  return std::visit([](auto&& m) { return tsn_json_stringify(m); }, u.v());
+}
 
 template <class T>
 static std::string tsn_json_stringify(const tsn_rc<std::vector<T>>& a) {
