@@ -32,6 +32,11 @@ function freshTemp(): string {
   return `_tsn_d${tempCounter++}`;
 }
 
+// Synthetic local name for an anonymous `export default` (an expression, or an
+// unnamed `export default function`/`class`). The loader maps the module's
+// "default" export to it and mangles it apart on a cross-module collision.
+const DEFAULT_EXPORT_NAME = "tsn_default";
+
 export function lower(fileName: string, source: string): Module {
   tempCounter = 0;
   const sf = ts.createSourceFile(
@@ -43,21 +48,46 @@ export function lower(fileName: string, source: string): Module {
   const classes: ClassDecl[] = [];
   const functions: Func[] = [];
   const main: Stmt[] = [];
+  // The local name of this file's `export default` target, if any (see Module).
+  let defaultExport: string | undefined;
   for (const stmt of sf.statements) {
-    // `import`/`export` declarations are handled by the module loader
-    // (src/frontend/modules.ts): imports drove which files to include, and an
-    // `export` modifier on a declaration is otherwise ignored. We skip the
-    // statements here so they don't fall through to the "unsupported" throw. A
-    // bare `export {...}` / re-export is rejected by the loader before we get here.
+    // `import`/`export` declarations are wired by the module loader
+    // (src/frontend/modules.ts): imports drove which files to include, an `export`
+    // modifier on a declaration lowers transparently (handled below), and a bare
+    // `export {...}` / re-export only affects the loader's symbol table. We skip
+    // them here so they don't fall through to the "unsupported" throw.
     if (ts.isImportDeclaration(stmt) || ts.isExportDeclaration(stmt)) {
       continue;
     }
+    // `export default <expr>` — a bare expression (not a declaration). Desugar it
+    // to a synthetic module variable; the loader maps the module's "default" export
+    // to it. `export = x` (CommonJS) has no module-record analogue → clean error.
+    if (ts.isExportAssignment(stmt)) {
+      if (stmt.isExportEquals) {
+        throw new Error(
+          "`export =` (CommonJS export assignment) is not supported — use `export default`",
+        );
+      }
+      main.push({
+        kind: "let",
+        name: DEFAULT_EXPORT_NAME,
+        init: lowerExpr(stmt.expression),
+      });
+      defaultExport = DEFAULT_EXPORT_NAME;
+      continue;
+    }
     if (ts.isClassDeclaration(stmt)) {
-      classes.push(lowerClass(stmt));
+      const isDefault = hasModifier(stmt, ts.SyntaxKind.DefaultKeyword);
+      const cls = lowerClass(stmt, isDefault ? DEFAULT_EXPORT_NAME : undefined);
+      classes.push(cls);
+      if (isDefault) defaultExport = cls.name;
       continue;
     }
     if (ts.isFunctionDeclaration(stmt)) {
-      functions.push(lowerFunction(stmt));
+      const isDefault = hasModifier(stmt, ts.SyntaxKind.DefaultKeyword);
+      const fn = lowerFunction(stmt, isDefault ? DEFAULT_EXPORT_NAME : undefined);
+      functions.push(fn);
+      if (isDefault) defaultExport = fn.name;
       continue;
     }
     if (ts.isReturnStatement(stmt)) {
@@ -67,7 +97,7 @@ export function lower(fileName: string, source: string): Module {
   }
   // A single lowered file has no dependency modules of its own; the module loader
   // (modules.ts) assembles cross-file programs and fills in `modules`.
-  return { classes, functions, main, modules: [] };
+  return { classes, functions, main, modules: [], defaultExport };
 }
 
 // Lower a typed parameter list (function, method, constructor, or closure). Each
@@ -171,9 +201,12 @@ function hasAsync(node: ts.HasModifiers): boolean {
   return hasModifier(node, ts.SyntaxKind.AsyncKeyword);
 }
 
-function lowerClass(cls: ts.ClassDeclaration): ClassDecl {
-  if (!cls.name) throw new Error("Class declarations must be named (v1)");
-  const name = cls.name.text;
+// `nameOverride` names an anonymous `export default class {}` (the loader maps the
+// module's "default" export to this name); a named class ignores it.
+function lowerClass(cls: ts.ClassDeclaration, nameOverride?: string): ClassDecl {
+  const name = cls.name?.text ?? nameOverride;
+  if (name === undefined)
+    throw new Error("Class declarations must be named (v1)");
   if (cls.heritageClauses && cls.heritageClauses.length > 0) {
     throw new Error(
       `Class inheritance (extends/implements) is not supported yet (v1)`,
@@ -255,18 +288,20 @@ function lowerClass(cls: ts.ClassDeclaration): ClassDecl {
   return { name, fields, ctor, methods };
 }
 
-function lowerFunction(fn: ts.FunctionDeclaration): Func {
-  if (!fn.name) throw new Error("Function declarations must be named (v1)");
-  if (!fn.body) throw new Error(`Function '${fn.name.text}' must have a body`);
+// `nameOverride` names an anonymous `export default function () {}` (the loader
+// maps the module's "default" export to this name); a named function ignores it.
+function lowerFunction(fn: ts.FunctionDeclaration, nameOverride?: string): Func {
+  const name = fn.name?.text ?? nameOverride;
+  if (name === undefined)
+    throw new Error("Function declarations must be named (v1)");
+  if (!fn.body) throw new Error(`Function '${name}' must have a body`);
 
   // Params may be any supported type — scalars, arrays, objects, or class
   // instances. A destructuring param contributes desugared `let`s in `prelude`.
   const { params, prelude } = lowerParams(fn.parameters);
 
   if (!fn.type) {
-    throw new Error(
-      `Function '${fn.name.text}' needs a return type annotation`,
-    );
+    throw new Error(`Function '${name}' needs a return type annotation`);
   }
   let returnType: RetType;
   if (fn.type.kind === ts.SyntaxKind.VoidKeyword) {
@@ -279,7 +314,7 @@ function lowerFunction(fn: ts.FunctionDeclaration): Func {
   }
 
   const body = [...prelude, ...lowerStmts(fn.body.statements)];
-  return { name: fn.name.text, params, returnType, body, async: hasAsync(fn) };
+  return { name, params, returnType, body, async: hasAsync(fn) };
 }
 
 function lowerStatement(node: ts.Statement, out: Stmt[]): void {
@@ -885,6 +920,20 @@ function lowerType(node: ts.TypeNode): Type {
     const t = lowerTypeReference(node, node.typeName.text);
     if (t !== undefined) return t;
   }
+  // `ns.Cls` — a namespace-qualified type name (`import * as ns`). Encode it as a
+  // class type whose name carries the `ns.` qualifier; the loader's renamer
+  // resolves it to the real class. Only a single `ns.Cls` level is supported.
+  if (
+    ts.isTypeReferenceNode(node) &&
+    ts.isQualifiedName(node.typeName) &&
+    ts.isIdentifier(node.typeName.left) &&
+    !node.typeArguments
+  ) {
+    return {
+      kind: "class",
+      name: `${node.typeName.left.text}.${node.typeName.right.text}`,
+    };
+  }
   throw new Error(`Unsupported type annotation: ${ts.SyntaxKind[node.kind]}`);
 }
 
@@ -1212,6 +1261,19 @@ function lowerExpr(node: ts.Expression): Expr {
 // `new C(args)` — also intercepts the `new Map`/`new Set` builtins (reference
 // containers, not class instances) and rejects `new Promise(executor)` (closures).
 function lowerNew(node: ts.NewExpression): Expr {
+  // `new ns.Cls(args)` — a namespace-qualified constructor (`import * as ns`). The
+  // class name carries the `ns.` qualifier; the loader's renamer resolves it to the
+  // real (possibly mangled) class. Only a single `ns.Cls` level is supported.
+  if (
+    ts.isPropertyAccessExpression(node.expression) &&
+    ts.isIdentifier(node.expression.expression)
+  ) {
+    return {
+      kind: "new",
+      className: `${node.expression.expression.text}.${node.expression.name.text}`,
+      args: node.arguments ? lowerArgs(node.arguments) : [],
+    };
+  }
   if (!ts.isIdentifier(node.expression)) {
     throw new Error("'new' requires a class name (v1)");
   }

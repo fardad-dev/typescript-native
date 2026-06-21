@@ -25,11 +25,24 @@
 // The stage-0 TypeScript checker enforces real module semantics (you may only use
 // what you export/import); this loader trusts that and focuses on wiring.
 //
-// Supported: `export` on a declaration (`export function`/`class`/`const`/`let`)
-// and named imports `import { a, b } from "./relative/path"` (relative specifiers
-// only, → `<spec>.ts`). Rejected cleanly: default imports, namespace imports
-// (`import * as ns`), import aliasing (`{ a as b }`), re-export statements,
-// non-relative/package specifiers, and circular imports.
+// Supported import/export forms (all relative specifiers, → `<spec>.ts`):
+//   - `export` on a declaration (`export function`/`class`/`const`/`let`).
+//   - named imports, incl. aliasing — `import { a, b as c } from "./d"`.
+//   - default — `export default fn/class/<expr>`, `import d from "./d"`,
+//     `import d, { a } from "./d"`. A `default` export is just an export named
+//     "default"; an `export default <expr>` desugars (in `lower`) to a synthetic
+//     module variable.
+//   - namespace imports — `import * as ns from "./d"`. `ns` is virtual (no runtime
+//     object): each `ns.x` / `ns.f(...)` / `new ns.C(...)` / type `ns.C` is resolved
+//     against `./d`'s symbol table by the Renamer.
+//   - export lists & re-exports — `export { a, b as c }`, `export { a } from "./d"`,
+//     `export * from "./d"`. These extend a module's symbol table; a `from` re-export
+//     also adds a dependency edge.
+// Rejected cleanly: non-relative/package specifiers (external npm packages can't be
+// compiled to native) and circular imports (the eager memoized-record init model
+// would risk a silent miscompile under ES cycle/TDZ semantics) — both permanent
+// limitations. Also rejected: namespace re-export (`export * as ns from`) and the
+// CommonJS `export =`.
 
 import * as fs from "fs";
 import * as path from "path";
@@ -56,48 +69,27 @@ function resolveImport(fromFile: string, spec: string): string {
   );
 }
 
-// Validate that an import declaration uses a supported form (named, non-aliased)
-// and return its resolved dependency path. The graph follows every import (incl.
-// `import type` and bare `import "./x"` side-effect imports) so the referenced
-// module's declarations are merged in.
+// Return an import declaration's resolved dependency path. Every import *form* is
+// accepted here — named (incl. aliasing `{ a as b }`), default (`import d from`),
+// and namespace (`import * as ns`) — and wired later in `collectImports`. The graph
+// follows every import (incl. `import type` and bare `import "./x"` side-effect
+// imports) so the referenced module's declarations are merged in. The one rejected
+// case is a non-relative specifier (handled by `resolveImport`).
 function importDependency(node: ts.ImportDeclaration, file: string): string {
   if (!ts.isStringLiteral(node.moduleSpecifier)) {
     throw new Error(
       `Import specifier must be a string literal in '${path.basename(file)}'`,
     );
   }
-  const spec = node.moduleSpecifier.text;
-  const clause = node.importClause;
-  if (clause) {
-    // `import dflt from "..."` — default import.
-    if (clause.name) {
-      throw new Error(
-        `Default imports are not supported (v1) in '${path.basename(file)}' — use a named import`,
-      );
-    }
-    const namedBindings = clause.namedBindings;
-    if (namedBindings && ts.isNamespaceImport(namedBindings)) {
-      throw new Error(
-        `Namespace imports (import * as ns) are not supported (v1) in '${path.basename(file)}'`,
-      );
-    }
-    if (namedBindings && ts.isNamedImports(namedBindings)) {
-      for (const el of namedBindings.elements) {
-        // `import { a as b }` — `propertyName` is the original, `name` the alias.
-        if (el.propertyName) {
-          throw new Error(
-            `Import aliasing (import { ${el.propertyName.text} as ${el.name.text} }) is not supported (v1) in '${path.basename(file)}'`,
-          );
-        }
-      }
-    }
-  }
-  return resolveImport(file, spec);
+  return resolveImport(file, node.moduleSpecifier.text);
 }
 
-// Parse a file (lightweight) just to list its resolved import dependencies, in
-// source order. Re-export statements are rejected here (they would need their own
-// graph edge and reference rewiring — out of subset).
+// Parse a file (lightweight) just to list its resolved dependency edges, in source
+// order: every `import`, plus a re-export *from* another module (`export { x } from
+// "./y"`, `export * from "./y"`) — the re-exported module's top-level must run and
+// its names are re-exported. A bare `export { x }` (no specifier) only affects the
+// symbol table, so it adds no edge. A namespace re-export (`export * as ns from`) is
+// rejected (it would need a namespace *value*).
 function dependenciesOf(file: string, source: string): string[] {
   const sf = ts.createSourceFile(
     file,
@@ -111,42 +103,116 @@ function dependenciesOf(file: string, source: string): string[] {
       deps.push(importDependency(stmt, file));
       continue;
     }
-    // `export { x } from "./y"` (re-export) or `export { x }` (export list).
     if (ts.isExportDeclaration(stmt)) {
-      throw new Error(
-        `Re-export / export-list statements are not supported (v1) in '${path.basename(file)}' — put 'export' on the declaration`,
-      );
+      if (stmt.exportClause && ts.isNamespaceExport(stmt.exportClause)) {
+        throw new Error(
+          `Namespace re-export (export * as ns from ...) is not supported (v1) in '${path.basename(file)}'`,
+        );
+      }
+      if (stmt.moduleSpecifier) {
+        if (!ts.isStringLiteral(stmt.moduleSpecifier)) {
+          throw new Error(
+            `Export specifier must be a string literal in '${path.basename(file)}'`,
+          );
+        }
+        deps.push(resolveImport(file, stmt.moduleSpecifier.text));
+      }
+      continue;
     }
   }
   return deps;
 }
 
-// A named import binding `{ local }` and the file it resolves to. (Aliasing
-// `{ a as b }` is rejected by `importDependency`, so `local` is the export name.)
+// A value import binding: `local` is the name in the importing module, `exportName`
+// the name it resolves to in `depFile`. Covers named imports (`{ a }` → both equal),
+// aliasing (`{ a as b }` → local `b`, export `a`), and default imports (`import d`
+// → export `"default"`).
 interface Binding {
   local: string;
+  exportName: string;
   depFile: string;
 }
 
-// The named-import bindings of a file, used to wire each module's references to
-// the exporting module's symbol. Import *forms* were already validated during the
-// graph walk (`dependenciesOf`), so by here every import is a well-formed named
-// import.
-function importBindings(file: string, source: string): Binding[] {
+// A namespace import `import * as ns from "./d"`: `ns` is virtual (no runtime
+// object) — every `ns.x` is resolved against `./d`'s symbol table at rename time.
+interface NsImport {
+  nsLocal: string;
+  depFile: string;
+}
+
+// A re-export / export-list entry. `{ exportName, localName, fromFile? }` covers
+// `export { a as b }` (local `a` re-exported as `b`; no `fromFile`) and the same
+// `from "./d"` form (resolve `a` in `./d`). `{ star: true, fromFile }` is
+// `export * from "./d"` (re-export all of `./d`'s exports except its default).
+type ReExport =
+  | { exportName: string; localName: string; fromFile?: string }
+  | { star: true; fromFile: string };
+
+// The value/namespace imports of a file. Import *specifiers* were already resolved
+// during the graph walk, so every specifier here is a well-formed relative path.
+function collectImports(
+  file: string,
+  source: string,
+): { bindings: Binding[]; namespaces: NsImport[] } {
   const sf = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true);
   const bindings: Binding[] = [];
+  const namespaces: NsImport[] = [];
   for (const stmt of sf.statements) {
     if (!ts.isImportDeclaration(stmt) || !stmt.importClause) continue;
-    const namedBindings = stmt.importClause.namedBindings;
-    if (!namedBindings || !ts.isNamedImports(namedBindings)) continue;
     const depFile = resolveImport(
       file,
       (stmt.moduleSpecifier as ts.StringLiteral).text,
     );
-    for (const el of namedBindings.elements)
-      bindings.push({ local: el.name.text, depFile });
+    const clause = stmt.importClause;
+    // `import dflt from "..."` / `import dflt, { ... } from "..."`.
+    if (clause.name) {
+      bindings.push({ local: clause.name.text, exportName: "default", depFile });
+    }
+    const nb = clause.namedBindings;
+    if (nb && ts.isNamespaceImport(nb)) {
+      namespaces.push({ nsLocal: nb.name.text, depFile });
+    } else if (nb && ts.isNamedImports(nb)) {
+      for (const el of nb.elements) {
+        bindings.push({
+          local: el.name.text,
+          exportName: el.propertyName?.text ?? el.name.text,
+          depFile,
+        });
+      }
+    }
   }
-  return bindings;
+  return { bindings, namespaces };
+}
+
+// The re-export / export-list entries of a file, used to extend its symbol table
+// with names it exports indirectly. `export type { ... }` is type-only (erased), so
+// it carries no runtime wiring. A namespace re-export was rejected in the graph walk.
+function reExportsOf(file: string, source: string): ReExport[] {
+  const sf = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true);
+  const out: ReExport[] = [];
+  for (const stmt of sf.statements) {
+    if (!ts.isExportDeclaration(stmt) || stmt.isTypeOnly) continue;
+    const fromFile =
+      stmt.moduleSpecifier && ts.isStringLiteral(stmt.moduleSpecifier)
+        ? resolveImport(file, stmt.moduleSpecifier.text)
+        : undefined;
+    const clause = stmt.exportClause;
+    if (!clause) {
+      // `export * from "./d"` — the parser guarantees a specifier here.
+      if (fromFile) out.push({ star: true, fromFile });
+      continue;
+    }
+    if (ts.isNamespaceExport(clause)) continue; // rejected earlier
+    for (const el of clause.elements) {
+      // `export { a as b }` — `name` is the export (`b`), `propertyName` the local.
+      out.push({
+        exportName: el.name.text,
+        localName: el.propertyName?.text ?? el.name.text,
+        fromFile,
+      });
+    }
+  }
+  return out;
 }
 
 // The "global C++ symbols" a module declares: functions and classes always (they
@@ -246,6 +312,8 @@ class Renamer {
   constructor(
     private symtab: Map<string, Resolution>,
     private isEntry: boolean,
+    // local namespace name (`import * as ns`) -> that dependency's symbol table.
+    private namespaces: Map<string, Map<string, Resolution>>,
   ) {}
 
   run(mod: Module): void {
@@ -254,18 +322,52 @@ class Renamer {
     mod.main = this.topBody(mod.main);
   }
 
-  // Resolve a value identifier to its replacement expression: a renamed `var`, or
-  // a `member`-on-`init()` for a dependency-module variable. Locals are unchanged.
-  private ref(name: string, locals: Set<string>): Expr {
-    if (locals.has(name)) return { kind: "var", name };
-    const r = this.symtab.get(name);
-    if (r === undefined) return { kind: "var", name };
+  // A Resolution as an expression: a renamed `var`, or a `member`-on-`init()` read
+  // for a dependency-module variable (reusing the object/member codegen).
+  private resolutionExpr(r: Resolution): Expr {
     if (typeof r === "string") return { kind: "var", name: r };
     return {
       kind: "member",
       obj: { kind: "call", callee: r.record, args: [] },
       name: r.field,
     };
+  }
+
+  // If `e` is an unshadowed reference to a namespace import, its dependency's symbol
+  // table (so `ns.x` can resolve `x`); otherwise undefined.
+  private nsOf(
+    e: Expr,
+    locals: Set<string>,
+  ): Map<string, Resolution> | undefined {
+    if (e.kind === "var" && !locals.has(e.name))
+      return this.namespaces.get(e.name);
+    return undefined;
+  }
+
+  // Resolve a value identifier to its replacement expression: a renamed `var`, or
+  // a `member`-on-`init()` for a dependency-module variable. Locals are unchanged.
+  // A bare namespace name used as a value (not `ns.x`) is a clean error.
+  private ref(name: string, locals: Set<string>): Expr {
+    if (locals.has(name)) return { kind: "var", name };
+    if (this.namespaces.has(name)) {
+      throw new Error(
+        `Namespace import '${name}' can only be used via member access (e.g. ${name}.x) — using it as a value is not supported`,
+      );
+    }
+    const r = this.symtab.get(name);
+    if (r === undefined) return { kind: "var", name };
+    return this.resolutionExpr(r);
+  }
+
+  // Resolve a class/type name that may be namespace-qualified ("ns.Cls"). A plain
+  // name resolves through the symbol table (functions/classes are plain strings); a
+  // qualified name resolves its member through the namespace's table.
+  private resolveTypeName(name: string): string {
+    const dot = name.indexOf(".");
+    if (dot < 0) return this.symName(name);
+    const ns = this.namespaces.get(name.slice(0, dot));
+    const r = ns?.get(name.slice(dot + 1));
+    return typeof r === "string" ? r : name;
   }
 
   // A name in the type/declaration namespace (function/class names): always a
@@ -421,7 +523,8 @@ class Renamer {
         e.args = e.args.map((a) => this.expr(a, locals));
         return e;
       case "new":
-        e.className = this.symName(e.className);
+        // className may be namespace-qualified ("ns.Cls") from `new ns.Cls(...)`.
+        e.className = this.resolveTypeName(e.className);
         e.args = e.args.map((a) => this.expr(a, locals));
         return e;
       case "binary":
@@ -449,13 +552,27 @@ class Renamer {
         e.arr = this.expr(e.arr, locals);
         e.index = this.expr(e.index, locals);
         return e;
-      case "member":
+      case "member": {
+        // `ns.x` on a namespace import resolves to `x`'s definition in the dep.
+        const r = this.nsOf(e.obj, locals)?.get(e.name);
+        if (r !== undefined) return this.resolutionExpr(r);
         e.obj = this.expr(e.obj, locals); // not e.name (field / .length)
         return e;
-      case "methodCall":
+      }
+      case "methodCall": {
+        // `ns.fn(args)` on a namespace import — a call of the dep's `fn` (a function
+        // → a direct `call`; a function-valued variable → a `callValue`).
+        const r = this.nsOf(e.receiver, locals)?.get(e.method);
+        if (r !== undefined) {
+          const args = e.args.map((a) => this.expr(a, locals));
+          return typeof r === "string"
+            ? { kind: "call", callee: r, args }
+            : { kind: "callValue", callee: this.resolutionExpr(r), args };
+        }
         e.receiver = this.expr(e.receiver, locals); // not e.method
         e.args = e.args.map((a) => this.expr(a, locals));
         return e;
+      }
       case "jsonStringify":
       case "promiseResolve":
       case "promiseAll":
@@ -519,7 +636,7 @@ class Renamer {
 
   private type(t: Type): void {
     if (typeof t !== "object") return; // primitive keyword
-    if (t.kind === "class") t.name = this.symName(t.name);
+    if (t.kind === "class") t.name = this.resolveTypeName(t.name); // may be ns.Cls
     else if (t.kind === "array") this.type(t.element);
     else if (t.kind === "map") {
       this.type(t.key);
@@ -575,11 +692,14 @@ function topoSort(entry: string, read: (file: string) => string): string[] {
   return order;
 }
 
-// Build each module's symbol table (own declarations + imported bindings) in topo
-// order — so an importer always finds its dependency's table ready — then rewrite
-// that module's IR *in place* via the scope-aware Renamer. A global name (function,
-// class, entry var) is mangled when it collides across modules or clashes with a
-// reserved C++ identifier (e.g. an entry variable or function `main`).
+// Build each module's symbol table in topo order — so an importer always finds its
+// dependency's table ready — then rewrite that module's IR *in place* via the
+// scope-aware Renamer. A global name (function, class, entry var) is mangled when it
+// collides across modules or clashes with a reserved C++ identifier (e.g. an entry
+// variable or function `main`). Each table is the union of: the module's own
+// declarations; its `default` export; its named/default imports; and its re-exports
+// (which point at another module's resolution). Namespace imports don't add table
+// entries — they are resolved per-access by the Renamer against the dep's table.
 function resolveAndRename(
   modules: LoadedModule[],
   read: (file: string) => string,
@@ -598,6 +718,8 @@ function resolveAndRename(
     const symtab = new Map<string, Resolution>();
     const mangleIfNeeded = (name: string) =>
       mustMangle(name) ? mangle(m.index, name) : name;
+    // 1. Own declarations: functions/classes (top-level symbols) and module
+    //    variables (entry → file-scope global; dependency → record field).
     for (const f of m.mod.functions) symtab.set(f.name, mangleIfNeeded(f.name));
     for (const c of m.mod.classes) symtab.set(c.name, mangleIfNeeded(c.name));
     for (const s of m.mod.main) {
@@ -609,12 +731,45 @@ function resolveAndRename(
           : { record: initName(m.index), field: s.name }, // dep var -> record
       );
     }
-    for (const { local, depFile } of importBindings(m.file, read(m.file))) {
-      const resolved = symtabs.get(depFile)?.get(local);
-      if (resolved !== undefined) symtab.set(local, resolved);
+    // 2. `export default` → the synthetic `default` export name (resolves to the
+    //    default target's own resolution, already in the table from step 1).
+    if (m.mod.defaultExport !== undefined) {
+      const r = symtab.get(m.mod.defaultExport);
+      if (r !== undefined) symtab.set("default", r);
+    }
+    // 3. Named / default / aliased imports → the exporting module's resolution.
+    const { bindings, namespaces } = collectImports(m.file, read(m.file));
+    for (const b of bindings) {
+      const resolved = symtabs.get(b.depFile)?.get(b.exportName);
+      if (resolved !== undefined) symtab.set(b.local, resolved);
+    }
+    // 4. Re-exports / export lists → make an exported-as name resolve like its
+    //    source (a local decl, or a name in the `from` module). `export *` copies a
+    //    dependency's exports, except its default and any name already present
+    //    (a local declaration / explicit re-export wins).
+    for (const re of reExportsOf(m.file, read(m.file))) {
+      if ("star" in re) {
+        const depTab = symtabs.get(re.fromFile);
+        if (!depTab) continue;
+        for (const [name, res] of depTab) {
+          if (name !== "default" && !symtab.has(name)) symtab.set(name, res);
+        }
+      } else {
+        const src = re.fromFile
+          ? symtabs.get(re.fromFile)?.get(re.localName)
+          : symtab.get(re.localName);
+        if (src !== undefined) symtab.set(re.exportName, src);
+      }
     }
     symtabs.set(m.file, symtab);
-    new Renamer(symtab, m.isEntry).run(m.mod);
+    // 5. Namespace imports: bind each `ns` to its dependency's (now complete) table
+    //    so the Renamer can resolve `ns.x` accesses.
+    const nsTabs = new Map<string, Map<string, Resolution>>();
+    for (const ns of namespaces) {
+      const depTab = symtabs.get(ns.depFile);
+      if (depTab) nsTabs.set(ns.nsLocal, depTab);
+    }
+    new Renamer(symtab, m.isEntry, nsTabs).run(m.mod);
   }
 }
 

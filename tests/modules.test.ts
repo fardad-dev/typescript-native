@@ -5,10 +5,12 @@ import * as path from "path";
 import { loadProgram } from "../src/frontend/modules";
 
 // The module loader resolves the import graph, lowers each file, and merges
-// everything into one IR Module. The e2e harness covers programs that compile
-// and run; this file covers the loader's *structural* rejections — the cases
-// that can't be expressed as a runnable .ts/.expected pair (cycles, cross-module
-// name collisions, unsupported import forms, unresolvable specifiers).
+// everything into one IR Module. The e2e harness covers programs that compile and
+// run (incl. the `module-*` cases for aliasing, default/namespace imports, and
+// re-exports); this file covers the loader's *structural* behavior that can't be a
+// runnable .ts/.expected pair — its rejections (cycles, name collisions, the two
+// permanently-unsupported forms) and the symbol-table wiring of the advanced
+// import/export forms.
 
 describe("module loader: graph resolution and rejections", () => {
   let dir: string;
@@ -104,36 +106,79 @@ describe("module loader: graph resolution and rejections", () => {
     expect(() => load(entry)).toThrow(/relative import/);
   });
 
-  it("rejects default imports", () => {
-    file("dep.ts", `export function f(): number { return 1; }`);
-    const entry = file("main.ts", `import dflt from "./dep";\nconsole.log(1);`);
-    expect(() => load(entry)).toThrow(/[Dd]efault import/);
-  });
-
-  it("rejects namespace imports", () => {
-    file("dep.ts", `export function f(): number { return 1; }`);
+  it("wires an import alias to the dependency's export", () => {
+    file("dep.ts", `export function add(a: number, b: number): number { return a + b; }`);
     const entry = file(
       "main.ts",
-      `import * as ns from "./dep";\nconsole.log(1);`,
+      `import { add as plus } from "./dep";\nconsole.log(plus(1, 2));`,
     );
-    expect(() => load(entry)).toThrow(/[Nn]amespace import/);
+    const mod = load(entry);
+    // The local `plus` resolves to dep's `add`: the call's callee is rewritten.
+    expect(mod.functions.map((f) => f.name)).toContain("add");
+    expect(mod.main[0]).toMatchObject({
+      kind: "log",
+      arg: { kind: "call", callee: "add" },
+    });
   });
 
-  it("rejects import aliasing", () => {
-    file("dep.ts", `export function f(): number { return 1; }`);
-    const entry = file(
-      "main.ts",
-      `import { f as g } from "./dep";\nconsole.log(1);`,
-    );
-    expect(() => load(entry)).toThrow(/alias/);
+  it("wires a default import to the dependency's default export", () => {
+    file("dep.ts", `export default function f(): number { return 1; }`);
+    const entry = file("main.ts", `import g from "./dep";\nconsole.log(g());`);
+    const mod = load(entry);
+    expect(mod.functions.map((fn) => fn.name)).toContain("f");
+    // `g()` resolves to the default-exported `f`.
+    expect(mod.main[0]).toMatchObject({
+      kind: "log",
+      arg: { kind: "call", callee: "f" },
+    });
   });
 
-  it("rejects re-export statements", () => {
-    file("dep.ts", `export function f(): number { return 1; }`);
+  it("resolves a namespace import's member access", () => {
+    file("dep.ts", `export function ping(): number { return 7; }`);
     const entry = file(
       "main.ts",
-      `export { f } from "./dep";\nconsole.log(1);`,
+      `import * as ns from "./dep";\nconsole.log(ns.ping());`,
     );
-    expect(() => load(entry)).toThrow(/[Rr]e-export|export-list/);
+    const mod = load(entry);
+    expect(mod.functions.map((f) => f.name)).toContain("ping");
+    // `ns.ping()` resolves to a direct call of `ping` (no runtime namespace object).
+    expect(mod.main[0]).toMatchObject({
+      kind: "log",
+      arg: { kind: "call", callee: "ping" },
+    });
+  });
+
+  it("resolves names re-exported by a barrel (named `from` + star)", () => {
+    file("a.ts", `export function one(): number { return 1; }`);
+    file("b.ts", `export const two = 2;`);
+    file(
+      "barrel.ts",
+      `export { one } from "./a";\nexport * from "./b";`,
+    );
+    const entry = file(
+      "main.ts",
+      `import { one, two } from "./barrel";\nconsole.log(one() + two);`,
+    );
+    const mod = load(entry);
+    // `one` is a top-level function from a.ts; `two` is a record-field variable from
+    // b.ts (a dependency module). Both reached through the barrel's re-exports.
+    expect(mod.functions.map((f) => f.name)).toContain("one");
+    const arg = (mod.main[0] as { arg: { left: unknown; right: unknown } }).arg;
+    expect(arg.left).toMatchObject({ kind: "call", callee: "one" });
+    expect(arg.right).toMatchObject({ kind: "member", name: "two" });
+  });
+
+  it("rejects a namespace re-export (export * as ns from)", () => {
+    file("dep.ts", `export const x = 1;`);
+    const entry = file(
+      "main.ts",
+      `export * as ns from "./dep";\nconsole.log(1);`,
+    );
+    expect(() => load(entry)).toThrow(/[Nn]amespace re-export/);
+  });
+
+  it("rejects `export =` (CommonJS export assignment)", () => {
+    const entry = file("main.ts", `const x = 1;\nexport = x;`);
+    expect(() => load(entry)).toThrow(/export =/);
   });
 });

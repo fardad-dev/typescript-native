@@ -44,8 +44,10 @@ discriminant, so TypeScript flags every site when a node is added or changed.
 - **`Func`** (`name`, `params`, `returnType`, `body`, `async`), **`Method`** (a `Func` minus the
   implicit receiver), **`ClassDecl`** (`name`, `fields`, `ctor`, `methods` — one constructor;
   inheritance/static/accessors not modeled).
-- **`Module`** — `{ classes; functions; main: Stmt[] }`. `main` is the top-level program body → C++
-  `main()`.
+- **`Module`** — `{ classes; functions; main: Stmt[]; modules; defaultExport? }`. `main` is the
+  top-level program body → C++ `main()`; `modules` holds imported dependency modules (each a memoized
+  record `init()`); `defaultExport` is the local name of a file's `export default` target (set on a
+  per-file `lower` result for the loader to wire the `"default"` export; unset on the merged module).
 
 ## Design notes
 

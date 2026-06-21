@@ -123,8 +123,11 @@ Implemented and tested end-to-end:
   hood; links `-lcurl` only when used).
 - **Classes:** fields, one constructor, instance methods, `new`, `this.field`/`this.method()`.
   Reference types. (No `extends`/`static`/accessors yet.)
-- **Modules:** `export` on declarations + named imports of relative specifiers; the graph is bundled
-  into one binary with each module scoped independently.
+- **Modules:** the full `export`/`import` surface over relative specifiers — `export` on a
+  declaration, export lists (`export { a, b as c }`), default exports (`export default fn/class/expr`),
+  re-exports (`export { x } from`, `export * from`), and every import form (named, aliased
+  `{ a as b }`, default `import d from`, namespace `import * as ns`). The graph is bundled into one
+  binary, each module scoped independently.
 
 The compiler **errors cleanly** — TypeScript diagnostics from stage 0, or a `tsnc:` message for
 constructs the subset doesn't lower — never a silent miscompile. For the full surface and every
@@ -148,8 +151,12 @@ Every item ships a `tests/cases/*.ts` + `.expected` pair (red → green).
 7. **Enums, literal types, tuples** — need more type-system work.
 8. **Generics / type parameters** (`<T>(x: T) => T`, user `Box<T>`) — the largest type-system lift.
 
-**Deferred module forms** (clean errors today): `export default` / default imports, `import * as`,
-import aliasing (`{ a as b }`), re-exports, non-relative specifiers, circular imports.
+**Module forms — permanently unsupported** (clean errors, not roadmap): **non-relative / package
+specifiers** (they reference external npm packages there's no way to compile to native) and
+**circular imports** (the eager memoized-record `init()` model would risk a silent miscompile under
+ES cycle/TDZ semantics — and silent miscompiles are off the table). Also rejected: namespace
+re-export (`export * as ns from`) and the CommonJS `export =`. Every other import/export form is
+supported (see *Language support*).
 
 **Will never support:** the `any` type, and bare `this` as a value.
 

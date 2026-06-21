@@ -312,4 +312,9 @@ export interface Module {
   // Dependency modules (those imported by others), in dependency order. Empty for
   // a single-file program — in which case codegen is exactly as before.
   modules: DepModule[];
+  // The local name of this file's `export default` target (a function/class name,
+  // or a synthetic variable for `export default <expr>`). Set by `lower` on the
+  // per-file result so the loader can wire the "default" export; the loader leaves
+  // it unset on the merged module. Undefined when the file has no default export.
+  defaultExport?: string;
 }
