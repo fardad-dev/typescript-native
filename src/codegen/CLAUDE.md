@@ -50,6 +50,8 @@ field names, the user's functions, `main`).
 | `Set<T>`            | `tsn_rc<tsn_set<Tc>>` | **reference** type (`setPointee`): an insertion-ordered `tsn_set`. `new Set<T>(arr?)` → `tsn_make_rc` (the array seeds it); `add`/`has`/`del`/`clear`/`values` via `->`; iterable by `for…of`; `.size` (i64) |
 | `Promise<T>`        | `tsn_promise<Tc>` (C++20 coroutine type) | **reference** type: a handle wrapping a `std::shared_ptr` to promise state (the one aggregate left on `shared_ptr` — not a hot path). An `async` function's declared return type — its body is a coroutine (`co_return`/`co_await`). `Promise<void>` → `tsn_promise<tsn_unit>`. Resolved numbers use the f64 rep. See *Async / await* below |
 | `Response`          | `tsn_rc<tsn_response>` | **reference** type: the `fetch(...)` result. Fields `status` (f64) / `ok` (bool); methods `text()` → `Promise<string>`, `json()` → `Promise<T>` (target type required). See *fetch / Response* below |
+| `null` / `undefined` | `tsn_null` / `tsn_undefined` | empty tag structs (distinct types so a union variant discriminates them; `typeof null === "object"`). Mostly a union member / the optional-`?:` desugar |
+| `A \| B \| …` (union) | `tsn_union<M0, …>` | a `std::variant` **wrapper** (ADL). Members rep-stable + `undefined`/`null`-first (the default alternative). See *Union types & narrowing* below |
 
 Arrays, objects and class instances are **all reference types** (`tsn_rc<…>`), so JS
 semantics hold uniformly: copy/assign aliases, mutation through one alias is visible through the
@@ -409,6 +411,52 @@ keeps the one-tick deferral, so JS ordering still holds.
   overload (`Response { status: N, ok: B }`). **Deferred** (clean errors): request options
   (`fetch(url, {…})` — caught at stage 0 by the one-arg ambient signature), `res.headers`/`blob()`/
   `statusText`, GET only.
+
+## Union types & narrowing
+
+A union `A | B | …` compiles to **`tsn_union<…>`** — a thin `std::variant` wrapper (runtime header).
+The wrapper (not a bare `std::variant`) is what makes our `tsn_inspect` / `tsn_json_stringify` /
+`tsn_truthy` / `tsn_typeof` overloads resolve by **ADL** even for an all-scalar union like
+`number | string` (whose alternatives have no associated namespace of ours). `null` / `undefined`
+are empty tag structs `tsn_null` / `tsn_undefined`.
+
+- **Type identity / canonical order.** Lowering canonicalizes a union's members (flatten/dedupe/
+  collapse/sort). `cppType` then re-sorts the C++ alternatives by their **final** (post-rename) type
+  text, with `undefined`/`null` first (`unionMemberCpps`). So two structurally equal unions emit
+  byte-identical `tsn_union<…>` (rename-stable — the module `Renamer` can mangle a class member's
+  name without reordering the variant), and the variant's **default alternative** is the JS-correct
+  value for a `Map.get` miss on a `T | undefined` / `T | null` value type.
+- **Assignability vs. equality.** `isAssignable(target, source)` allows a **member → union** widen
+  and a **narrower → wider union** widen (top-level only — nested element unions must match
+  structurally). It drives `coerceTo`, which constructs the variant with explicit
+  `std::in_place_type<Member>` (dodging `std::variant`'s `double`-vs-`bool` ctor ambiguity) and uses
+  `tsn_union_widen<Wider>(u)` (a runtime `std::visit` re-wrap) for union→union. `coerceTo` is applied
+  at every value-flow site (`let`/`assign`/`return`/async return/args/dep-init field). **Equality**
+  is separate (`emitUnionEquality`): `u === member` is `holds_alternative<M> && get<M> == m` (single-
+  eval of `u` via an IIFE), `u === u` (same canonical type) compares the underlying variants;
+  `!==` negates. `console.log` of a union routes through `tsn_console_union` — the active member
+  printed with **top-level** semantics (a string bare, like a top-level string; else `tsn_inspect`).
+- **Flow narrowing (`analyzeGuard` + `this.narrowed`).** Narrowing is done **in the emitter**, not by
+  threading the checker — stage 0 (real TS) already proved the program correct under TS narrowing, so
+  the emitted `std::get<Member>` is sound (no runtime variant-access check). `this.vars` keeps the
+  *declared* union; `this.narrowed` overrides it for reads inside a guarded region. `analyzeGuard`
+  recognizes the v1 forms: `typeof x === "lit"` (and `!==`), `x === null`/`undefined` (and `!==`),
+  bare truthiness `x` / `!x` (drops null/undefined), and a boolean-`&&` chain over the same variable.
+  The `if`/ternary emitters install the positive narrowing for the then-branch and the negative for
+  the else via `withNarrowed` (save/run/restore); `&&`/`||` narrow their right operand by the left's
+  guard. **Early-return narrowing**: when a then-block always exits (`alwaysExits`) and there's no
+  `else`, the negative narrowing is installed for the rest of the enclosing block — `emitBlock`
+  snapshots/restores `this.narrowed` so it doesn't leak past the block. A narrowed read (the `var`
+  case) emits `std::get<Member>((x).v())` when narrowed to one member (else keeps the variant, typed
+  as the smaller union); **reassigning** a narrowed var drops its narrowing. `typeof e` itself is a
+  first-class `string` (`tsn_typeof` via `std::visit` for a union; `staticTypeof` otherwise).
+- **Optional parameters** `(a?: T)` are `T | undefined` (lowering); `checkArgs` allows omitted
+  trailing optionals (arity is `min..max`, `min` = first optional param) and appends a
+  `tsn_undefined{}` default. `emitCall` shares `checkArgs`.
+- **Deferred (clean `tsnc:` errors / structural-only):** optional object **fields** (`{ x?: T }` —
+  need object-literal field-defaulting + nested coercion), a **ternary** whose branches have
+  different types (no union-merge), and union-typed **array/Map/Set element** coercion. Member access
+  / arithmetic on an *un-narrowed* union is caught at stage 0 (TS), never miscompiled.
 
 ## Guard clauses
 

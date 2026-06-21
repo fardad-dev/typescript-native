@@ -7,8 +7,14 @@ is added or changed.
 
 ## The definitions
 
-- **`Type`** — `"number" | "boolean" | "string"` plus aggregate shapes, a class instance, and the
-  Map/Set containers:
+- **`Type`** — `"number" | "boolean" | "string" | "null" | "undefined"` plus aggregate shapes, a
+  class instance, the Map/Set containers, and unions:
+  - `"null"` / `"undefined"` — unit value types (codegen → empty tag structs `tsn_null` /
+    `tsn_undefined`); mostly union members and the optional-`?:` desugar.
+  - `{ kind: "union"; members: Type[] }` — `A | B | …`. Members are **canonicalized** in lowering
+    (flattened, deduped, single-member collapsed, stable-sorted) so `number | string` ≡
+    `string | number`. Codegen → `tsn_union<…>` (a `std::variant` wrapper); a member widens in
+    (coercion) and `typeof`/`=== null`/truthiness guards narrow it back (see codegen).
   - `{ kind: "array"; element: Type }`
   - `{ kind: "object"; fields: Field[] }` where `Field = { name; type }`
   - `{ kind: "class"; name: string }` — a named class instance.
@@ -33,7 +39,9 @@ is added or changed.
   trio `await` (`{ expr }` — `co_await`), `promiseResolve` (`{ arg }` — `Promise.resolve`), and
   `promiseAll` (`{ arg }` — `Promise.all`), and the fetch pair `fetch` (`{ url }` — a blocking GET
   returning a settled `Promise<Response>`) / `responseJson` (`{ receiver; type }` — `res.json()` as
-  a `Promise<T>`; the target `type` is captured up front since `Response.json()` is `Promise<any>`).
+  a `Promise<T>`; the target `type` is captured up front since `Response.json()` is `Promise<any>`),
+  the `null` / `undefined` literals, and `typeof` (`{ operand }` — a `string`; on a union resolved
+  at runtime, and as `typeof x === "…"` in a guard it drives flow narrowing in codegen).
 - **`Stmt`** — `let`, `log`, `return`, `exprStmt` (a bare expression evaluated for effect),
   `assign`, and the control-flow statements: `if`, `while`, `for`, `doWhile`, `forOf`
   (`{ name; iterable; body }`), `forIn` (`{ name; target; body }`), `switch` (`{ disc; cases }`
