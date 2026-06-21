@@ -229,6 +229,19 @@ struct tsn_union : std::variant<Ts...> {
   std::variant<Ts...>& v() { return *this; }
 };
 
+// Widen a narrower union into a wider one (every alternative of the source is also
+// an alternative of `Wider`): rebuild `Wider` around the active member. Used when a
+// `A | B` value flows into a `A | B | C` slot — the C++ variant types differ, so a
+// plain copy won't do.
+template <class Wider, class... Ts>
+static Wider tsn_union_widen(const tsn_union<Ts...>& u) {
+  return std::visit(
+      [](auto&& m) -> Wider {
+        return Wider(std::in_place_type<std::decay_t<decltype(m)>>, m);
+      },
+      u.v());
+}
+
 // The shared, heap-allocated state behind a promise (a `tsn_promise<T>` is a
 // thin handle to it, so copies alias — JS reference semantics, identity `===`).
 // `value` outlives the coroutine frame that produced it (the frame self-destroys

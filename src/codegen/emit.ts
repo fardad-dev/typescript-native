@@ -460,11 +460,10 @@ class Emitter {
   private coerceTo(value: Value, target: Type): string {
     if (sameType(value.type, target) || !isUnion(target)) return value.code;
     if (isUnion(value.type)) {
-      // Narrower union → wider union: deferred (Phase 4). The C++ variant types
-      // differ, so this needs a std::visit re-wrap rather than a plain construction.
-      throw new Error(
-        `Widening '${displayType(value.type)}' to '${displayType(target)}' is not supported (v1) — assign through a matching member`,
-      );
+      // Narrower union → wider union: the C++ variant types differ, so rebuild the
+      // wider variant around the active member at runtime (isAssignable has already
+      // verified every source member is an alternative of the target).
+      return `tsn_union_widen<${this.cppType(target)}>(${value.code})`;
     }
     const mcpp = this.cppType(value.type);
     const inner = this.f64SlotCode(value); // i64 number → double for the f64 member
