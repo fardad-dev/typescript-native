@@ -1,6 +1,12 @@
 // Stage 1 + 2: parse with the official TypeScript parser, then lower its AST
-// into our internal IR. We read type annotations straight off the AST; a full
-// ts.Program + TypeChecker comes later (see CLAUDE.md roadmap).
+// into our internal IR. We read type annotations straight off the AST: stage 0
+// (src/frontend/check.ts) already ran a real ts.Program + TypeChecker as a gate,
+// but lowering does not yet thread the checker's *inferred* types through.
+//
+// Many `Error` messages here carry a "(v1)" marker — it flags a construct that
+// is valid TypeScript but outside this compiler's current subset (so it's a
+// clean "not yet supported", not a type error). Stage 0 has already accepted the
+// program as type-correct by the time these fire.
 
 import * as ts from "typescript";
 import {
@@ -81,15 +87,16 @@ function lowerParams(params: ts.NodeArray<ts.ParameterDeclaration>): Param[] {
   });
 }
 
+// Whether `node` carries the given modifier keyword.
+function hasModifier(node: ts.HasModifiers, kind: ts.SyntaxKind): boolean {
+  return ts.getModifiers(node)?.some((m) => m.kind === kind) ?? false;
+}
+
 // `static` is the one modifier that changes semantics (no `this`); reject it.
 // Access modifiers (public/private/protected/readonly) are accepted and ignored
 // — we don't enforce visibility yet, and they don't affect generated code.
 function hasStatic(node: ts.HasModifiers): boolean {
-  return (
-    ts
-      .getModifiers(node)
-      ?.some((m) => m.kind === ts.SyntaxKind.StaticKeyword) ?? false
-  );
+  return hasModifier(node, ts.SyntaxKind.StaticKeyword);
 }
 
 // The `async` modifier on a function/method. An async function returns a
@@ -97,10 +104,7 @@ function hasStatic(node: ts.HasModifiers): boolean {
 // `await`. (Stage 0 already enforces that `await` appears only in async functions
 // and that an async function's annotated return type is a `Promise<...>`.)
 function hasAsync(node: ts.HasModifiers): boolean {
-  return (
-    ts.getModifiers(node)?.some((m) => m.kind === ts.SyntaxKind.AsyncKeyword) ??
-    false
-  );
+  return hasModifier(node, ts.SyntaxKind.AsyncKeyword);
 }
 
 function lowerClass(cls: ts.ClassDeclaration): ClassDecl {
@@ -139,9 +143,10 @@ function lowerClass(cls: ts.ClassDeclaration): ClassDecl {
       if (ctor)
         throw new Error(`Class '${name}' has more than one constructor`);
       if (!m.body) throw new Error(`Constructor of '${name}' must have a body`);
-      const body: Stmt[] = [];
-      for (const s of m.body.statements) lowerStatement(s, body);
-      ctor = { params: lowerParams(m.parameters), body };
+      ctor = {
+        params: lowerParams(m.parameters),
+        body: lowerStmts(m.body.statements),
+      };
       continue;
     }
     if (ts.isMethodDeclaration(m)) {
@@ -161,13 +166,11 @@ function lowerClass(cls: ts.ClassDeclaration): ClassDecl {
       // promise type by lowerType); `void` only appears on non-async methods.
       const returnType: RetType =
         m.type.kind === ts.SyntaxKind.VoidKeyword ? "void" : lowerType(m.type);
-      const body: Stmt[] = [];
-      for (const s of m.body.statements) lowerStatement(s, body);
       methods.push({
         name: m.name.text,
         params: lowerParams(m.parameters),
         returnType,
-        body,
+        body: lowerStmts(m.body.statements),
         async: hasAsync(m),
       });
       continue;
@@ -209,8 +212,7 @@ function lowerFunction(fn: ts.FunctionDeclaration): Func {
     returnType = lowerType(fn.type);
   }
 
-  const body: Stmt[] = [];
-  for (const s of fn.body.statements) lowerStatement(s, body);
+  const body = lowerStmts(fn.body.statements);
   return { name: fn.name.text, params, returnType, body, async: hasAsync(fn) };
 }
 
@@ -294,8 +296,7 @@ function lowerStatement(node: ts.Statement, out: Stmt[]): void {
       kind: "switch",
       disc: lowerExpr(node.expression),
       cases: node.caseBlock.clauses.map((clause): SwitchCase => {
-        const body: Stmt[] = [];
-        for (const s of clause.statements) lowerStatement(s, body);
+        const body = lowerStmts(clause.statements);
         return ts.isCaseClause(clause)
           ? { test: lowerExpr(clause.expression), body }
           : { body };
@@ -475,11 +476,20 @@ function lowerForBindingName(init: ts.ForInitializer, kw: "of" | "in"): string {
 // `label: <stmt>` — only loops may be labeled in this subset (so a labeled
 // `break`/`continue` has a well-defined target). Lower the wrapped statement and
 // require it to be exactly one loop.
+// The loop statement kinds — the only statements a label may target (so a
+// labeled `break`/`continue` has a well-defined loop to jump to).
+const LOOP_KINDS: readonly Stmt["kind"][] = [
+  "while",
+  "doWhile",
+  "for",
+  "forOf",
+  "forIn",
+];
+
 function lowerLabeled(node: ts.LabeledStatement): Stmt {
   const inner: Stmt[] = [];
   lowerStatement(node.statement, inner);
-  const loopKinds = ["while", "doWhile", "for", "forOf", "forIn"];
-  if (inner.length !== 1 || !loopKinds.includes(inner[0].kind)) {
+  if (inner.length !== 1 || !LOOP_KINDS.includes(inner[0].kind)) {
     throw new Error(
       `Only loops can be labeled (v1) — '${node.label.text}:' must label a for/while/do-while loop`,
     );
@@ -507,15 +517,12 @@ function lowerThrowValue(expr: ts.Expression): Expr {
 // catch/finally is present. The catch binding (if any) must be a simple
 // identifier; its value is bound as a `string` during codegen.
 function lowerTry(node: ts.TryStatement): Stmt {
-  const block: Stmt[] = [];
-  for (const s of node.tryBlock.statements) lowerStatement(s, block);
+  const block = lowerStmts(node.tryBlock.statements);
 
   let catchName: string | undefined;
   let catchBody: Stmt[] | undefined;
   if (node.catchClause) {
-    catchBody = [];
-    for (const s of node.catchClause.block.statements)
-      lowerStatement(s, catchBody);
+    catchBody = lowerStmts(node.catchClause.block.statements);
     const decl = node.catchClause.variableDeclaration;
     if (decl) {
       if (!ts.isIdentifier(decl.name)) {
@@ -525,24 +532,27 @@ function lowerTry(node: ts.TryStatement): Stmt {
     }
   }
 
-  let finallyBody: Stmt[] | undefined;
-  if (node.finallyBlock) {
-    finallyBody = [];
-    for (const s of node.finallyBlock.statements)
-      lowerStatement(s, finallyBody);
-  }
+  const finallyBody = node.finallyBlock
+    ? lowerStmts(node.finallyBlock.statements)
+    : undefined;
 
   return { kind: "try", block, catchName, catchBody, finallyBody };
 }
 
+// Lower a sequence of statements into a fresh IR statement array. Used wherever
+// a body's statements (a function/method/loop body, a switch clause, a try block)
+// lower as a group.
+function lowerStmts(statements: readonly ts.Statement[]): Stmt[] {
+  const out: Stmt[] = [];
+  for (const s of statements) lowerStatement(s, out);
+  return out;
+}
+
 // A block (`{ ... }`) or a single bare statement (`if (c) stmt;`) -> Stmt[].
 function lowerBlock(node: ts.Statement): Stmt[] {
+  if (ts.isBlock(node)) return lowerStmts(node.statements);
   const out: Stmt[] = [];
-  if (ts.isBlock(node)) {
-    for (const s of node.statements) lowerStatement(s, out);
-  } else {
-    lowerStatement(node, out);
-  }
+  lowerStatement(node, out);
   return out;
 }
 
@@ -645,77 +655,95 @@ function lowerType(node: ts.TypeNode): Type {
   if (ts.isArrayTypeNode(node)) {
     return { kind: "array", element: lowerType(node.elementType) };
   }
-  // `{ a: T; b: U }` — fields may be any supported type now, including arrays and
-  // nested objects (`{ pts: number[] }`, `{ inner: { x: number } }`). `lowerType`
-  // recurses, so the nesting is captured structurally; codegen maps each field to
-  // its C++ type (a `std::vector<...>` member or a nested struct).
-  if (ts.isTypeLiteralNode(node)) {
-    const fields = node.members.map((m) => {
-      if (
-        !ts.isPropertySignature(m) ||
-        !m.name ||
-        !ts.isIdentifier(m.name) ||
-        !m.type
-      ) {
-        throw new Error("Unsupported object type member (v1)");
-      }
-      // An optional field `x?: T` would be `T | undefined`, but constructing it
-      // needs object-literal field-defaulting and nested union coercion (a value
-      // widens only at the top level today) — deferred. Reject it cleanly rather
-      // than silently dropping the `?` (which would treat the field as required).
-      if (m.questionToken) {
-        throw new Error(
-          `Optional object field '${m.name.text}?' is not supported (v1) — use '${m.name.text}: T | undefined' with an explicit value`,
-        );
-      }
-      return { name: m.name.text, type: lowerType(m.type) };
-    });
-    return { kind: "object", fields };
-  }
+  // `{ a: T; b: U }` — an object type literal.
+  if (ts.isTypeLiteralNode(node)) return lowerObjectType(node);
+  // A named type: a primitive/boxed wrapper, a built-in generic (Array/Map/Set/
+  // Promise), `Response`, or a class instance. Returns undefined if it's a named
+  // type we don't lower (e.g. a user generic with type args) — fall through.
   if (ts.isTypeReferenceNode(node) && ts.isIdentifier(node.typeName)) {
-    const n = node.typeName.text;
-    // In our `tsn` dialect, the boxed wrappers `Number`/`Boolean`/`String` are
-    // treated as their primitives — we only have one of each.
-    if (n === "Number" || n === "number") return "number";
-    if (n === "Boolean" || n === "boolean") return "boolean";
-    if (n === "String" || n === "string") return "string";
-    // `Array<T>`
-    if (n === "Array" && node.typeArguments?.length === 1) {
-      return { kind: "array", element: lowerType(node.typeArguments[0]) };
-    }
-    // `Map<K, V>` / `Set<T>` — reference-typed containers (see codegen).
-    if (n === "Map" && node.typeArguments?.length === 2) {
-      return {
-        kind: "map",
-        key: lowerType(node.typeArguments[0]),
-        value: lowerType(node.typeArguments[1]),
-      };
-    }
-    if (n === "Set" && node.typeArguments?.length === 1) {
-      return { kind: "set", element: lowerType(node.typeArguments[0]) };
-    }
-    // `Promise<T>` — the result type of an async function and a first-class value.
-    // `Promise<void>` lowers to a promise with no resolved value (resolves to JS
-    // `undefined`). `await` on a promise yields `T` (see codegen).
-    if (n === "Promise" && node.typeArguments?.length === 1) {
-      const arg = node.typeArguments[0];
-      if (arg.kind === ts.SyntaxKind.VoidKeyword) return { kind: "promise" };
-      return { kind: "promise", value: lowerType(arg) };
-    }
-    // `Response` — the built-in result of `fetch(...)` (see codegen). A bare
-    // identifier, so it's matched here before the class-instance fallthrough.
-    if (n === "Response" && !node.typeArguments) {
-      return { kind: "response" };
-    }
-    // A bare identifier that isn't a known primitive/built-in is treated as a
-    // class instance type (`let p: Point`). The emitter validates the class
-    // exists. Generic refs (with type arguments) still fall through as
-    // unsupported, so e.g. `Map<K, V>` keeps its clear "Unsupported type" error.
-    if (!node.typeArguments) {
-      return { kind: "class", name: n };
-    }
+    const t = lowerTypeReference(node, node.typeName.text);
+    if (t !== undefined) return t;
   }
   throw new Error(`Unsupported type annotation: ${ts.SyntaxKind[node.kind]}`);
+}
+
+// `{ a: T; b: U }` — fields may be any supported type, including arrays and nested
+// objects (`{ pts: number[] }`, `{ inner: { x: number } }`). `lowerType` recurses,
+// so the nesting is captured structurally; codegen maps each field to its C++ type
+// (a `std::vector<...>` member or a nested struct).
+function lowerObjectType(node: ts.TypeLiteralNode): Type {
+  const fields = node.members.map((m) => {
+    if (
+      !ts.isPropertySignature(m) ||
+      !m.name ||
+      !ts.isIdentifier(m.name) ||
+      !m.type
+    ) {
+      throw new Error("Unsupported object type member (v1)");
+    }
+    // An optional field `x?: T` would be `T | undefined`, but constructing it
+    // needs object-literal field-defaulting and nested union coercion (a value
+    // widens only at the top level today) — deferred. Reject it cleanly rather
+    // than silently dropping the `?` (which would treat the field as required).
+    if (m.questionToken) {
+      throw new Error(
+        `Optional object field '${m.name.text}?' is not supported (v1) — use '${m.name.text}: T | undefined' with an explicit value`,
+      );
+    }
+    return { name: m.name.text, type: lowerType(m.type) };
+  });
+  return { kind: "object", fields };
+}
+
+// A named type reference `n<...>`. Handles the primitives/boxed wrappers, the
+// built-in generics (`Array`/`Map`/`Set`/`Promise`), `Response`, and a bare
+// identifier as a class instance. Returns `undefined` for a named type the subset
+// doesn't lower (so the caller falls through to its "Unsupported type" error).
+function lowerTypeReference(
+  node: ts.TypeReferenceNode,
+  n: string,
+): Type | undefined {
+  // In our `tsn` dialect, the boxed wrappers `Number`/`Boolean`/`String` are
+  // treated as their primitives — we only have one of each.
+  if (n === "Number" || n === "number") return "number";
+  if (n === "Boolean" || n === "boolean") return "boolean";
+  if (n === "String" || n === "string") return "string";
+  // `Array<T>`
+  if (n === "Array" && node.typeArguments?.length === 1) {
+    return { kind: "array", element: lowerType(node.typeArguments[0]) };
+  }
+  // `Map<K, V>` / `Set<T>` — reference-typed containers (see codegen).
+  if (n === "Map" && node.typeArguments?.length === 2) {
+    return {
+      kind: "map",
+      key: lowerType(node.typeArguments[0]),
+      value: lowerType(node.typeArguments[1]),
+    };
+  }
+  if (n === "Set" && node.typeArguments?.length === 1) {
+    return { kind: "set", element: lowerType(node.typeArguments[0]) };
+  }
+  // `Promise<T>` — the result type of an async function and a first-class value.
+  // `Promise<void>` lowers to a promise with no resolved value (resolves to JS
+  // `undefined`). `await` on a promise yields `T` (see codegen).
+  if (n === "Promise" && node.typeArguments?.length === 1) {
+    const arg = node.typeArguments[0];
+    if (arg.kind === ts.SyntaxKind.VoidKeyword) return { kind: "promise" };
+    return { kind: "promise", value: lowerType(arg) };
+  }
+  // `Response` — the built-in result of `fetch(...)` (see codegen). A bare
+  // identifier, so it's matched here before the class-instance fallthrough.
+  if (n === "Response" && !node.typeArguments) {
+    return { kind: "response" };
+  }
+  // A bare identifier that isn't a known primitive/built-in is treated as a class
+  // instance type (`let p: Point`). The emitter validates the class exists.
+  // Generic refs (with type arguments) return undefined → "Unsupported type", so
+  // e.g. a user `Box<T>` keeps its clear error.
+  if (!node.typeArguments) {
+    return { kind: "class", name: n };
+  }
+  return undefined;
 }
 
 // A stable structural key for a type — used to dedupe and order union members.
@@ -768,6 +796,13 @@ function typeKindOrdinal(t: Type): number {
   return order[t.kind] ?? 99;
 }
 
+// Lexicographic 3-way string comparison (by UTF-16 code unit) for `Array.sort`
+// comparators — deliberately `<`/`>`, not `localeCompare`, so the ordering is the
+// stable byte order the rest of the pipeline assumes.
+function byteCompare(a: string, b: string): number {
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
 // Canonicalize a union's members: flatten nested unions, dedupe (structurally),
 // collapse a single-member union to that member, reject empty, and sort into a
 // stable order (scalars first, `undefined`/`null` at the front). Codegen re-sorts
@@ -792,9 +827,7 @@ function canonicalizeUnion(rawMembers: Type[]): Type {
   flat.sort((a, b) => {
     const d = typeKindOrdinal(a) - typeKindOrdinal(b);
     if (d !== 0) return d;
-    const ka = typeKey(a);
-    const kb = typeKey(b);
-    return ka < kb ? -1 : ka > kb ? 1 : 0;
+    return byteCompare(typeKey(a), typeKey(b));
   });
   return flat.length === 1 ? flat[0] : { kind: "union", members: flat };
 }
@@ -852,28 +885,7 @@ function lowerExpr(node: ts.Expression): Expr {
   if (ts.isTypeOfExpression(node)) {
     return { kind: "typeof", operand: lowerExpr(node.expression) };
   }
-  if (ts.isNewExpression(node)) {
-    if (!ts.isIdentifier(node.expression)) {
-      throw new Error("'new' requires a class name (v1)");
-    }
-    const ctor = node.expression.text;
-    // `new Map<K, V>()` / `new Set<T>(...)` are builtins, not class instances.
-    if (ctor === "Map") return lowerNewMap(node);
-    if (ctor === "Set") return lowerNewSet(node);
-    // `new Promise(executor)` needs a first-class function (the executor) and
-    // capture machinery — out of subset. Async functions / Promise.resolve cover
-    // the common cases without it.
-    if (ctor === "Promise") {
-      throw new Error(
-        "new Promise(executor) is not supported (v1) — it needs first-class function values (closures); use an async function or Promise.resolve",
-      );
-    }
-    return {
-      kind: "new",
-      className: ctor,
-      args: node.arguments ? node.arguments.map(lowerExpr) : [],
-    };
-  }
+  if (ts.isNewExpression(node)) return lowerNew(node);
   // `await e` — suspend the enclosing async function until `e`'s promise settles
   // and yield its resolved value. Lowered to an `await` IR node (codegen emits
   // `co_await`); codegen enforces it appears only inside an async function.
@@ -885,23 +897,7 @@ function lowerExpr(node: ts.Expression): Expr {
   // — no runtime effect — so it lowers transparently. This is what lets the common
   // `map.get(k)!` idiom type-check (Map.get is `V | undefined`) and still lower.
   if (ts.isNonNullExpression(node)) return lowerExpr(node.expression);
-  // `e as T` — supported as the type carrier for `JSON.parse(text) as T` and
-  // `await res.json() as T` (both produce an `any`, so the assertion supplies the
-  // value's static type). A general type assertion has no representation in the
-  // typed subset.
-  if (ts.isAsExpression(node)) {
-    const inner = skipParens(node.expression);
-    if (isJsonParseCall(inner)) {
-      return jsonParseNode(inner, lowerType(node.type));
-    }
-    const jsonCall = responseJsonCall(node.expression);
-    if (jsonCall) {
-      return responseJsonAwaitNode(jsonCall, lowerType(node.type));
-    }
-    throw new Error(
-      "Type assertions ('as T') are only supported on JSON.parse(...) and `await res.json()` (v1)",
-    );
-  }
+  if (ts.isAsExpression(node)) return lowerAsExpr(node);
   if (ts.isArrayLiteralExpression(node)) {
     return {
       kind: "array",
@@ -947,37 +943,7 @@ function lowerExpr(node: ts.Expression): Expr {
       name: node.name.text,
     };
   }
-  if (ts.isCallExpression(node)) {
-    // `JSON.stringify(x)` / `JSON.parse(x)` and `Math.<fn>(...)` are builtins, not
-    // method calls — intercept before the generic `recv.method(args)` path.
-    const json = tryLowerJsonCall(node);
-    if (json) return json;
-    const math = tryLowerMathCall(node);
-    if (math) return math;
-    const promise = tryLowerPromiseCall(node);
-    if (promise) return promise;
-    const fetched = tryLowerFetchCall(node);
-    if (fetched) return fetched;
-    // `recv.method(args)` -> methodCall (e.g. xs.push(v)).
-    if (ts.isPropertyAccessExpression(node.expression)) {
-      return {
-        kind: "methodCall",
-        receiver: lowerExpr(node.expression.expression),
-        method: node.expression.name.text,
-        args: node.arguments.map(lowerExpr),
-      };
-    }
-    if (!ts.isIdentifier(node.expression)) {
-      throw new Error(
-        "Only direct calls to named functions are supported (v1)",
-      );
-    }
-    return {
-      kind: "call",
-      callee: node.expression.text,
-      args: node.arguments.map(lowerExpr),
-    };
-  }
+  if (ts.isCallExpression(node)) return lowerCall(node);
   // Prefix `!e`, `-e`, `+e`. (`++`/`--` are handled as assignments, not here.)
   if (ts.isPrefixUnaryExpression(node)) {
     if (node.operator === ts.SyntaxKind.ExclamationToken) {
@@ -1007,6 +973,79 @@ function lowerExpr(node: ts.Expression): Expr {
     };
   }
   throw new Error(`Unsupported expression: ${ts.SyntaxKind[node.kind]}`);
+}
+
+// `new C(args)` — also intercepts the `new Map`/`new Set` builtins (reference
+// containers, not class instances) and rejects `new Promise(executor)` (closures).
+function lowerNew(node: ts.NewExpression): Expr {
+  if (!ts.isIdentifier(node.expression)) {
+    throw new Error("'new' requires a class name (v1)");
+  }
+  const ctor = node.expression.text;
+  if (ctor === "Map") return lowerNewMap(node);
+  if (ctor === "Set") return lowerNewSet(node);
+  // `new Promise(executor)` needs a first-class function (the executor) and
+  // capture machinery — out of subset. Async functions / Promise.resolve cover
+  // the common cases without it.
+  if (ctor === "Promise") {
+    throw new Error(
+      "new Promise(executor) is not supported (v1) — it needs first-class function values (closures); use an async function or Promise.resolve",
+    );
+  }
+  return {
+    kind: "new",
+    className: ctor,
+    args: node.arguments ? node.arguments.map(lowerExpr) : [],
+  };
+}
+
+// `e as T` — supported as the type carrier for `JSON.parse(text) as T` and
+// `await res.json() as T` (both produce an `any`, so the assertion supplies the
+// value's static type). A general type assertion has no representation in the
+// typed subset.
+function lowerAsExpr(node: ts.AsExpression): Expr {
+  const inner = skipParens(node.expression);
+  if (isJsonParseCall(inner)) {
+    return jsonParseNode(inner, lowerType(node.type));
+  }
+  const jsonCall = responseJsonCall(node.expression);
+  if (jsonCall) {
+    return responseJsonAwaitNode(jsonCall, lowerType(node.type));
+  }
+  throw new Error(
+    "Type assertions ('as T') are only supported on JSON.parse(...) and `await res.json()` (v1)",
+  );
+}
+
+// A call expression. The namespaced/global builtins (`JSON.*`, `Math.*`,
+// `Promise.*`, `fetch`) are intercepted before the generic `recv.method(args)`
+// method-call and `f(args)` named-call paths.
+function lowerCall(node: ts.CallExpression): Expr {
+  const json = tryLowerJsonCall(node);
+  if (json) return json;
+  const math = tryLowerMathCall(node);
+  if (math) return math;
+  const promise = tryLowerPromiseCall(node);
+  if (promise) return promise;
+  const fetched = tryLowerFetchCall(node);
+  if (fetched) return fetched;
+  // `recv.method(args)` -> methodCall (e.g. xs.push(v)).
+  if (ts.isPropertyAccessExpression(node.expression)) {
+    return {
+      kind: "methodCall",
+      receiver: lowerExpr(node.expression.expression),
+      method: node.expression.name.text,
+      args: node.arguments.map(lowerExpr),
+    };
+  }
+  if (!ts.isIdentifier(node.expression)) {
+    throw new Error("Only direct calls to named functions are supported (v1)");
+  }
+  return {
+    kind: "call",
+    callee: node.expression.text,
+    args: node.arguments.map(lowerExpr),
+  };
 }
 
 function lowerBinaryOp(kind: ts.SyntaxKind): BinaryOp {

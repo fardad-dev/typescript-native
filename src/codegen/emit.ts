@@ -111,6 +111,12 @@ function isAggregate(t: Type): boolean {
   return isArray(t) || isObject(t);
 }
 
+// Lexicographic 3-way string comparison (by code unit) for `Array.sort`
+// comparators — `<`/`>`, not `localeCompare`, so the ordering is byte-stable.
+function byteCompare(a: string, b: string): number {
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
 function displayType(t: RetType): string {
   if (t === "void") return "void";
   if (isClass(t)) return t.name;
@@ -424,11 +430,10 @@ class Emitter {
   // order rename-stable, so `number | string` and `string | number` emit the same
   // `tsn_union<double, tsn_str>`.
   private unionMemberCpps(t: UnionType): string[] {
-    const rank = (m: Type) =>
-      m === "undefined" ? 0 : m === "null" ? 1 : 2;
+    const rank = (m: Type) => (m === "undefined" ? 0 : m === "null" ? 1 : 2);
     return t.members
       .map((m) => ({ m, cpp: this.cppType(m) }))
-      .sort((a, b) => rank(a.m) - rank(b.m) || (a.cpp < b.cpp ? -1 : a.cpp > b.cpp ? 1 : 0))
+      .sort((a, b) => rank(a.m) - rank(b.m) || byteCompare(a.cpp, b.cpp))
       .map((x) => x.cpp);
   }
 
@@ -608,8 +613,7 @@ class Emitter {
   private jsonStringifyFwdDecls(): string[] {
     const names = [...this.structFields.keys(), ...this.classes.keys()];
     return names.map(
-      (n) =>
-        `static std::string tsn_json_stringify(const tsn_rc<${n}>& v);`,
+      (n) => `static std::string tsn_json_stringify(const tsn_rc<${n}>& v);`,
     );
   }
 
@@ -1011,9 +1015,7 @@ class Emitter {
       }
       this.globals.set(stmt.name, stmt.type);
       this.globalDecls.push(`${this.cppType(stmt.type)} ${stmt.name};`);
-      this.push(
-        `${stmt.name} = tsn_make_rc<${this.vecType(stmt.type)}>();`,
-      );
+      this.push(`${stmt.name} = tsn_make_rc<${this.vecType(stmt.type)}>();`);
       return;
     }
     const init = this.emitExpr(stmt.init);
@@ -1043,16 +1045,26 @@ class Emitter {
     this.body.push(this.indent + line);
   }
 
+  // Run `fn` with the emission indent one level deeper, restoring it after.
+  // Block emitters use this to indent the body between their `{` and `}` pushes
+  // (no try/finally: any error aborts the whole emit, so there's nothing to
+  // unwind to). emitBlock layers narrowing-state snapshotting on top.
+  private withIndent(fn: () => void): void {
+    const saved = this.indent;
+    this.indent += "  ";
+    fn();
+    this.indent = saved;
+  }
+
   // Emit a nested `{ ... }` block of statements at one deeper indent level.
   private emitBlock(stmts: Stmt[]): void {
-    const saved = this.indent;
     // Snapshot the narrowing state: an early-return guard inside this block may
     // narrow the fallthrough (see the `if` emitter), and that must not leak past
     // the block's end. (Cheap — the map holds at most a handful of entries.)
     const savedNarrowed = new Map(this.narrowed);
-    this.indent += "  ";
-    for (const s of stmts) this.emitStmt(s);
-    this.indent = saved;
+    this.withIndent(() => {
+      for (const s of stmts) this.emitStmt(s);
+    });
     this.narrowed = savedNarrowed;
   }
 
@@ -1062,7 +1074,9 @@ class Emitter {
   // return; …` narrows `s` to non-null for the statements after the `if`.
   private alwaysExits(stmts: Stmt[]): boolean {
     const last = stmts[stmts.length - 1];
-    return last !== undefined && (last.kind === "return" || last.kind === "throw");
+    return (
+      last !== undefined && (last.kind === "return" || last.kind === "throw")
+    );
   }
 
   // Emit a condition expression; it must be usable as a C++ condition.
@@ -1136,7 +1150,11 @@ class Emitter {
         // Intersect: keep members in both positives (compare against each side).
         const keep = (m: Type) =>
           this.typeInNarrow(m, l.positive) && this.typeInNarrow(m, r.positive);
-        return { name: l.name, positive: this.filterUnion(u, keep), negative: u };
+        return {
+          name: l.name,
+          positive: this.filterUnion(u, keep),
+          negative: u,
+        };
       }
       return l ?? r;
     }
@@ -1145,14 +1163,17 @@ class Emitter {
     }
     // Bare truthiness `x` → then-branch drops null/undefined.
     const tv = this.truthyGuard(cond);
-    if (tv) return { name: tv.name, positive: tv.truthy, negative: tv.declared };
+    if (tv)
+      return { name: tv.name, positive: tv.truthy, negative: tv.declared };
     return undefined;
   }
 
   // Whether member `m` is within the narrowed type `n` (a member is in a union if
   // it's one of its members; otherwise types must match).
   private typeInNarrow(m: Type, n: Type): boolean {
-    return isUnion(n) ? n.members.some((nm) => sameType(nm, m)) : sameType(n, m);
+    return isUnion(n)
+      ? n.members.some((nm) => sameType(nm, m))
+      : sameType(n, m);
   }
 
   // A bare-variable truthiness guard: `{ name, declared union, truthy }` where
@@ -1163,7 +1184,10 @@ class Emitter {
     if (e.kind !== "var") return undefined;
     const u = this.declaredUnion(e.name);
     if (!u) return undefined;
-    const truthy = this.filterUnion(u, (m) => m !== "null" && m !== "undefined");
+    const truthy = this.filterUnion(
+      u,
+      (m) => m !== "null" && m !== "undefined",
+    );
     return { name: e.name, declared: u, truthy };
   }
 
@@ -1188,13 +1212,16 @@ class Emitter {
       return flip({ name: tof, positive, negative });
     }
     // x === null / x === undefined
-    const v = left.kind === "var" ? left.name : right.kind === "var" ? right.name : undefined;
-    const litType =
-      left.kind === "null" || right.kind === "null"
-        ? "null"
-        : left.kind === "undefined" || right.kind === "undefined"
-          ? "undefined"
+    const v =
+      left.kind === "var"
+        ? left.name
+        : right.kind === "var"
+          ? right.name
           : undefined;
+    let litType: Type | undefined;
+    if (left.kind === "null" || right.kind === "null") litType = "null";
+    else if (left.kind === "undefined" || right.kind === "undefined")
+      litType = "undefined";
     if (v !== undefined && litType !== undefined) {
       const u = this.declaredUnion(v);
       if (!u) return undefined;
@@ -1270,11 +1297,10 @@ class Emitter {
   // Used where `continue` must `goto` (a labeled loop); for a plain loop the body
   // goes through emitBlock instead.
   private emitLoopBodyWithContinue(body: Stmt[], ctx: BreakCtx): void {
-    const saved = this.indent;
-    this.indent += "  ";
-    for (const s of body) this.emitStmt(s);
-    this.push(`${ctx.continueLabel}: ;`);
-    this.indent = saved;
+    this.withIndent(() => {
+      for (const s of body) this.emitStmt(s);
+      this.push(`${ctx.continueLabel}: ;`);
+    });
   }
 
   // Resolve the target of a `break`: the matching labeled loop, or (unlabeled) the
@@ -1611,12 +1637,11 @@ class Emitter {
           // Goto-form: the update moves into the body after the continue label, so
           // `continue` (a goto) still runs it before re-testing the condition.
           this.push(`for (${init}; ${cond}; ) {`);
-          const saved = this.indent;
-          this.indent += "  ";
-          for (const s of stmt.body) this.emitStmt(s);
-          this.push(`${ctx.continueLabel}: ;`);
-          if (update) this.push(`${update};`);
-          this.indent = saved;
+          this.withIndent(() => {
+            for (const s of stmt.body) this.emitStmt(s);
+            this.push(`${ctx.continueLabel}: ;`);
+            if (update) this.push(`${update};`);
+          });
           this.push(`}`);
         } else {
           this.push(`for (${init}; ${cond}; ${update}) {`);
@@ -1712,17 +1737,16 @@ class Emitter {
     this.push(`auto ${it} = ${iter.code};`);
     const incr = ctx.goto ? "" : `${i}++`;
     this.push(`for (std::size_t ${i} = 0; ${i} < ${sizeExpr}; ${incr}) {`);
-    const saved = this.indent;
-    this.indent += "  ";
-    this.push(`${elemCpp} ${stmt.name} = ${elemCode};`);
-    this.vars.set(stmt.name, elemType);
-    for (const s of stmt.body) this.emitStmt(s);
-    if (ctx.goto) {
-      this.push(`${ctx.continueLabel}: ;`);
-      this.push(`${i}++;`);
-    }
-    this.vars.delete(stmt.name);
-    this.indent = saved;
+    this.withIndent(() => {
+      this.push(`${elemCpp} ${stmt.name} = ${elemCode};`);
+      this.vars.set(stmt.name, elemType);
+      for (const s of stmt.body) this.emitStmt(s);
+      if (ctx.goto) {
+        this.push(`${ctx.continueLabel}: ;`);
+        this.push(`${i}++;`);
+      }
+      this.vars.delete(stmt.name);
+    });
     this.push(`}`);
     this.exitLoop(ctx);
   }
@@ -1739,7 +1763,6 @@ class Emitter {
     // we only need the statically-known field names).
     this.push(`auto ${t} = ${tgt.code};`);
     const fields = this.forInKeys(tgt.type);
-    const saved = this.indent;
     let keyCode: string;
     let sizeExpr: string;
     if (fields === null) {
@@ -1758,16 +1781,16 @@ class Emitter {
     }
     const incr = ctx.goto ? "" : `${i}++`;
     this.push(`for (std::size_t ${i} = 0; ${i} < ${sizeExpr}; ${incr}) {`);
-    this.indent += "  ";
-    this.push(`tsn_str ${stmt.name} = ${keyCode};`);
-    this.vars.set(stmt.name, "string");
-    for (const s of stmt.body) this.emitStmt(s);
-    if (ctx.goto) {
-      this.push(`${ctx.continueLabel}: ;`);
-      this.push(`${i}++;`);
-    }
-    this.vars.delete(stmt.name);
-    this.indent = saved;
+    this.withIndent(() => {
+      this.push(`tsn_str ${stmt.name} = ${keyCode};`);
+      this.vars.set(stmt.name, "string");
+      for (const s of stmt.body) this.emitStmt(s);
+      if (ctx.goto) {
+        this.push(`${ctx.continueLabel}: ;`);
+        this.push(`${i}++;`);
+      }
+      this.vars.delete(stmt.name);
+    });
     this.push(`}`);
     this.exitLoop(ctx);
   }
@@ -1799,36 +1822,39 @@ class Emitter {
     const endLabel = `_tsn_swend${id}`;
     const caseLabel = (i: number) => `_tsn_sw${id}_c${i}`;
     const defaultIdx = stmt.cases.findIndex((c) => c.test === undefined);
-    const saved = this.indent;
     this.push(`{`);
-    this.indent += "  ";
-    this.push(`auto ${sw} = ${disc.code};`);
-    // Dispatch: first matching `case` wins; later tests aren't evaluated (the goto
-    // jumps away), matching JS's evaluate-in-order-until-match.
-    stmt.cases.forEach((c, idx) => {
-      if (c.test === undefined) return;
-      const t = this.emitExpr(c.test);
-      if (!sameType(t.type, disc.type)) {
-        throw new Error(
-          `switch case type '${displayType(t.type)}' is not comparable to discriminant type '${displayType(disc.type)}'`,
-        );
-      }
-      this.push(`if ((${sw} == ${t.code})) goto ${caseLabel(idx)};`);
+    this.withIndent(() => {
+      this.push(`auto ${sw} = ${disc.code};`);
+      // Dispatch: first matching `case` wins; later tests aren't evaluated (the
+      // goto jumps away), matching JS's evaluate-in-order-until-match.
+      stmt.cases.forEach((c, idx) => {
+        if (c.test === undefined) return;
+        const t = this.emitExpr(c.test);
+        if (!sameType(t.type, disc.type)) {
+          throw new Error(
+            `switch case type '${displayType(t.type)}' is not comparable to discriminant type '${displayType(disc.type)}'`,
+          );
+        }
+        this.push(`if ((${sw} == ${t.code})) goto ${caseLabel(idx)};`);
+      });
+      this.push(`goto ${defaultIdx >= 0 ? caseLabel(defaultIdx) : endLabel};`);
+      // Clause bodies. `break` inside resolves to this switch (goto past the end).
+      const ctx: BreakCtx = {
+        kind: "switch",
+        goto: true,
+        breakLabel: endLabel,
+      };
+      this.breakStack.push(ctx);
+      stmt.cases.forEach((c, idx) => {
+        this.push(`${caseLabel(idx)}: {`);
+        this.withIndent(() => {
+          for (const s of c.body) this.emitStmt(s);
+        });
+        this.push(`}`);
+      });
+      this.breakStack.pop();
+      this.push(`${endLabel}: ;`);
     });
-    this.push(`goto ${defaultIdx >= 0 ? caseLabel(defaultIdx) : endLabel};`);
-    // Clause bodies. `break` inside resolves to this switch (goto past the end).
-    const ctx: BreakCtx = { kind: "switch", goto: true, breakLabel: endLabel };
-    this.breakStack.push(ctx);
-    stmt.cases.forEach((c, idx) => {
-      this.push(`${caseLabel(idx)}: {`);
-      this.indent += "  ";
-      for (const s of c.body) this.emitStmt(s);
-      this.indent = saved + "  ";
-      this.push(`}`);
-    });
-    this.breakStack.pop();
-    this.push(`${endLabel}: ;`);
-    this.indent = saved;
     this.push(`}`);
   }
 
@@ -1844,37 +1870,40 @@ class Emitter {
   }): void {
     const hasFinally = stmt.finallyBody !== undefined;
     const hasCatch = stmt.catchBody !== undefined;
-    const saved = this.indent;
+    // The finally guard (if any) and the try/catch body sit at the same indent;
+    // a finally wraps them in an extra `{ … }` (and its own deeper level).
+    const emitTryCore = () => {
+      if (hasFinally) {
+        this.assertFinallySafe(stmt.finallyBody!);
+        const id = this.ctrlUid++;
+        this.push(`auto _tsn_fin${id} = tsn_make_finally([&]() {`);
+        this.withIndent(() => {
+          for (const s of stmt.finallyBody!) this.emitStmt(s);
+        });
+        this.push(`});`);
+      }
+      if (hasCatch) {
+        this.push(`try {`);
+        this.emitBlock(stmt.block);
+        const cname = stmt.catchName ?? `_tsn_ex${this.ctrlUid++}`;
+        this.push(`} catch (const tsn_str& ${cname}) {`);
+        if (stmt.catchName) this.vars.set(stmt.catchName, "string");
+        this.emitBlock(stmt.catchBody!);
+        if (stmt.catchName) this.vars.delete(stmt.catchName);
+        this.push(`}`);
+      } else {
+        // finally-only: the RAII guard already covers exceptions/returns.
+        this.push(`{`);
+        this.emitBlock(stmt.block);
+        this.push(`}`);
+      }
+    };
     if (hasFinally) {
-      this.assertFinallySafe(stmt.finallyBody!);
-      const id = this.ctrlUid++;
       this.push(`{`);
-      this.indent += "  ";
-      this.push(`auto _tsn_fin${id} = tsn_make_finally([&]() {`);
-      const inner = this.indent;
-      this.indent += "  ";
-      for (const s of stmt.finallyBody!) this.emitStmt(s);
-      this.indent = inner;
-      this.push(`});`);
-    }
-    if (hasCatch) {
-      this.push(`try {`);
-      this.emitBlock(stmt.block);
-      const cname = stmt.catchName ?? `_tsn_ex${this.ctrlUid++}`;
-      this.push(`} catch (const tsn_str& ${cname}) {`);
-      if (stmt.catchName) this.vars.set(stmt.catchName, "string");
-      this.emitBlock(stmt.catchBody!);
-      if (stmt.catchName) this.vars.delete(stmt.catchName);
+      this.withIndent(emitTryCore);
       this.push(`}`);
     } else {
-      // finally-only: the RAII guard already covers exceptions/returns.
-      this.push(`{`);
-      this.emitBlock(stmt.block);
-      this.push(`}`);
-    }
-    if (hasFinally) {
-      this.indent = saved;
-      this.push(`}`);
+      emitTryCore();
     }
   }
 
@@ -2396,12 +2425,7 @@ class Emitter {
     // <cmath> overload (and integer literals don't pick an integral overload).
     const ds = vals.map((v) => `static_cast<double>(${v.code})`);
     const num = (code: string): Value => ({ code, type: "number", rep: "f64" });
-    const arity = (n: number) => {
-      if (vals.length !== n)
-        throw new Error(
-          `'Math.${fn}' expects ${n} argument(s), got ${vals.length}`,
-        );
-    };
+    const arity = (n: number) => this.checkArity(`Math.${fn}`, vals.length, n);
 
     const std = Emitter.MATH_UNARY_STD[fn];
     if (std) {
@@ -2563,6 +2587,44 @@ class Emitter {
     return isUnion(p) && p.members.some((m) => m === "undefined");
   }
 
+  // Validate an argument count against [min, max] (max defaults to min for an
+  // exact count; pass Infinity for "at least min"), throwing a clear error that
+  // names `label` (a method/function name) on mismatch. Centralizes the arity
+  // checks the string/array/map/set/math method emitters all need.
+  private checkArity(
+    label: string,
+    count: number,
+    min: number,
+    max = min,
+  ): void {
+    if (count >= min && count <= max) return;
+    const plural = (k: number) => `${k} argument${k === 1 ? "" : "s"}`;
+    const want =
+      max === Infinity
+        ? `at least ${plural(min)}`
+        : min === max
+          ? plural(min)
+          : `${min}-${max} arguments`;
+    throw new Error(`'${label}' expects ${want}, got ${count}`);
+  }
+
+  // Emit an optional numeric argument at index `i`: returns its C++ code, or the
+  // "NAN" sentinel the tsn_* helpers read as "absent" when the arg isn't present.
+  // Throws (naming `label`/`what`) if present but not a number.
+  private optionalNumberArg(
+    args: Expr[],
+    i: number,
+    label: string,
+    what = "argument",
+  ): string {
+    if (i >= args.length) return "NAN";
+    const v = this.emitExpr(args[i]);
+    if (v.type !== "number") {
+      throw new Error(`'${label}' ${what} must be a number`);
+    }
+    return v.code;
+  }
+
   // Type-check a call/ctor argument list against parameter types and return each
   // argument's C++ code. Reps are reconciled by repr.ts (a float arg demotes the
   // matching param slot), so no per-argument cast is needed here. A trailing
@@ -2589,7 +2651,12 @@ class Emitter {
     });
     // Omitted trailing optionals default to `undefined` (coerced into the union).
     for (let i = args.length; i < params.length; i++) {
-      out.push(this.coerceTo({ code: "tsn_undefined{}", type: "undefined" }, params[i]));
+      out.push(
+        this.coerceTo(
+          { code: "tsn_undefined{}", type: "undefined" },
+          params[i],
+        ),
+      );
     }
     return out;
   }
@@ -2738,7 +2805,10 @@ class Emitter {
           `Cannot compare '${displayType(l.type)}' and '${displayType(r.type)}' with '${op}' — different unions (v1)`,
         );
       }
-      return { code: neg(`((${l.code}).v() == (${r.code}).v())`), type: "boolean" };
+      return {
+        code: neg(`((${l.code}).v() == (${r.code}).v())`),
+        type: "boolean",
+      };
     }
     const [u, m] = isUnion(l.type) ? [l, r] : [r, l];
     const ut = u.type as UnionType;
@@ -2786,251 +2856,183 @@ class Emitter {
     if (recv.type === "string") {
       return this.emitStringMethod(recv, e);
     }
-    if (isArray(recv.type)) {
-      const elem = recv.type.element;
-      // The array is a shared_ptr; the tsn_* helpers take the vector, so the
-      // receiver is dereferenced (`*ptr`) at each call site.
-      const vecRecv = `*(${recv.code})`;
-      switch (e.method) {
-        case "push": {
-          if (e.args.length !== 1) {
-            throw new Error(`'push' expects 1 argument, got ${e.args.length}`);
-          }
-          const arg = this.emitExpr(e.args[0]);
-          if (!sameType(arg.type, elem)) {
-            throw new Error(
-              `Cannot push '${displayType(arg.type)}' onto '${displayType(recv.type)}'`,
-            );
-          }
-          // Mutating through the shared vector is visible to every alias (JS).
-          // Returns the new length (a number); usable as a value or a statement.
-          return { code: `tsn_push(${vecRecv}, ${arg.code})`, type: "number" };
-        }
-        case "pop": {
-          if (e.args.length !== 0) {
-            throw new Error(`'pop' expects 0 arguments, got ${e.args.length}`);
-          }
-          // Returns the removed last element (the array's element type).
-          return { code: `tsn_pop(${vecRecv})`, type: elem };
-        }
-        case "slice": {
-          // `slice(start?, end?)` — both optional numbers; an omitted one is NaN
-          // ("default") in the helper. Returns a *new* array (a fresh shared_ptr).
-          if (e.args.length > 2) {
-            throw new Error(
-              `'slice' expects 0-2 argument(s), got ${e.args.length}`,
-            );
-          }
-          const nums = e.args.map((a) => this.emitExpr(a));
-          for (const n of nums) {
-            if (n.type !== "number") {
-              throw new Error("'slice' arguments must be numbers");
-            }
-          }
-          const start = nums[0]?.code ?? "NAN";
-          const end = nums[1]?.code ?? "NAN";
-          const vec = this.vecType(recv.type);
-          return {
-            code: `tsn_make_rc<${vec}>(tsn_array_slice(${vecRecv}, ${start}, ${end}))`,
-            type: recv.type,
-          };
-        }
-        case "indexOf": {
-          // `indexOf(searchElement, fromIndex?)` -> number (-1 if absent). Needs
-          // element equality, so aggregate (object/array) elements are rejected.
-          if (e.args.length < 1 || e.args.length > 2) {
-            throw new Error(
-              `'indexOf' expects 1-2 argument(s), got ${e.args.length}`,
-            );
-          }
-          if (isAggregate(elem)) {
-            throw new Error(
-              `'indexOf' is not supported on '${displayType(recv.type)}' (elements have no equality)`,
-            );
-          }
-          const search = this.emitExpr(e.args[0]);
-          if (!sameType(search.type, elem)) {
-            throw new Error(
-              `'indexOf' search type '${displayType(search.type)}' does not match element type '${displayType(elem)}'`,
-            );
-          }
-          let from = "NAN";
-          if (e.args.length === 2) {
-            const f = this.emitExpr(e.args[1]);
-            if (f.type !== "number") {
-              throw new Error("'indexOf' fromIndex must be a number");
-            }
-            from = f.code;
-          }
-          // f64SlotCode casts an i64-literal search value to the element's double
-          // rep (a no-op for string/boolean/class), so the template deduces one T.
-          return {
-            code: `tsn_array_index_of(${vecRecv}, ${this.f64SlotCode(search)}, ${from})`,
-            type: "number",
-          };
-        }
-        case "join": {
-          if (e.args.length > 1) {
-            throw new Error(
-              `'join' expects 0-1 argument(s), got ${e.args.length}`,
-            );
-          }
-          if (elem !== "string" && elem !== "number") {
-            throw new Error(
-              `'join' is only supported on string[] or number[], not '${displayType(recv.type)}'`,
-            );
-          }
-          // Separator defaults to "," (JS); a provided one must be a string.
-          let sep = `","`;
-          if (e.args.length === 1) {
-            const arg = this.emitExpr(e.args[0]);
-            if (arg.type !== "string") {
-              throw new Error("'join' separator must be a string");
-            }
-            sep = arg.code;
-          }
-          return { code: `tsn_join(${vecRecv}, ${sep})`, type: "string" };
-        }
-        case "includes":
-        case "lastIndexOf": {
-          // Membership / last-position via element `==` (so aggregate elements,
-          // which have no equality, are rejected — class elements use identity).
-          if (e.args.length < 1 || e.args.length > 2) {
-            throw new Error(
-              `'${e.method}' expects 1-2 argument(s), got ${e.args.length}`,
-            );
-          }
-          if (isAggregate(elem)) {
-            throw new Error(
-              `'${e.method}' is not supported on '${displayType(recv.type)}' (elements have no equality)`,
-            );
-          }
-          const search = this.emitExpr(e.args[0]);
-          if (!sameType(search.type, elem)) {
-            throw new Error(
-              `'${e.method}' search type '${displayType(search.type)}' does not match element type '${displayType(elem)}'`,
-            );
-          }
-          let from = "NAN";
-          if (e.args.length === 2) {
-            const f = this.emitExpr(e.args[1]);
-            if (f.type !== "number") {
-              throw new Error(`'${e.method}' fromIndex must be a number`);
-            }
-            from = f.code;
-          }
-          const helper =
-            e.method === "includes"
-              ? "tsn_array_includes"
-              : "tsn_array_last_index_of";
-          return {
-            code: `${helper}(${vecRecv}, ${this.f64SlotCode(search)}, ${from})`,
-            type: e.method === "includes" ? "boolean" : "number",
-          };
-        }
-        case "reverse": {
-          if (e.args.length !== 0) {
-            throw new Error(
-              `'reverse' expects 0 arguments, got ${e.args.length}`,
-            );
-          }
-          // Mutates in place and returns the SAME array reference (chainable /
-          // usable as a value). The IIFE takes the receiver by value (a refcount
-          // bump) so the receiver expression is evaluated exactly once.
-          return {
-            code: `([](auto _tsn_r){ tsn_array_reverse(*_tsn_r); return _tsn_r; }(${recv.code}))`,
-            type: recv.type,
-          };
-        }
-        case "fill": {
-          if (e.args.length < 1 || e.args.length > 3) {
-            throw new Error(
-              `'fill' expects 1-3 argument(s), got ${e.args.length}`,
-            );
-          }
-          const val = this.emitExpr(e.args[0]);
-          if (!sameType(val.type, elem)) {
-            throw new Error(
-              `Cannot fill '${displayType(recv.type)}' with '${displayType(val.type)}'`,
-            );
-          }
-          const nums = e.args.slice(1).map((a) => this.emitExpr(a));
-          for (const n of nums) {
-            if (n.type !== "number") {
-              throw new Error("'fill' start/end must be numbers");
-            }
-          }
-          // start/end are lowered into a C++ lambda body (see below), where a
-          // co_await can't appear — reject an awaited index argument cleanly.
-          if (e.args.slice(1).some(containsAwait)) {
-            throw new Error(
-              "'await' inside Array.fill's start/end is not supported (v1) — assign it to a variable first",
-            );
-          }
-          const start = nums[0]?.code ?? "NAN";
-          const end = nums[1]?.code ?? "NAN";
-          // `[&]` captures any locals referenced by start/end; the receiver and
-          // value pass as by-value args (evaluated once). Returns the array.
-          return {
-            code: `([&](auto _tsn_r, auto _tsn_x){ tsn_array_fill(*_tsn_r, _tsn_x, ${start}, ${end}); return _tsn_r; }(${recv.code}, ${this.f64SlotCode(val)}))`,
-            type: recv.type,
-          };
-        }
-        case "shift": {
-          if (e.args.length !== 0) {
-            throw new Error(
-              `'shift' expects 0 arguments, got ${e.args.length}`,
-            );
-          }
-          // Removes and returns the first element (empty -> element default).
-          return { code: `tsn_array_shift(${vecRecv})`, type: elem };
-        }
-        case "unshift": {
-          if (e.args.length < 1) {
-            throw new Error("'unshift' expects at least 1 argument");
-          }
-          const items = e.args.map((a) => {
-            const v = this.emitExpr(a);
-            if (!sameType(v.type, elem)) {
-              throw new Error(
-                `Cannot unshift '${displayType(v.type)}' onto '${displayType(recv.type)}'`,
-              );
-            }
-            return this.f64SlotCode(v);
-          });
-          // Pass the prepended items as a vector so 0..n args work; returns length.
-          const vec = this.vecType(recv.type);
-          return {
-            code: `tsn_array_unshift(${vecRecv}, ${vec}{${items.join(", ")}})`,
-            type: "number",
-          };
-        }
-        case "concat": {
-          // Array operands only (element-value args aren't supported); each must
-          // share the receiver's type. 0 args -> a fresh shallow copy (new identity).
-          let acc = vecRecv;
-          for (const a of e.args) {
-            const arg = this.emitExpr(a);
-            if (!sameType(arg.type, recv.type)) {
-              throw new Error(
-                `'concat' expects '${displayType(recv.type)}' argument(s), got '${displayType(arg.type)}'`,
-              );
-            }
-            acc = `tsn_array_concat(${acc}, *(${arg.code}))`;
-          }
-          const vec = this.vecType(recv.type);
-          return { code: `tsn_make_rc<${vec}>(${acc})`, type: recv.type };
-        }
-        default:
-          throw new Error(`Unsupported array method '${e.method}'`);
-      }
-    }
+    if (isArray(recv.type)) return this.emitArrayMethod(recv, e);
     if (isMap(recv.type)) return this.emitMapMethod(recv, e, asStatement);
     if (isSet(recv.type)) return this.emitSetMethod(recv, e, asStatement);
     if (isResponse(recv.type)) return this.emitResponseMethod(recv, e);
     throw new Error(
       `Type '${displayType(recv.type)}' has no method '${e.method}'`,
     );
+  }
+
+  // Emit an array method call (push/pop/slice/indexOf/join/includes/reverse/…).
+  // The array is a tsn_rc; the tsn_* helpers take the underlying vector, so the
+  // receiver is dereferenced (`*ptr`) at each call site. Mutating methods are
+  // visible through every alias (JS reference semantics); slice/concat/reverse
+  // return a *new* array (a fresh tsn_rc) or the same reference, per JS.
+  private emitArrayMethod(
+    recv: Value,
+    e: { method: string; args: Expr[] },
+  ): { code: string; type: RetType } {
+    const arrType = recv.type as ArrayType;
+    const elem = arrType.element;
+    const vecRecv = `*(${recv.code})`;
+    switch (e.method) {
+      case "push": {
+        this.checkArity("push", e.args.length, 1);
+        const arg = this.emitExpr(e.args[0]);
+        if (!sameType(arg.type, elem)) {
+          throw new Error(
+            `Cannot push '${displayType(arg.type)}' onto '${displayType(recv.type)}'`,
+          );
+        }
+        // Mutating through the shared vector is visible to every alias (JS).
+        // Returns the new length (a number); usable as a value or a statement.
+        return { code: `tsn_push(${vecRecv}, ${arg.code})`, type: "number" };
+      }
+      case "pop": {
+        this.checkArity("pop", e.args.length, 0);
+        // Returns the removed last element (the array's element type).
+        return { code: `tsn_pop(${vecRecv})`, type: elem };
+      }
+      case "slice": {
+        // `slice(start?, end?)` — both optional numbers; an omitted one is NaN
+        // ("default") in the helper. Returns a *new* array (a fresh tsn_rc).
+        this.checkArity("slice", e.args.length, 0, 2);
+        const start = this.optionalNumberArg(e.args, 0, "slice");
+        const end = this.optionalNumberArg(e.args, 1, "slice");
+        const vec = this.vecType(arrType);
+        return {
+          code: `tsn_make_rc<${vec}>(tsn_array_slice(${vecRecv}, ${start}, ${end}))`,
+          type: recv.type,
+        };
+      }
+      case "indexOf":
+      case "includes":
+      case "lastIndexOf": {
+        // Position / membership via element `==` (so aggregate elements, which
+        // have no equality, are rejected — class elements compare by identity).
+        // `indexOf(search, fromIndex?)` / `includes` / `lastIndexOf`.
+        this.checkArity(e.method, e.args.length, 1, 2);
+        if (isAggregate(elem)) {
+          throw new Error(
+            `'${e.method}' is not supported on '${displayType(recv.type)}' (elements have no equality)`,
+          );
+        }
+        const search = this.emitExpr(e.args[0]);
+        if (!sameType(search.type, elem)) {
+          throw new Error(
+            `'${e.method}' search type '${displayType(search.type)}' does not match element type '${displayType(elem)}'`,
+          );
+        }
+        const from = this.optionalNumberArg(e.args, 1, e.method, "fromIndex");
+        // f64SlotCode casts an i64-literal search value to the element's double
+        // rep (a no-op for string/boolean/class), so the template deduces one T.
+        const helper =
+          e.method === "indexOf"
+            ? "tsn_array_index_of"
+            : e.method === "includes"
+              ? "tsn_array_includes"
+              : "tsn_array_last_index_of";
+        return {
+          code: `${helper}(${vecRecv}, ${this.f64SlotCode(search)}, ${from})`,
+          type: e.method === "includes" ? "boolean" : "number",
+        };
+      }
+      case "join": {
+        this.checkArity("join", e.args.length, 0, 1);
+        if (elem !== "string" && elem !== "number") {
+          throw new Error(
+            `'join' is only supported on string[] or number[], not '${displayType(recv.type)}'`,
+          );
+        }
+        // Separator defaults to "," (JS); a provided one must be a string.
+        let sep = `","`;
+        if (e.args.length === 1) {
+          const arg = this.emitExpr(e.args[0]);
+          if (arg.type !== "string") {
+            throw new Error("'join' separator must be a string");
+          }
+          sep = arg.code;
+        }
+        return { code: `tsn_join(${vecRecv}, ${sep})`, type: "string" };
+      }
+      case "reverse": {
+        this.checkArity("reverse", e.args.length, 0);
+        // Mutates in place and returns the SAME array reference (chainable /
+        // usable as a value). The IIFE takes the receiver by value (a refcount
+        // bump) so the receiver expression is evaluated exactly once.
+        return {
+          code: `([](auto _tsn_r){ tsn_array_reverse(*_tsn_r); return _tsn_r; }(${recv.code}))`,
+          type: recv.type,
+        };
+      }
+      case "fill": {
+        this.checkArity("fill", e.args.length, 1, 3);
+        const val = this.emitExpr(e.args[0]);
+        if (!sameType(val.type, elem)) {
+          throw new Error(
+            `Cannot fill '${displayType(recv.type)}' with '${displayType(val.type)}'`,
+          );
+        }
+        // start/end are lowered into a C++ lambda body (see below), where a
+        // co_await can't appear — reject an awaited index argument cleanly.
+        if (e.args.slice(1).some(containsAwait)) {
+          throw new Error(
+            "'await' inside Array.fill's start/end is not supported (v1) — assign it to a variable first",
+          );
+        }
+        const start = this.optionalNumberArg(e.args, 1, "fill", "start/end");
+        const end = this.optionalNumberArg(e.args, 2, "fill", "start/end");
+        // `[&]` captures any locals referenced by start/end; the receiver and
+        // value pass as by-value args (evaluated once). Returns the array.
+        return {
+          code: `([&](auto _tsn_r, auto _tsn_x){ tsn_array_fill(*_tsn_r, _tsn_x, ${start}, ${end}); return _tsn_r; }(${recv.code}, ${this.f64SlotCode(val)}))`,
+          type: recv.type,
+        };
+      }
+      case "shift": {
+        this.checkArity("shift", e.args.length, 0);
+        // Removes and returns the first element (empty -> element default).
+        return { code: `tsn_array_shift(${vecRecv})`, type: elem };
+      }
+      case "unshift": {
+        this.checkArity("unshift", e.args.length, 1, Infinity);
+        const items = e.args.map((a) => {
+          const v = this.emitExpr(a);
+          if (!sameType(v.type, elem)) {
+            throw new Error(
+              `Cannot unshift '${displayType(v.type)}' onto '${displayType(recv.type)}'`,
+            );
+          }
+          return this.f64SlotCode(v);
+        });
+        // Pass the prepended items as a vector so 0..n args work; returns length.
+        const vec = this.vecType(arrType);
+        return {
+          code: `tsn_array_unshift(${vecRecv}, ${vec}{${items.join(", ")}})`,
+          type: "number",
+        };
+      }
+      case "concat": {
+        // Array operands only (element-value args aren't supported); each must
+        // share the receiver's type. 0 args -> a fresh shallow copy (new identity).
+        let acc = vecRecv;
+        for (const a of e.args) {
+          const arg = this.emitExpr(a);
+          if (!sameType(arg.type, recv.type)) {
+            throw new Error(
+              `'concat' expects '${displayType(recv.type)}' argument(s), got '${displayType(arg.type)}'`,
+            );
+          }
+          acc = `tsn_array_concat(${acc}, *(${arg.code}))`;
+        }
+        const vec = this.vecType(arrType);
+        return { code: `tsn_make_rc<${vec}>(${acc})`, type: recv.type };
+      }
+      default:
+        throw new Error(`Unsupported array method '${e.method}'`);
+    }
   }
 
   // Emit a fetch Response method. `text()` resolves a promise over the buffered
@@ -3071,13 +3073,8 @@ class Emitter {
   ): { code: string; type: RetType } {
     const t = recv.type as MapType;
     const { key, value } = t;
-    const arity = (n: number) => {
-      if (e.args.length !== n) {
-        throw new Error(
-          `'Map.${e.method}' expects ${n} argument(s), got ${e.args.length}`,
-        );
-      }
-    };
+    const arity = (n: number) =>
+      this.checkArity(`Map.${e.method}`, e.args.length, n);
     // Emit + type-check the first argument as a key, returning its (f64-cast) code.
     const keyArg = (): string => {
       const k = this.emitExpr(e.args[0]);
@@ -3160,13 +3157,8 @@ class Emitter {
   ): { code: string; type: RetType } {
     const t = recv.type as SetType;
     const elem = t.element;
-    const arity = (n: number) => {
-      if (e.args.length !== n) {
-        throw new Error(
-          `'Set.${e.method}' expects ${n} argument(s), got ${e.args.length}`,
-        );
-      }
-    };
+    const arity = (n: number) =>
+      this.checkArity(`Set.${e.method}`, e.args.length, n);
     const elemArg = (): string => {
       const x = this.emitExpr(e.args[0]);
       if (!sameType(x.type, elem)) {
@@ -3267,18 +3259,24 @@ class Emitter {
 
     // Require `lo..hi` args, all numbers; returns their codes (NAN-padded to hi).
     const numArgs = (lo: number, hi: number): string[] => {
-      if (argv.length < lo || argv.length > hi) {
-        const want = lo === hi ? `${lo}` : `${lo}-${hi}`;
-        throw new Error(
-          `'${e.method}' expects ${want} argument(s), got ${argv.length}`,
-        );
-      }
+      this.checkArity(e.method, argv.length, lo, hi);
       for (const a of argv) {
         if (a.type !== "number") {
           throw new Error(`'${e.method}' arguments must be numbers`);
         }
       }
       return Array.from({ length: hi }, (_, i) => argv[i]?.code ?? "NAN");
+    };
+    // A string search argument plus an optional numeric position — the shape
+    // indexOf / lastIndexOf / includes / startsWith / endsWith all share. Returns
+    // `[searchCode, positionCodeOrNAN]`; `what` names the numeric arg in errors.
+    const searchAndPosition = (what: string): [string, string] => {
+      this.checkArity(e.method, argv.length, 1, 2);
+      if (argv[0].type !== "string") {
+        throw new Error(`'${e.method}' search argument must be a string`);
+      }
+      const pos = this.optionalNumberArg(e.args, 1, e.method, what);
+      return [argv[0].code, pos];
     };
 
     switch (e.method) {
@@ -3310,18 +3308,11 @@ class Emitter {
       case "split": {
         // `split(sep: string, limit?: number)` -> string[]. Regex separators are
         // outside the subset (a regex literal already fails at lowering).
-        if (argv.length < 1 || argv.length > 2) {
-          throw new Error(
-            `'split' expects 1-2 argument(s), got ${argv.length}`,
-          );
-        }
+        this.checkArity("split", argv.length, 1, 2);
         if (argv[0].type !== "string") {
           throw new Error("'split' separator must be a string");
         }
-        if (argv.length === 2 && argv[1].type !== "number") {
-          throw new Error("'split' limit must be a number");
-        }
-        const limit = argv.length === 2 ? argv[1].code : "NAN";
+        const limit = this.optionalNumberArg(e.args, 1, "split", "limit");
         // Returns a reference-typed string[] (a shared_ptr to the result vector).
         return {
           code: `tsn_make_rc<std::vector<tsn_str>>(tsn_split(${s}, ${argv[0].code}, ${limit}))`,
@@ -3329,38 +3320,16 @@ class Emitter {
         };
       }
       case "indexOf": {
-        if (argv.length < 1 || argv.length > 2) {
-          throw new Error(
-            `'indexOf' expects 1-2 argument(s), got ${argv.length}`,
-          );
-        }
-        if (argv[0].type !== "string") {
-          throw new Error("'indexOf' search argument must be a string");
-        }
-        if (argv.length === 2 && argv[1].type !== "number") {
-          throw new Error("'indexOf' fromIndex must be a number");
-        }
-        const from = argv.length === 2 ? argv[1].code : "NAN";
+        const [search, from] = searchAndPosition("fromIndex");
         return {
-          code: `tsn_index_of(${s}, ${argv[0].code}, ${from})`,
+          code: `tsn_index_of(${s}, ${search}, ${from})`,
           type: "number",
         };
       }
       case "lastIndexOf": {
-        if (argv.length < 1 || argv.length > 2) {
-          throw new Error(
-            `'lastIndexOf' expects 1-2 argument(s), got ${argv.length}`,
-          );
-        }
-        if (argv[0].type !== "string") {
-          throw new Error("'lastIndexOf' search argument must be a string");
-        }
-        if (argv.length === 2 && argv[1].type !== "number") {
-          throw new Error("'lastIndexOf' fromIndex must be a number");
-        }
-        const from = argv.length === 2 ? argv[1].code : "NAN";
+        const [search, from] = searchAndPosition("fromIndex");
         return {
-          code: `tsn_last_index_of(${s}, ${argv[0].code}, ${from})`,
+          code: `tsn_last_index_of(${s}, ${search}, ${from})`,
           type: "number",
         };
       }
@@ -3368,18 +3337,7 @@ class Emitter {
       case "startsWith":
       case "endsWith": {
         // A string search + optional numeric position; returns a boolean.
-        if (argv.length < 1 || argv.length > 2) {
-          throw new Error(
-            `'${e.method}' expects 1-2 argument(s), got ${argv.length}`,
-          );
-        }
-        if (argv[0].type !== "string") {
-          throw new Error(`'${e.method}' search argument must be a string`);
-        }
-        if (argv.length === 2 && argv[1].type !== "number") {
-          throw new Error(`'${e.method}' position must be a number`);
-        }
-        const pos = argv.length === 2 ? argv[1].code : "NAN";
+        const [search, pos] = searchAndPosition("position");
         const helper =
           e.method === "includes"
             ? "tsn_str_includes"
@@ -3387,7 +3345,7 @@ class Emitter {
               ? "tsn_starts_with"
               : "tsn_ends_with";
         return {
-          code: `${helper}(${s}, ${argv[0].code}, ${pos})`,
+          code: `${helper}(${s}, ${search}, ${pos})`,
           type: "boolean",
         };
       }
@@ -3407,11 +3365,7 @@ class Emitter {
       case "padStart":
       case "padEnd": {
         // `padStart(targetLength, padString = " ")`.
-        if (argv.length < 1 || argv.length > 2) {
-          throw new Error(
-            `'${e.method}' expects 1-2 argument(s), got ${argv.length}`,
-          );
-        }
+        this.checkArity(e.method, argv.length, 1, 2);
         if (argv[0].type !== "number") {
           throw new Error(`'${e.method}' target length must be a number`);
         }
@@ -3433,11 +3387,7 @@ class Emitter {
       case "replaceAll": {
         // String search + string replacement only (regex / function args are out
         // of subset). `replace` hits the first match; `replaceAll` every match.
-        if (argv.length !== 2) {
-          throw new Error(
-            `'${e.method}' expects 2 argument(s), got ${argv.length}`,
-          );
-        }
+        this.checkArity(e.method, argv.length, 2);
         if (argv[0].type !== "string" || argv[1].type !== "string") {
           throw new Error(
             `'${e.method}' arguments must be strings (regex / function args are out of subset)`,

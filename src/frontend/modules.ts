@@ -75,14 +75,14 @@ function importDependency(node: ts.ImportDeclaration, file: string): string {
         `Default imports are not supported (v1) in '${path.basename(file)}' — use a named import`,
       );
     }
-    const nb = clause.namedBindings;
-    if (nb && ts.isNamespaceImport(nb)) {
+    const namedBindings = clause.namedBindings;
+    if (namedBindings && ts.isNamespaceImport(namedBindings)) {
       throw new Error(
         `Namespace imports (import * as ns) are not supported (v1) in '${path.basename(file)}'`,
       );
     }
-    if (nb && ts.isNamedImports(nb)) {
-      for (const el of nb.elements) {
+    if (namedBindings && ts.isNamedImports(namedBindings)) {
+      for (const el of namedBindings.elements) {
         // `import { a as b }` — `propertyName` is the original, `name` the alias.
         if (el.propertyName) {
           throw new Error(
@@ -137,13 +137,13 @@ function importBindings(file: string, source: string): Binding[] {
   const bindings: Binding[] = [];
   for (const stmt of sf.statements) {
     if (!ts.isImportDeclaration(stmt) || !stmt.importClause) continue;
-    const nb = stmt.importClause.namedBindings;
-    if (!nb || !ts.isNamedImports(nb)) continue;
+    const namedBindings = stmt.importClause.namedBindings;
+    if (!namedBindings || !ts.isNamedImports(namedBindings)) continue;
     const depFile = resolveImport(
       file,
       (stmt.moduleSpecifier as ts.StringLiteral).text,
     );
-    for (const el of nb.elements)
+    for (const el of namedBindings.elements)
       bindings.push({ local: el.name.text, depFile });
   }
   return bindings;
@@ -503,26 +503,19 @@ class Renamer {
   }
 }
 
-// Resolve the import graph from `entryPath`, lower every reachable file, scope
-// names across modules, and merge into one IR Module. The entry module's
-// top-level becomes `main`; each *dependency* module becomes a memoized record
-// (`Module.modules`). Functions and classes stay top-level (mangled on
-// collision); dependency-module variables are reached through their record.
-export function loadProgram(entryPath: string): Module {
-  const entry = path.resolve(entryPath);
-  const sources = new Map<string, string>();
-  const read = (file: string): string => {
-    let s = sources.get(file);
-    if (s === undefined) {
-      s = fs.readFileSync(file, "utf8");
-      sources.set(file, s);
-    }
-    return s;
-  };
+// One reachable file, lowered: its path, position in dependency order, whether
+// it is the entry, and its (pre-rename) IR Module.
+interface LoadedModule {
+  file: string;
+  index: number;
+  isEntry: boolean;
+  mod: Module;
+}
 
-  // Depth-first post-order walk → topological order (a file is appended only
-  // after all its dependencies). `onStack` detects cycles. The entry is visited
-  // first but appended LAST, so it is the final element.
+// Depth-first post-order over the import graph from `entry` → topological order
+// (a file is appended only after all its dependencies, so the entry — visited
+// first — is appended LAST). `onStack` detects cycles (thrown with the trace).
+function topoSort(entry: string, read: (file: string) => string): string[] {
   const order: string[] = [];
   const done = new Set<string>();
   const onStack = new Set<string>();
@@ -544,44 +537,40 @@ export function loadProgram(entryPath: string): Module {
     order.push(file);
   };
   visit(entry, []);
+  return order;
+}
 
-  // Lower each module (topo order ⇒ index reflects dependency order; entry last).
-  const modules = order.map((file, index) => ({
-    file,
-    index,
-    isEntry: file === entry,
-    mod: lower(file, read(file)),
-  }));
-
-  // Which global names (functions, classes, entry vars) appear in more than one
-  // module → those collide and must be mangled per module.
+// Build each module's symbol table (own declarations + imported bindings) in topo
+// order — so an importer always finds its dependency's table ready — then rewrite
+// that module's IR *in place* via the scope-aware Renamer. A global name (function,
+// class, entry var) is mangled when it collides across modules or clashes with a
+// reserved C++ identifier (e.g. an entry variable or function `main`).
+function resolveAndRename(
+  modules: LoadedModule[],
+  read: (file: string) => string,
+): void {
   const nameCount = new Map<string, number>();
   for (const m of modules) {
     for (const name of globalSymbols(m.mod, m.isEntry)) {
       nameCount.set(name, (nameCount.get(name) ?? 0) + 1);
     }
   }
-  // A global name must be mangled if it is reused across modules OR would clash
-  // with a C++ reserved identifier (e.g. an entry variable or function `main`).
   const mustMangle = (name: string) =>
     (nameCount.get(name) ?? 0) > 1 || RESERVED.has(name);
 
-  // Build each module's symbol table (own declarations + imported bindings) in
-  // topo order, so an importer always finds its dependency's table ready, then
-  // rewrite that module's IR in place.
   const symtabs = new Map<string, Map<string, Resolution>>();
   for (const m of modules) {
     const symtab = new Map<string, Resolution>();
-    const claim = (name: string) =>
+    const mangleIfNeeded = (name: string) =>
       mustMangle(name) ? mangle(m.index, name) : name;
-    for (const f of m.mod.functions) symtab.set(f.name, claim(f.name));
-    for (const c of m.mod.classes) symtab.set(c.name, claim(c.name));
+    for (const f of m.mod.functions) symtab.set(f.name, mangleIfNeeded(f.name));
+    for (const c of m.mod.classes) symtab.set(c.name, mangleIfNeeded(c.name));
     for (const s of m.mod.main) {
       if (s.kind !== "let") continue;
       symtab.set(
         s.name,
         m.isEntry
-          ? claim(s.name) // entry var -> (mangled) file-scope global
+          ? mangleIfNeeded(s.name) // entry var -> (mangled) file-scope global
           : { record: initName(m.index), field: s.name }, // dep var -> record
       );
     }
@@ -592,6 +581,34 @@ export function loadProgram(entryPath: string): Module {
     symtabs.set(m.file, symtab);
     new Renamer(symtab, m.isEntry).run(m.mod);
   }
+}
+
+// Resolve the import graph from `entryPath`, lower every reachable file, scope
+// names across modules, and merge into one IR Module. The entry module's
+// top-level becomes `main`; each *dependency* module becomes a memoized record
+// (`Module.modules`). Functions and classes stay top-level (mangled on
+// collision); dependency-module variables are reached through their record.
+export function loadProgram(entryPath: string): Module {
+  const entry = path.resolve(entryPath);
+  const sources = new Map<string, string>();
+  const read = (file: string): string => {
+    let s = sources.get(file);
+    if (s === undefined) {
+      s = fs.readFileSync(file, "utf8");
+      sources.set(file, s);
+    }
+    return s;
+  };
+
+  // Lower each reachable file in dependency order (topo sort ⇒ index reflects
+  // dependency order, entry last), then resolve names across modules.
+  const modules: LoadedModule[] = topoSort(entry, read).map((file, index) => ({
+    file,
+    index,
+    isEntry: file === entry,
+    mod: lower(file, read(file)),
+  }));
+  resolveAndRename(modules, read);
 
   // Merge: entry top-level → main; each dependency → a record module; functions
   // and classes from every module are top-level.

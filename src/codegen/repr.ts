@@ -48,6 +48,18 @@ export function combineRep(a: Rep, b: Rep): Rep {
   return a === "i64" && b === "i64" ? "i64" : "f64";
 }
 
+// Narrow a Type to a specific composite kind. `isKind(t, "array")` collapses the
+// repeated `typeof t === object && t.kind === ...` shape test into one named
+// predicate (and narrows `t` to that member for the caller). Accepts a `RetType`
+// too (a `"void"` return type is a string, so it's never a composite kind).
+type CompositeType = Exclude<Type, string>;
+function isKind<K extends CompositeType["kind"]>(
+  t: RetType,
+  kind: K,
+): t is Extract<CompositeType, { kind: K }> {
+  return typeof t === "object" && t.kind === kind;
+}
+
 // What the emitter queries after analysis: the chosen rep of any number slot.
 export interface RepTable {
   varRep(funcKey: string, name: string): Rep;
@@ -145,7 +157,7 @@ class RepAnalyzer {
 
     const repOf = this.repOf;
     return {
-      varRep: (fk, name) => repOf.get(varSlot(fk, name)) ?? "i64",
+      varRep: (funcKey, name) => repOf.get(varSlot(funcKey, name)) ?? "i64",
       retRep: (fn) => repOf.get(retSlot(fn)) ?? "i64",
       globalRep: (name) => repOf.get(globalSlot(name)) ?? "i64",
     };
@@ -162,26 +174,47 @@ class RepAnalyzer {
     }
   }
 
+  // Visit each call/ctor/method argument (surfacing nested calls) and, where a
+  // float (`f64`) argument flows into a `number` parameter, demote that
+  // parameter's slot to f64. `slotKey` is the callee's scope key (a function
+  // name, `ctorSlotKey`, or `methodSlotKey`); `params` may be undefined (an
+  // unknown callee), in which case args are still visited for their effects.
+  private demoteParamsFromArgs(
+    args: Expr[],
+    params: Param[] | undefined,
+    slotKey: string,
+    scope: Map<string, Type>,
+    funcKey: string,
+  ): void {
+    args.forEach((arg, i) => {
+      const av = this.visit(arg, scope, funcKey);
+      const p = params?.[i];
+      if (p && p.type === "number" && av.rep === "f64") {
+        this.demote(varSlot(slotKey, p.name));
+      }
+    });
+  }
+
   // --- statements: track variable types in `scope`, record slot demotions -----
 
   private walkAll(
     stmts: Stmt[],
     scope: Map<string, Type>,
-    fk: string,
+    funcKey: string,
     ret: RetType,
   ): void {
-    for (const s of stmts) this.walk(s, scope, fk, ret);
+    for (const s of stmts) this.walk(s, scope, funcKey, ret);
   }
 
   private walk(
     s: Stmt,
     scope: Map<string, Type>,
-    fk: string,
+    funcKey: string,
     ret: RetType,
   ): void {
     switch (s.kind) {
       case "let": {
-        const init = this.visit(s.init, scope, fk);
+        const init = this.visit(s.init, scope, funcKey);
         // An annotation is authoritative for the type (e.g. empty `[]` or a
         // declared `: number`); otherwise the type is inferred from the init.
         const type = s.type !== undefined ? s.type : (init.type as Type);
@@ -196,17 +229,17 @@ class RepAnalyzer {
         } else {
           scope.set(s.name, type);
           if (type === "number" && init.rep === "f64") {
-            this.demote(varSlot(fk, s.name));
+            this.demote(varSlot(funcKey, s.name));
           }
         }
         return;
       }
       case "assign": {
-        const val = this.visit(s.value, scope, fk);
+        const val = this.visit(s.value, scope, funcKey);
         if (s.target.kind === "var") {
           const name = s.target.name;
           if (scope.get(name) === "number" && val.rep === "f64") {
-            this.demote(varSlot(fk, name));
+            this.demote(varSlot(funcKey, name));
           } else if (
             !scope.has(name) &&
             this.globalTypes.get(name) === "number" &&
@@ -218,55 +251,56 @@ class RepAnalyzer {
         } else {
           // index/member target — object fields and array elements are f64, so
           // no slot to demote; still visit it to surface nested calls.
-          this.visit(s.target, scope, fk);
+          this.visit(s.target, scope, funcKey);
         }
         return;
       }
       case "return": {
         if (s.value) {
-          const val = this.visit(s.value, scope, fk);
-          if (ret === "number" && val.rep === "f64") this.demote(retSlot(fk));
+          const val = this.visit(s.value, scope, funcKey);
+          if (ret === "number" && val.rep === "f64")
+            this.demote(retSlot(funcKey));
         }
         return;
       }
       case "log":
-        this.visit(s.arg, scope, fk);
+        this.visit(s.arg, scope, funcKey);
         return;
       case "exprStmt":
-        this.visit(s.expr, scope, fk);
+        this.visit(s.expr, scope, funcKey);
         return;
       case "if":
-        this.visit(s.cond, scope, fk);
-        this.walkAll(s.then, scope, fk, ret);
-        if (s.else) this.walkAll(s.else, scope, fk, ret);
+        this.visit(s.cond, scope, funcKey);
+        this.walkAll(s.then, scope, funcKey, ret);
+        if (s.else) this.walkAll(s.else, scope, funcKey, ret);
         return;
       case "while":
-        this.visit(s.cond, scope, fk);
-        this.walkAll(s.body, scope, fk, ret);
+        this.visit(s.cond, scope, funcKey);
+        this.walkAll(s.body, scope, funcKey, ret);
         return;
       case "for": {
         // A `let` init is scoped to the loop (matching the emitter); drop it after.
         let loopVar: string | undefined;
         if (s.init) {
-          this.walk(s.init, scope, fk, ret);
+          this.walk(s.init, scope, funcKey, ret);
           if (s.init.kind === "let") loopVar = s.init.name;
         }
-        if (s.cond) this.visit(s.cond, scope, fk);
-        if (s.update) this.walk(s.update, scope, fk, ret);
-        this.walkAll(s.body, scope, fk, ret);
+        if (s.cond) this.visit(s.cond, scope, funcKey);
+        if (s.update) this.walk(s.update, scope, funcKey, ret);
+        this.walkAll(s.body, scope, funcKey, ret);
         if (loopVar) scope.delete(loopVar);
         return;
       }
       case "doWhile":
-        this.visit(s.cond, scope, fk);
-        this.walkAll(s.body, scope, fk, ret);
+        this.visit(s.cond, scope, funcKey);
+        this.walkAll(s.body, scope, funcKey, ret);
         return;
       case "forOf": {
-        const it = this.visit(s.iterable, scope, fk);
+        const it = this.visit(s.iterable, scope, funcKey);
         let elemType: Type = "number";
-        if (typeof it.type === "object" && it.type.kind === "array") {
+        if (isKind(it.type, "array")) {
           elemType = it.type.element;
-        } else if (typeof it.type === "object" && it.type.kind === "set") {
+        } else if (isKind(it.type, "set")) {
           elemType = it.type.element;
         } else if (it.type === "string") {
           elemType = "string";
@@ -274,41 +308,41 @@ class RepAnalyzer {
         scope.set(s.name, elemType);
         // Array elements / string chars are stored as f64, so a number loop var is
         // never i64 (demote it so the emitter's `double` declaration stays sound).
-        if (elemType === "number") this.demote(varSlot(fk, s.name));
-        this.walkAll(s.body, scope, fk, ret);
+        if (elemType === "number") this.demote(varSlot(funcKey, s.name));
+        this.walkAll(s.body, scope, funcKey, ret);
         scope.delete(s.name);
         return;
       }
       case "forIn":
-        this.visit(s.target, scope, fk);
+        this.visit(s.target, scope, funcKey);
         scope.set(s.name, "string"); // for-in keys are always strings
-        this.walkAll(s.body, scope, fk, ret);
+        this.walkAll(s.body, scope, funcKey, ret);
         scope.delete(s.name);
         return;
       case "switch":
-        this.visit(s.disc, scope, fk);
+        this.visit(s.disc, scope, funcKey);
         for (const c of s.cases) {
-          if (c.test) this.visit(c.test, scope, fk);
-          this.walkAll(c.body, scope, fk, ret);
+          if (c.test) this.visit(c.test, scope, funcKey);
+          this.walkAll(c.body, scope, funcKey, ret);
         }
         return;
       case "break":
       case "continue":
         return;
       case "labeled":
-        this.walk(s.body, scope, fk, ret);
+        this.walk(s.body, scope, funcKey, ret);
         return;
       case "throw":
-        this.visit(s.value, scope, fk);
+        this.visit(s.value, scope, funcKey);
         return;
       case "try":
-        this.walkAll(s.block, scope, fk, ret);
+        this.walkAll(s.block, scope, funcKey, ret);
         if (s.catchBody) {
           if (s.catchName) scope.set(s.catchName, "string");
-          this.walkAll(s.catchBody, scope, fk, ret);
+          this.walkAll(s.catchBody, scope, funcKey, ret);
           if (s.catchName) scope.delete(s.catchName);
         }
-        if (s.finallyBody) this.walkAll(s.finallyBody, scope, fk, ret);
+        if (s.finallyBody) this.walkAll(s.finallyBody, scope, funcKey, ret);
         return;
     }
   }
@@ -323,7 +357,7 @@ class RepAnalyzer {
   private visit(
     e: Expr,
     scope: Map<string, Type>,
-    fk: string,
+    funcKey: string,
   ): { type: RetType; rep: Rep } {
     switch (e.kind) {
       case "num":
@@ -337,7 +371,7 @@ class RepAnalyzer {
       case "undefined":
         return { type: "undefined", rep: "f64" };
       case "typeof":
-        this.visit(e.operand, scope, fk); // surface nested calls
+        this.visit(e.operand, scope, funcKey); // surface nested calls
         return { type: "string", rep: "f64" };
       case "this":
         return {
@@ -347,15 +381,15 @@ class RepAnalyzer {
           rep: "f64",
         };
       case "new": {
+        // A float ctor argument forces the matching ctor param to f64.
         const cls = this.classes.get(e.className);
-        e.args.forEach((arg, i) => {
-          const av = this.visit(arg, scope, fk);
-          const p = cls?.ctor.params[i];
-          // A float ctor argument forces the matching ctor param to f64.
-          if (p && p.type === "number" && av.rep === "f64") {
-            this.demote(varSlot(ctorSlotKey(e.className), p.name));
-          }
-        });
+        this.demoteParamsFromArgs(
+          e.args,
+          cls?.ctor.params,
+          ctorSlotKey(e.className),
+          scope,
+          funcKey,
+        );
         return { type: { kind: "class", name: e.className }, rep: "f64" };
       }
       case "var": {
@@ -364,7 +398,7 @@ class RepAnalyzer {
           const t = scope.get(e.name)!;
           return {
             type: t,
-            rep: t === "number" ? this.getRep(varSlot(fk, e.name)) : "f64",
+            rep: t === "number" ? this.getRep(varSlot(funcKey, e.name)) : "f64",
           };
         }
         if (this.globalSet.has(e.name)) {
@@ -374,25 +408,25 @@ class RepAnalyzer {
             rep: t === "number" ? this.getRep(globalSlot(e.name)) : "f64",
           };
         }
-        return { type: "number", rep: this.getRep(varSlot(fk, e.name)) };
+        return { type: "number", rep: this.getRep(varSlot(funcKey, e.name)) };
       }
       case "unary": {
-        const v = this.visit(e.operand, scope, fk);
+        const v = this.visit(e.operand, scope, funcKey);
         if (e.op === "!") return { type: "boolean", rep: "f64" };
         return { type: "number", rep: v.rep }; // -x / +x preserve the rep
       }
       case "ternary": {
         // Result type is the (shared) branch type; for a number result the rep
         // is i64 only when both branches are (mirrors `+`/`-`/`*`).
-        this.visit(e.cond, scope, fk);
-        const a = this.visit(e.whenTrue, scope, fk);
-        const b = this.visit(e.whenFalse, scope, fk);
+        this.visit(e.cond, scope, funcKey);
+        const a = this.visit(e.whenTrue, scope, funcKey);
+        const b = this.visit(e.whenFalse, scope, funcKey);
         const rep = a.type === "number" ? combineRep(a.rep, b.rep) : "f64";
         return { type: a.type, rep };
       }
       case "binary": {
-        const l = this.visit(e.left, scope, fk);
-        const r = this.visit(e.right, scope, fk);
+        const l = this.visit(e.left, scope, funcKey);
+        const r = this.visit(e.right, scope, funcKey);
         if (e.op === "+" && (l.type === "string" || r.type === "string")) {
           return { type: "string", rep: "f64" }; // concatenation
         }
@@ -406,69 +440,67 @@ class RepAnalyzer {
         return { type: "boolean", rep: "f64" }; // relational / equality / logical
       }
       case "array": {
-        const els = e.elements.map((el) => this.visit(el, scope, fk));
+        const els = e.elements.map((el) => this.visit(el, scope, funcKey));
         const element = (els[0]?.type ?? "number") as Type;
         return { type: { kind: "array", element }, rep: "f64" };
       }
       case "object": {
         const fields = e.properties.map((p) => ({
           name: p.name,
-          type: this.visit(p.value, scope, fk).type as Type,
+          type: this.visit(p.value, scope, funcKey).type as Type,
         }));
         return { type: { kind: "object", fields }, rep: "f64" };
       }
       case "index": {
-        const arr = this.visit(e.arr, scope, fk);
-        this.visit(e.index, scope, fk);
+        const arr = this.visit(e.arr, scope, funcKey);
+        this.visit(e.index, scope, funcKey);
         if (arr.type === "string") return { type: "string", rep: "f64" };
-        if (typeof arr.type === "object" && arr.type.kind === "array") {
+        if (isKind(arr.type, "array")) {
           return { type: arr.type.element, rep: "f64" };
         }
         return { type: "number", rep: "f64" };
       }
       case "member": {
-        const obj = this.visit(e.obj, scope, fk);
+        const obj = this.visit(e.obj, scope, funcKey);
         const arrayOrString =
-          obj.type === "string" ||
-          (typeof obj.type === "object" && obj.type.kind === "array");
+          obj.type === "string" || isKind(obj.type, "array");
         if (e.name === "length" && arrayOrString) {
           return { type: "number", rep: "i64" }; // .size() is a non-negative integer
         }
         // Map/Set `.size` is also a non-negative integer.
         if (
           e.name === "size" &&
-          typeof obj.type === "object" &&
-          (obj.type.kind === "map" || obj.type.kind === "set")
+          (isKind(obj.type, "map") || isKind(obj.type, "set"))
         ) {
           return { type: "number", rep: "i64" };
         }
-        if (typeof obj.type === "object" && obj.type.kind === "object") {
+        if (isKind(obj.type, "object")) {
           const field = obj.type.fields.find((f) => f.name === e.name);
           if (field) return { type: field.type, rep: "f64" };
         }
-        if (typeof obj.type === "object" && obj.type.kind === "class") {
+        if (isKind(obj.type, "class")) {
           const field = this.classes
             .get(obj.type.name)
             ?.fields.find((f) => f.name === e.name);
           if (field) return { type: field.type, rep: "f64" };
         }
         // Response: `.ok` is boolean, `.status` a number (f64, like the default).
-        if (typeof obj.type === "object" && obj.type.kind === "response") {
+        if (isKind(obj.type, "response")) {
           if (e.name === "ok") return { type: "boolean", rep: "f64" };
           return { type: "number", rep: "f64" };
         }
         return { type: "number", rep: "f64" };
       }
       case "call": {
+        // A float argument forces the parameter to f64 at every call site.
         const sig = this.sigs.get(e.callee);
-        e.args.forEach((arg, i) => {
-          const av = this.visit(arg, scope, fk);
-          const p = sig?.params[i];
-          // A float argument forces the parameter to f64 at every call site.
-          if (p && p.type === "number" && av.rep === "f64") {
-            this.demote(varSlot(e.callee, p.name));
-          }
-        });
+        this.demoteParamsFromArgs(
+          e.args,
+          sig?.params,
+          e.callee,
+          scope,
+          funcKey,
+        );
         if (!sig) return { type: "number", rep: "f64" };
         return {
           type: sig.ret,
@@ -476,29 +508,29 @@ class RepAnalyzer {
         };
       }
       case "methodCall": {
-        const recv = this.visit(e.receiver, scope, fk);
+        const recv = this.visit(e.receiver, scope, funcKey);
         // Instance method: demote its number params from float args (like a
         // call), and report its return type. Number returns are treated as f64
         // (matching the emitter), so no method retRep is queried.
-        if (typeof recv.type === "object" && recv.type.kind === "class") {
+        if (isKind(recv.type, "class")) {
           const className = recv.type.name;
           const method = this.classes
             .get(className)
             ?.methods.find((m) => m.name === e.method);
-          e.args.forEach((arg, i) => {
-            const av = this.visit(arg, scope, fk);
-            const p = method?.params[i];
-            if (p && p.type === "number" && av.rep === "f64") {
-              this.demote(varSlot(methodSlotKey(className, e.method), p.name));
-            }
-          });
+          this.demoteParamsFromArgs(
+            e.args,
+            method?.params,
+            methodSlotKey(className, e.method),
+            scope,
+            funcKey,
+          );
           return { type: method ? method.returnType : "number", rep: "f64" };
         }
         // Map methods: report result types so slot inference is accurate (`get`
         // is the value type, `keys`/`values` arrays, `has`/`delete` boolean, `set`
         // the map itself). Numbers stay f64 (map values are stored as f64).
-        if (typeof recv.type === "object" && recv.type.kind === "map") {
-          e.args.forEach((a) => this.visit(a, scope, fk));
+        if (isKind(recv.type, "map")) {
+          e.args.forEach((a) => this.visit(a, scope, funcKey));
           const m = recv.type;
           switch (e.method) {
             case "get":
@@ -517,8 +549,8 @@ class RepAnalyzer {
           }
         }
         // Set methods: `values`/`keys` arrays, `has`/`delete` boolean, `add` the set.
-        if (typeof recv.type === "object" && recv.type.kind === "set") {
-          e.args.forEach((a) => this.visit(a, scope, fk));
+        if (isKind(recv.type, "set")) {
+          e.args.forEach((a) => this.visit(a, scope, funcKey));
           const elem = recv.type.element;
           switch (e.method) {
             case "values":
@@ -536,8 +568,8 @@ class RepAnalyzer {
         // Response methods: `text()` resolves to a Promise<string>; `json()` only
         // reaches the emitter without a target type (an error), so a placeholder
         // here is fine. Numbers stay f64.
-        if (typeof recv.type === "object" && recv.type.kind === "response") {
-          e.args.forEach((a) => this.visit(a, scope, fk));
+        if (isKind(recv.type, "response")) {
+          e.args.forEach((a) => this.visit(a, scope, funcKey));
           if (e.method === "text") {
             return { type: { kind: "promise", value: "string" }, rep: "f64" };
           }
@@ -546,8 +578,8 @@ class RepAnalyzer {
         // Array methods: dispatch on the receiver type so the result type matches
         // the emitter (e.g. array `slice` is an array, not a string). Number
         // results stay f64, like every other method's number return.
-        if (typeof recv.type === "object" && recv.type.kind === "array") {
-          e.args.forEach((a) => this.visit(a, scope, fk));
+        if (isKind(recv.type, "array")) {
+          e.args.forEach((a) => this.visit(a, scope, funcKey));
           const elem = recv.type.element;
           switch (e.method) {
             case "pop":
@@ -567,7 +599,7 @@ class RepAnalyzer {
               return { type: "number", rep: "f64" };
           }
         }
-        e.args.forEach((a) => this.visit(a, scope, fk));
+        e.args.forEach((a) => this.visit(a, scope, funcKey));
         switch (e.method) {
           case "toUpperCase":
           case "toLowerCase":
@@ -596,12 +628,12 @@ class RepAnalyzer {
         }
       }
       case "jsonStringify":
-        this.visit(e.arg, scope, fk);
+        this.visit(e.arg, scope, funcKey);
         return { type: "string", rep: "f64" };
       case "mathCall":
         // Visit args so nested calls (`Math.floor(f(x))`) drive arg→param
         // demotion; the result is always an f64 number (Math is double math).
-        e.args.forEach((a) => this.visit(a, scope, fk));
+        e.args.forEach((a) => this.visit(a, scope, funcKey));
         return { type: "number", rep: "f64" };
       case "mathConst":
         return { type: "number", rep: "f64" };
@@ -611,18 +643,18 @@ class RepAnalyzer {
           rep: "f64",
         };
       case "setNew":
-        if (e.init) this.visit(e.init, scope, fk);
+        if (e.init) this.visit(e.init, scope, funcKey);
         return { type: { kind: "set", element: e.element }, rep: "f64" };
       case "jsonParse":
         // JSON numbers parse to doubles, so a JSON.parse value is always f64 (the
         // annotated/asserted target type may be number, but it's never i64-rep).
-        this.visit(e.text, scope, fk);
+        this.visit(e.text, scope, funcKey);
         return { type: e.type, rep: "f64" };
       case "await": {
         // `await p` yields the promise's resolved type. A resolved number is the
         // f64 rep (promise values are stored as f64, like array elements).
-        const inner = this.visit(e.expr, scope, fk);
-        if (typeof inner.type === "object" && inner.type.kind === "promise") {
+        const inner = this.visit(e.expr, scope, funcKey);
+        if (isKind(inner.type, "promise")) {
           // value absent => Promise<void>; report a number placeholder (a void
           // await is statement-only and never feeds a slot).
           return { type: inner.type.value ?? "number", rep: "f64" };
@@ -630,23 +662,20 @@ class RepAnalyzer {
         return { type: inner.type, rep: "f64" }; // await of a non-promise = identity
       }
       case "promiseResolve": {
-        const a = this.visit(e.arg, scope, fk);
+        const a = this.visit(e.arg, scope, funcKey);
         // Promise.resolve(p) === p when the arg is already a promise.
-        const t: Type =
-          typeof a.type === "object" && a.type.kind === "promise"
-            ? a.type
-            : { kind: "promise", value: a.type as Type };
+        const t: Type = isKind(a.type, "promise")
+          ? a.type
+          : { kind: "promise", value: a.type as Type };
         return { type: t, rep: "f64" };
       }
       case "promiseAll": {
-        const a = this.visit(e.arg, scope, fk);
+        const a = this.visit(e.arg, scope, funcKey);
         // arr is a Promise<T>[]; the result resolves to a T[].
         let value: Type = "number";
         if (
-          typeof a.type === "object" &&
-          a.type.kind === "array" &&
-          typeof a.type.element === "object" &&
-          a.type.element.kind === "promise" &&
+          isKind(a.type, "array") &&
+          isKind(a.type.element, "promise") &&
           a.type.element.value !== undefined
         ) {
           value = { kind: "array", element: a.type.element.value };
@@ -654,7 +683,7 @@ class RepAnalyzer {
         return { type: { kind: "promise", value }, rep: "f64" };
       }
       case "fetch":
-        this.visit(e.url, scope, fk);
+        this.visit(e.url, scope, funcKey);
         return {
           type: { kind: "promise", value: { kind: "response" } },
           rep: "f64",
@@ -662,7 +691,7 @@ class RepAnalyzer {
       case "responseJson":
         // Resolves to a Promise<T>; a parsed number is f64 (JSON numbers), like
         // jsonParse — the await yields f64 regardless.
-        this.visit(e.receiver, scope, fk);
+        this.visit(e.receiver, scope, funcKey);
         return { type: { kind: "promise", value: e.type }, rep: "f64" };
     }
   }
