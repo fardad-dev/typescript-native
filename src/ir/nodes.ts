@@ -10,6 +10,13 @@ export type Type =
   | "number"
   | "boolean"
   | "string"
+  // The `null` / `undefined` value types. Each is a *unit* type (one value), used
+  // mostly as a union member (`T | null`, `T | undefined`) and as the desugaring of
+  // an optional field/param (`x?: T` ⇒ `T | undefined`). Codegen maps them to empty
+  // tag structs (`tsn_null` / `tsn_undefined`) so a union variant can discriminate
+  // them and so `typeof` differs (`typeof null === "object"` vs `"undefined"`).
+  | "null"
+  | "undefined"
   | { kind: "array"; element: Type }
   | { kind: "object"; fields: Field[] }
   // An instance of a named class. Like arrays/objects, a class instance is a
@@ -31,7 +38,14 @@ export type Type =
   // compiled to `tsn_rc<tsn_response>`. Fields `status: number` /
   // `ok: boolean`; methods `text(): Promise<string>` and `json(): Promise<T>`
   // (the body is buffered, so both return already-resolved promises). See codegen.
-  | { kind: "response" };
+  | { kind: "response" }
+  // A union `A | B | …`. Members are canonicalized in lowering: nested unions
+  // flattened, duplicates removed (by structural equality), a single-member union
+  // collapsed to that member, and the members sorted into a stable order (so
+  // `number | string` and `string | number` are the *same* type). Codegen maps it
+  // to `tsn_union<…>` (a `std::variant`); a member value widens into it (coercion)
+  // and `typeof`/`=== null`/truthiness guards narrow it back (see codegen).
+  | { kind: "union"; members: Type[] };
 
 export type BinaryOp =
   // arithmetic (number -> number)
@@ -111,7 +125,15 @@ export type Expr =
   // the subset can't represent, so the target type `T` is captured up front (from
   // `await res.json() as T` or `const x: T = await res.json()`, like `jsonParse`).
   // Resolves to the response body parsed as JSON into a value of type `T`.
-  | { kind: "responseJson"; receiver: Expr; type: Type };
+  | { kind: "responseJson"; receiver: Expr; type: Type }
+  // The `null` / `undefined` literals (value types `"null"` / `"undefined"`).
+  | { kind: "null" }
+  | { kind: "undefined" }
+  // `typeof operand` — a `string` ("number" / "string" / "boolean" / "object" /
+  // "undefined"). For a union operand codegen emits a runtime `tsn_typeof` (the
+  // active variant decides at runtime); the value also drives flow narrowing when
+  // it appears as `typeof x === "…"` in an `if`/ternary condition (see codegen).
+  | { kind: "typeof"; operand: Expr };
 
 export type Stmt =
   // `type` is the annotation; absent means infer from the initializer.

@@ -80,7 +80,8 @@ A multi-file program is assembled from per-file `lower` results by `loadProgram`
   inheritance, `static`, accessors, parameter properties, field initializers, and a missing
   constructor; **ignores** access modifiers (public/private/…). Bodies lower via `lowerStatement`.
 - `lowerParams(params)` — shared typed-parameter lowering (functions, methods, constructors);
-  also rejects parameter-properties (`constructor(private x: ...)`).
+  also rejects parameter-properties (`constructor(private x: ...)`). An **optional parameter**
+  `a?: T` lowers to `T | undefined` (an omitted trailing arg defaults to `undefined` in codegen).
 - `lowerStatement(node, out)` — `let`/`const`, `return`, `console.log(...)` (special-cased to a
   `log` stmt), bare call expressions (`exprStmt`), and all the control-flow statements: `if`,
   `while`, `do…while`, C-style `for`, `for…of`/`for…in` (helper `lowerForBindingName`), `switch`,
@@ -89,10 +90,14 @@ A multi-file program is assembled from per-file `lower` results by `loadProgram`
 - `lowerVarDecl(decl)` — a single `let`/`const` binding; initializer is required. Also the home of
   the `const x: T = JSON.parse(text)` idiom: when annotated and the initializer is a `JSON.parse`
   call, the annotation supplies the parse target type (→ a `jsonParse` node).
-- `lowerType(node)` — TS `TypeNode` → IR `Type` (keywords, `T[]`, `Array<T>`, `Map<K, V>` / `Set<T>`,
-  `Promise<T>` / `Promise<void>` → a promise type, `Response` → the `fetch` response type, object type
-  literals; a **bare identifier** that isn't a known primitive/built-in → a `class` instance type).
-- `lowerExpr(node)` — TS `Expression` → IR `Expr` (literals, identifiers, binary, ternary
+- `lowerType(node)` — TS `TypeNode` → IR `Type` (keywords incl. `null`/`undefined`, `T[]`,
+  `Array<T>`, `Map<K, V>` / `Set<T>`, `Promise<T>` / `Promise<void>` → a promise type, `Response` →
+  the `fetch` response type, object type literals, and **union types** `A | B | …` via
+  `canonicalizeUnion` — flatten/dedupe/collapse/stable-sort, so `number | string` ≡ `string |
+  number`; a **bare identifier** that isn't a known primitive/built-in → a `class` instance type).
+  An optional object field (`{ x?: T }`) is a clean error (deferred — see codegen).
+- `lowerExpr(node)` — TS `Expression` → IR `Expr` (literals incl. `null` / `undefined` and
+  **`typeof e`**, identifiers, binary, ternary
   (`cond ? a : b`), unary, array/object literals, indexing, member access, calls, `new C(...)`,
   `this`, and the **non-null assertion `e!`** — lowered transparently as `lowerExpr(e)`, since it
   only narrows the static type; this lets `map.get(k)!` type-check). A **template literal**

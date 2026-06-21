@@ -12,6 +12,7 @@ tests/
   typecheck.test.ts  # stage-0 checker: asserts type-erroneous programs are rejected
   modules.test.ts    # module loader: asserts graph rejections (cycles, collisions, …)
   fetch.test.ts      # fetch: compile+run against a localhost server (network-hermetic)
+  union.test.ts      # union types: asserts subset rejections (optional object fields, …)
   cases/
     <name>.ts        # a complete tsn program (the entry)
     <name>.expected  # its exact expected stdout

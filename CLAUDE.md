@@ -105,24 +105,43 @@ npm test            # run the e2e suite once (vitest run)
 npm run test:watch  # re-run on change — the TDD red->green loop
 ```
 
-The suite (currently **113 e2e cases** + a stage-0 type-checker test file + a module-loader test
-file + a `fetch` test file, all green) auto-discovers every `tests/cases/*.ts`, compiles it to a real native binary,
+The suite (currently **121 e2e cases** + a stage-0 type-checker test file + a module-loader test
+file + a `fetch` test file + a union-rejection test file, all green) auto-discovers every
+`tests/cases/*.ts`, compiles it to a real native binary,
 runs it, and diffs stdout against the matching `.expected` file. **Every feature gets a
 `tests/cases/*.ts` + `.expected` pair**, ideally written first (red), then implemented to green.
 Programs that must be *rejected* (type errors) can't be expressed as a case pair, so they live in
 [tests/typecheck.test.ts](tests/typecheck.test.ts); structural module-graph rejections (cycles,
-name collisions, unsupported import forms) live in [tests/modules.test.ts](tests/modules.test.ts).
-See [tests/CLAUDE.md](tests/CLAUDE.md).
+name collisions, unsupported import forms) live in [tests/modules.test.ts](tests/modules.test.ts);
+union-specific subset rejections (optional object fields, …) live in
+[tests/union.test.ts](tests/union.test.ts). See [tests/CLAUDE.md](tests/CLAUDE.md).
 
 ## Current language support
 
 Implemented and tested end-to-end:
 
-- **Types:** `number`, `boolean`, `string`, arrays (`T[]` / `Array<T>`), object literal types
-  (`{ x: number; y: string }`). Aggregates **nest** — array elements and object fields may
-  themselves be arrays/objects (`number[][]`, `{ pts: number[] }`, `{ x: number }[]`,
+- **Types:** `number`, `boolean`, `string`, `null`, `undefined`, arrays (`T[]` / `Array<T>`),
+  object literal types (`{ x: number; y: string }`), and **union types** (`A | B | …`, e.g.
+  `number | string`, `T | null`, `T | undefined`). Aggregates **nest** — array elements and object
+  fields may themselves be arrays/objects (`number[][]`, `{ pts: number[] }`, `{ x: number }[]`,
   `{ inner: { x: number } }`).
-- **Values:** numeric/boolean/string literals, array literals `[...]`, object literals `{...}`.
+- **Values:** numeric/boolean/string literals, the `null`/`undefined` literals, array literals
+  `[...]`, object literals `{...}`.
+- **Union types & narrowing:** a union `A | B | …` (members **canonicalized** so `number | string`
+  ≡ `string | number`) compiles to a `tsn_union<…>` (a `std::variant` wrapper; `null`/`undefined`
+  are empty tag structs). A member **widens** into a union on assignment/argument/return (explicit
+  `std::in_place_type` construction), and a narrower union widens into a wider one. `console.log`
+  prints the active member (a string bare, like a top-level string); `===`/`!==` compares a union
+  against a member (holds-and-equals) or two equal unions. **Flow narrowing** lets a union be *used*
+  as one of its members inside a guard — `typeof x === "…"`, `x === null`/`undefined`, bare
+  truthiness, and boolean-`&&` chains, in `if`/`else`/ternary, plus **early-return** narrowing
+  (`if (x === null) return; …` narrows the fallthrough). A narrowed read emits `std::get<Member>`
+  (sound — the stage-0 checker proved the guard holds); reassignment drops the narrowing.
+  **`typeof e`** is a first-class `string` (resolved at runtime for a union; statically otherwise;
+  `typeof null === "object"`). **Optional parameters** `(a?: T)` desugar to `T | undefined` (an
+  omitted trailing arg defaults to `undefined`). **Deferred** (clean `tsnc:` errors): optional
+  object fields (`{ x?: T }` — need literal field-defaulting), a ternary whose branches have
+  *different* types (no union-merge yet), and union-typed array/Map/Set element coercion.
 - **Type checking:** a real `ts.Program` + `TypeChecker` runs **before** lowering and aborts on
   any TypeScript type error with full diagnostics (wrong assignment types, undeclared names, bad
   argument counts/types, bad property access). See [src/frontend/check.ts](src/frontend/check.ts).
@@ -306,6 +325,8 @@ tsn types map onto C++ types (see [src/codegen/CLAUDE.md](src/codegen/CLAUDE.md)
 | `Set<T>` | `tsn_rc<tsn_set<T>>` | **reference** type: insertion-ordered `tsn_set`; iterable by `for…of`; methods via `->`; `.size` (i64) |
 | `Promise<T>` | `tsn_promise<T>` (a C++20 coroutine type) | **reference** type: a handle holding a `std::shared_ptr` to shared promise state (the one aggregate still on `shared_ptr` — not a hot path). An `async` function returns one (its body is a coroutine using `co_return`/`co_await`); `await` is `co_await`. `Promise<void>` → `tsn_promise<tsn_unit>`. Resolved numbers use the f64 rep |
 | `Response` | `tsn_rc<tsn_response>` | **reference** type: the `fetch(...)` result (runtime `tsn_response { status; ok; body }`). Fields `status` (f64) / `ok` (bool); `text()` → `Promise<string>`, `json()` → `Promise<T>`. `tsn_fetch` (libcurl) is `#ifdef TSN_ENABLE_FETCH`; using it links `-lcurl` |
+| `null` / `undefined` | `tsn_null` / `tsn_undefined` | empty tag structs (one value each), distinct types so a union variant discriminates them and `typeof` differs (`typeof null === "object"`); mostly a union member / the optional-`?:` desugar |
+| `A \| B \| …` (union) | `tsn_union<M0, M1, …>` | a `std::variant` **wrapper** (so ADL finds our overloads for an all-scalar union). Members canonical + rep-stable (`undefined`/`null` first → the default alternative). A member **widens** in via `std::in_place_type` (`coerceTo`); a narrower union widens via `tsn_union_widen`. `===` is holds-and-equals; **narrowing** (`typeof`/`=== null`/truthiness/`&&`) reads a member via `std::get<Member>`. Number members are f64 |
 
 - **`number` is f64, but integer-valued numbers use a 64-bit integer representation.** A
   pre-pass ([src/codegen/repr.ts](src/codegen/repr.ts)) infers, per variable / parameter / return,
@@ -369,15 +390,17 @@ Not yet supported:
 
 | Type                 | Example                       | Notes                                                 |
 | -------------------- | ----------------------------- | ----------------------------------------------------- |
-| Union                | `number \| string`            | No tagged-union representation yet.                   |
 | `any`                | `let x: any`                  | Would erase the static type codegen relies on.        |
 | `unknown` / `never`  | `let x: unknown`              | Same reason as `any`.                                 |
 | Tuple                | `[number, string]`            | Only homogeneous `T[]` arrays are supported.          |
-| Literal / enum       | `"a" \| "b"`, `enum E {}`     | No literal types or enums.                            |
+| Literal / enum       | `"a" \| "b"`, `enum E {}`     | No literal types or enums (a union of *types* is fine — see _Union types & narrowing_). |
 | Intersection         | `A & B`                       | No type composition.                                  |
 | Function type        | `(x: number) => number`       | No first-class function values / closures.            |
 | Generic / type param | `<T>(x: T) => T`, `Box<T>`     | Only built-in `Array<T>` / `Map<K, V>` / `Set<T>` / `Promise<T>` are special-cased; user generics aren't. |
-| `null` / `undefined` | `string \| null`              | No nullable types; no optional (`x?:`) fields/params. |
+
+`null` / `undefined` and **union types** (`number | string`, `T | null`) **are** supported now —
+see _Union types & narrowing_ above. Optional **parameters** (`a?: T`) work; optional object
+**fields** (`{ x?: T }`) are still rejected (clean error — they need object-literal field-defaulting).
 
 ## Conventions
 
@@ -746,6 +769,36 @@ pair** (red → green).
       the object-heavy leaderboard benchmark dropped **~6×** (tsnc/cpp 7.55× → 1.24×, now ~parity with
       hand-written C++ and HotSpot C2), while the integer (primes) and string (word-sort) benchmarks are
       unchanged. See `tsn_rc` in [src/codegen/cpp/tsn_runtime.h](src/codegen/cpp/tsn_runtime.h).
+- [x] **Union types (the keystone) + `typeof` narrowing + `null`/`undefined` + optional params** —
+      `A | B | …` (e.g. `number | string`, `T | null`, `T | undefined`), represented in C++ as a
+      **`tsn_union<…>`** (a `std::variant` wrapper, so ADL finds our overloads even for an all-scalar
+      union); `null`/`undefined` are empty tag structs (`tsn_null`/`tsn_undefined`). The keystone
+      decisions: (1) **canonicalization** in lowering (flatten/dedupe/collapse/stable-sort) so
+      `number | string` ≡ `string | number` — and `cppType` re-sorts the C++ alternatives by their
+      *final* (post-rename) type text, with `undefined`/`null` first, so the type identity is
+      rename-stable *and* the variant's default alternative is the JS-correct `Map.get`-miss value;
+      (2) **assignability vs. equality split** — `isAssignable` (member→union and narrower→wider
+      widening, top-level only) drives a `coerceTo` that constructs the variant with explicit
+      `std::in_place_type` (dodging `std::variant`'s `double`-vs-`bool` ctor ambiguity) and
+      `tsn_union_widen` for union→union; equality is a separate `holds-and-equals` form; (3)
+      **flow narrowing done in the emitter** (no checker threading — stage 0 already proved the
+      program correct, so the emitted `std::get<Member>` is sound): `analyzeGuard` recognizes
+      `typeof x === "…"`, `x === null`/`undefined`, bare truthiness, and boolean-`&&` chains in
+      `if`/`else`/ternary, plus **early-return** narrowing (`if (x === null) return; …` narrows the
+      fallthrough via an `emitBlock` snapshot/restore of the narrowing map); reassignment drops the
+      narrowing. Threaded through all the usual files: two `Type` scalars + a `union` variant, three
+      `Expr` nodes (`null`/`undefined`/`typeof`), `lower` (+ `canonicalizeUnion`), `repr.ts` (unions
+      are never i64), the module `Renamer`, `emit.ts`, and the runtime (`tsn_null`/`tsn_undefined`/
+      `tsn_union`/`tsn_union_widen` + `tsn_inspect`/`tsn_json_stringify`/`tsn_truthy`/`tsn_typeof`/
+      `tsn_console_union` overloads via `std::visit`). `typeof e` is also a first-class `string`
+      (runtime for a union, static otherwise). **Optional parameters** `(a?: T)` desugar to
+      `T | undefined` (an omitted trailing arg defaults to `undefined`). Stage 0 (real TS) needs no
+      change — it already understands unions/narrowing — so the work is all lower→repr→emit→runtime;
+      non-union programs are byte-identical. Tests: `tests/cases/union-{basic,pass,narrow,typeof,
+      narrow-object,optional,widen}.ts` + [tests/union.test.ts](tests/union.test.ts) (rejections).
+      **Deferred** (clean `tsnc:` errors / follow-ups): optional object **fields** (`{ x?: T }` —
+      need object-literal field-defaulting + nested coercion), a **ternary** whose branches have
+      *different* types (union-merge), and union-typed **array/Map/Set element** coercion.
 
 ### todo
 
@@ -776,15 +829,20 @@ done (see _Done_). Still open:
 
 ### Blocked on the type system
 
-These need a representation/inference decision before they can lower. **Union types are the
-keystone** — a tagged representation that unlocks most of the rest.
+The **union-types keystone is now done** (`tsn_union` + `typeof` narrowing + `null`/`undefined`;
+see _Done_), which unblocks most of what was here. Still open:
 
-- [ ] **Union types** — `number | string`; no tagged-union representation yet.
-- [ ] **`null` / `undefined` + optional `?:`** fields/params — depend on unions.
+- [x] **Union types** — done (`A | B`, canonical `tsn_union<…>`; see _Done_).
+- [~] **`null` / `undefined` + optional `?:`** — `null`/`undefined` types + optional **parameters**
+      done; optional object **fields** (`{ x?: T }`) deferred (need object-literal field-defaulting).
 - [ ] **Enums & literal types**, **tuples** (`[number, string]`), **intersection** (`A & B`).
+- [ ] **Union polish** — a **ternary** with differing branch types (union-merge result) and
+      **union-typed array/Map/Set element** coercion (`(number | string)[]` push/index) — both
+      currently clean `tsnc:` errors / structural-match-only (top-level widening only today).
 - [ ] **Thread the `TypeChecker`'s inferred types into lowering** — stage 0 is a *gate* only;
       lowering re-reads annotations off the AST and can't see inferred types
-      ([src/frontend/check.ts](src/frontend/check.ts)). Blocks robust union/inference work.
+      ([src/frontend/check.ts](src/frontend/check.ts)). Narrowing is currently reproduced in the
+      emitter (`analyzeGuard`); threading would let it follow TS's inference exactly.
 
 ### Later
 

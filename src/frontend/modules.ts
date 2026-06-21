@@ -455,6 +455,9 @@ class Renamer {
       case "await":
         e.expr = this.expr(e.expr, locals);
         return e;
+      case "typeof":
+        e.operand = this.expr(e.operand, locals);
+        return e;
       case "mathCall":
         e.args = e.args.map((a) => this.expr(a, locals));
         return e;
@@ -494,6 +497,8 @@ class Renamer {
       if (t.value) this.type(t.value); // resolve a class type-ref in Promise<C>
     } else if (t.kind === "response")
       return; // built-in, no nested type-refs
+    else if (t.kind === "union")
+      for (const m of t.members) this.type(m); // resolve class refs in members
     else for (const f of t.fields) this.type(f.type);
   }
 }
