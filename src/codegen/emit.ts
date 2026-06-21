@@ -2558,16 +2558,28 @@ class Emitter {
     };
   }
 
+  // An optional parameter — its (desugared) type is a union containing
+  // `undefined`, so a caller may omit it (the omitted value is `undefined`).
+  private isOptionalParam(p: Type): boolean {
+    return isUnion(p) && p.members.some((m) => m === "undefined");
+  }
+
   // Type-check a call/ctor argument list against parameter types and return each
   // argument's C++ code. Reps are reconciled by repr.ts (a float arg demotes the
-  // matching param slot), so no per-argument cast is needed here.
+  // matching param slot), so no per-argument cast is needed here. A trailing
+  // optional parameter (`a?: T`) may be omitted — an `undefined` default is
+  // appended for it. (Optionals are trailing, enforced by stage 0.)
   private checkArgs(who: string, params: Type[], args: Expr[]): string[] {
-    if (args.length !== params.length) {
+    const firstOptional = params.findIndex((p) => this.isOptionalParam(p));
+    const min = firstOptional === -1 ? params.length : firstOptional;
+    if (args.length < min || args.length > params.length) {
+      const want =
+        min === params.length ? `${params.length}` : `${min}-${params.length}`;
       throw new Error(
-        `'${who}' expects ${params.length} argument(s), got ${args.length}`,
+        `'${who}' expects ${want} argument(s), got ${args.length}`,
       );
     }
-    return args.map((a, i) => {
+    const out = args.map((a, i) => {
       const val = this.emitExpr(a);
       if (!this.isAssignable(params[i], val.type)) {
         throw new Error(
@@ -2576,6 +2588,11 @@ class Emitter {
       }
       return this.coerceTo(val, params[i]);
     });
+    // Omitted trailing optionals default to `undefined` (coerced into the union).
+    for (let i = args.length; i < params.length; i++) {
+      out.push(this.coerceTo({ code: "tsn_undefined{}", type: "undefined" }, params[i]));
+    }
+    return out;
   }
 
   private emitBinary(e: { op: BinaryOp; left: Expr; right: Expr }): Value {
@@ -2745,20 +2762,9 @@ class Emitter {
   ): { code: string; type: RetType } {
     const sig = this.sigs.get(e.callee);
     if (!sig) throw new Error(`Unknown function: ${e.callee}`);
-    if (e.args.length !== sig.params.length) {
-      throw new Error(
-        `Function '${e.callee}' expects ${sig.params.length} argument(s), got ${e.args.length}`,
-      );
-    }
-    const args = e.args.map((a, i) => {
-      const val = this.emitExpr(a);
-      if (!this.isAssignable(sig.params[i], val.type)) {
-        throw new Error(
-          `Argument ${i + 1} of '${e.callee}': type '${displayType(val.type)}' is not assignable to '${displayType(sig.params[i])}'`,
-        );
-      }
-      return this.coerceTo(val, sig.params[i]);
-    });
+    // Shared arg-checking (handles widening into a union param and omitted
+    // trailing optional params — `a?: T`).
+    const args = this.checkArgs(e.callee, sig.params, e.args);
     if (sig.ret === "void" && !asStatement) {
       throw new Error(
         `'${e.callee}' returns void and cannot be used as a value`,

@@ -71,7 +71,13 @@ function lowerParams(params: ts.NodeArray<ts.ParameterDeclaration>): Param[] {
     if (!p.type) {
       throw new Error(`Parameter '${p.name.text}' needs a type annotation`);
     }
-    return { name: p.name.text, type: lowerType(p.type) };
+    // An optional parameter `a?: T` is `T | undefined` (callers may omit it; the
+    // omitted value is `undefined`). Codegen appends an `undefined` default for an
+    // omitted trailing optional arg. (Stage 0 enforces TS's required-before-optional
+    // ordering and rejects omitting a non-optional param.)
+    let type = lowerType(p.type);
+    if (p.questionToken) type = canonicalizeUnion([type, "undefined"]);
+    return { name: p.name.text, type };
   });
 }
 
@@ -652,6 +658,15 @@ function lowerType(node: ts.TypeNode): Type {
         !m.type
       ) {
         throw new Error("Unsupported object type member (v1)");
+      }
+      // An optional field `x?: T` would be `T | undefined`, but constructing it
+      // needs object-literal field-defaulting and nested union coercion (a value
+      // widens only at the top level today) — deferred. Reject it cleanly rather
+      // than silently dropping the `?` (which would treat the field as required).
+      if (m.questionToken) {
+        throw new Error(
+          `Optional object field '${m.name.text}?' is not supported (v1) — use '${m.name.text}: T | undefined' with an explicit value`,
+        );
       }
       return { name: m.name.text, type: lowerType(m.type) };
     });
