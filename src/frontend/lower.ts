@@ -782,11 +782,19 @@ function lowerVarDecl(decl: ts.VariableDeclaration): Stmt {
   if (!ts.isIdentifier(decl.name)) {
     throw new Error("Only simple identifier bindings are supported (v1)");
   }
-  if (!decl.initializer) {
-    throw new Error(`'${decl.name.text}' must be initialized (v1)`);
-  }
   // No annotation -> leave type undefined; codegen infers it from the initializer.
   const type = decl.type ? lowerType(decl.type) : undefined;
+  if (!decl.initializer) {
+    // `let x: T;` — a declaration with no initializer. The annotation is the only
+    // source of a type here (no `any`, nothing to infer from), so it's required.
+    // (`const x;` is already a TS stage-0 error, so it never reaches lowering.)
+    if (type === undefined) {
+      throw new Error(
+        `'${decl.name.text}' needs a type annotation when declared without an initializer`,
+      );
+    }
+    return { kind: "let", name: decl.name.text, type };
+  }
   // `const x: T = JSON.parse(text)` — the variable annotation supplies the parse
   // target type (the common idiom alongside `JSON.parse(text) as T`).
   const initNode = skipParens(decl.initializer);

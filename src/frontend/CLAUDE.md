@@ -87,7 +87,9 @@ A multi-file program is assembled from per-file `lower` results by `loadProgram`
   `break`/`continue`, labeled loops (rejects labeling a non-loop), `try`/`throw` (`throw new Error(msg)`
   lowers to throwing `msg`).
 - `lowerVarDeclInto` / `lowerVarDecl` — a `let`/`const`. A simple identifier → one `let` (also the home
-  of `const x: T = JSON.parse(text)` and `= await res.json()`). A **destructuring** binding is desugared
+  of `const x: T = JSON.parse(text)` and `= await res.json()`). An **uninitialized** declaration
+  (`let x: T;`, no initializer) → a `let` with no `init` and a required annotation (rejected without
+  one — there's no `any` to infer from; `const x;` is already a stage-0 error). A **destructuring** binding is desugared
   into a once-evaluated source temp + per-binding `let`s; array defaults use a length-check ternary,
   rest uses `.slice(i)`, holes are skipped; object rename/nesting read fields; object rest is deferred.
 - `lowerType` — TS `TypeNode` → IR `Type`: keywords (incl. `null`/`undefined`), `T[]`/`Array<T>`,

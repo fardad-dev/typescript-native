@@ -244,23 +244,26 @@ class RepAnalyzer {
   ): void {
     switch (s.kind) {
       case "let": {
-        const init = this.visit(s.init, scope, funcKey);
-        // An annotation is authoritative for the type (e.g. empty `[]` or a
-        // declared `: number`); otherwise the type is inferred from the init.
-        const type = s.type !== undefined ? s.type : (init.type as Type);
+        // An uninitialized `let x: T;` has no init to visit; its annotation is
+        // authoritative for the type. A later `assign` of a fraction demotes its
+        // slot (the `assign` case below), so it starts i64-eligible like any slot.
+        const init = s.init ? this.visit(s.init, scope, funcKey) : undefined;
+        // An annotation is authoritative for the type (e.g. empty `[]`, a declared
+        // `: number`, or an uninitialized decl); otherwise inferred from the init.
+        const type = s.type !== undefined ? s.type : (init!.type as Type);
         // A direct top-level `let` is a global (file-scope), not a local: record
         // its type and demote its global slot, but do NOT add it to the local
         // scope (so a same-named function-local stays a distinct local slot).
         if (this.globalNodes.has(s)) {
           this.globalTypes.set(s.name, type);
-          if (type === "number" && init.rep === "f64") {
+          if (type === "number" && init?.rep === "f64") {
             this.demote(globalSlot(s.name));
           }
         } else {
           scope.set(s.name, type);
           // A captured (boxed) number local lives in an f64 cell; a fractional
           // initializer also forces f64. Either way demote to match the emitter.
-          if (type === "number" && (init.rep === "f64" || s.boxed)) {
+          if (type === "number" && (init?.rep === "f64" || s.boxed)) {
             this.demote(varSlot(funcKey, s.name));
           }
         }

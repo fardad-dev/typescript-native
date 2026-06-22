@@ -1091,6 +1091,17 @@ class Emitter {
     const fields: Field[] = [];
     for (const s of d.body) {
       if (s.kind === "let") {
+        // `let x: T;` with no initializer — the field is value-initialized by the
+        // record's `tsn_make_rc<struct>()` (assigned later, before any read). Just
+        // register the field/type; no `rec->x = …`.
+        if (s.init === undefined) {
+          fields.push({ name: s.name, type: s.type! });
+          this.sigs.set(fn, {
+            params: [],
+            ret: { kind: "object", fields: [...fields] },
+          });
+          continue;
+        }
         const init = this.emitExpr(s.init);
         if (s.type !== undefined && !this.isAssignable(s.type, init.type)) {
           throw new Error(
@@ -1151,8 +1162,18 @@ class Emitter {
     kind: "let";
     name: string;
     type?: Type;
-    init: Expr;
+    init?: Expr;
   }): void {
+    // `let x: T;` with no initializer — declare the global (assigned later in
+    // main, before any read). A namespace-scope scalar zero-inits; a reference
+    // type default-constructs. The annotation supplies the type.
+    if (stmt.init === undefined) {
+      const declared = stmt.type!;
+      this.globals.set(stmt.name, declared);
+      const declType = this.slotType(declared, this.reps.globalRep(stmt.name));
+      this.globalDecls.push(`${declType} ${stmt.name};`);
+      return;
+    }
     // Empty array literal: take the element type from the annotation (as locals).
     if (stmt.init.kind === "array" && stmt.init.elements.length === 0) {
       if (!stmt.type || !isArray(stmt.type)) {
@@ -1547,11 +1568,15 @@ class Emitter {
   // Compute a `let`'s declared type and initializer Value. Handles the empty-array
   // literal (whose element type comes from the annotation) and the
   // annotation-widens-the-init rule (a union slot keeps its union type). Does NOT
-  // register the variable — callers do that (inlineStmt / emitBoxedLet).
-  private letInit(stmt: { name: string; type?: Type; init: Expr }): {
+  // register the variable — callers do that (inlineStmt / emitBoxedLet). Only for
+  // an *initialized* `let`; a `let x: T;` with no init is handled by each caller.
+  private letInit(stmt: { name: string; type?: Type; init?: Expr }): {
     declared: Type;
     init: Value;
   } {
+    if (stmt.init === undefined) {
+      throw new Error("letInit called on an uninitialized declaration");
+    }
     if (stmt.init.kind === "array" && stmt.init.elements.length === 0) {
       if (!stmt.type || !isArray(stmt.type)) {
         throw new Error("Empty array literal needs an array type annotation");
@@ -1582,10 +1607,23 @@ class Emitter {
   // (`const f = (n) => f(n - 1)`, which must be type-annotated) captures the cell
   // before it is filled. An annotated binding is pre-registered so that closure can
   // resolve the name while its body is emitted.
-  private emitBoxedLet(stmt: { name: string; type?: Type; init: Expr }): void {
+  private emitBoxedLet(stmt: { name: string; type?: Type; init?: Expr }): void {
     if (stmt.type !== undefined) {
       this.vars.set(stmt.name, stmt.type);
       this.boxed.add(stmt.name);
+    }
+    // `let x: T;` with no initializer, captured by a closure — allocate the empty
+    // cell (its `v` is value-initialized) and leave it; the later `assign` writes
+    // through `(x)->v`, visible to every closure sharing the cell.
+    if (stmt.init === undefined) {
+      const declared = stmt.type!;
+      this.vars.set(stmt.name, declared);
+      this.boxed.add(stmt.name);
+      const elem = this.boxElemType(declared);
+      this.push(
+        `${this.boxType(declared)} ${stmt.name} = tsn_make_rc<tsn_box<${elem}>>();`,
+      );
+      return;
     }
     const { declared, init } = this.letInit(stmt);
     this.vars.set(stmt.name, declared);
@@ -1604,6 +1642,18 @@ class Emitter {
   // inline inside a `for (...)` header). `let` registers the variable.
   private inlineStmt(stmt: Stmt): string {
     if (stmt.kind === "let") {
+      // `let x: T;` — declared with no initializer. Value-initialize the slot
+      // (scalars -> 0/false, reference types -> default ctor); it is assigned
+      // before any read (stage 0 enforces that). The annotation is the type.
+      if (stmt.init === undefined) {
+        const declared = stmt.type!;
+        this.vars.set(stmt.name, declared);
+        const cpp = this.slotType(
+          declared,
+          this.reps.varRep(this.funcKey, stmt.name),
+        );
+        return `${cpp} ${stmt.name}{}`;
+      }
       const { declared, init } = this.letInit(stmt);
       this.vars.set(stmt.name, declared);
       // A captured (boxed) let — used here only for a for-loop counter (statement
@@ -4124,7 +4174,7 @@ function containsAwait(e: Expr): boolean {
 function stmtContainsAwait(s: Stmt): boolean {
   switch (s.kind) {
     case "let":
-      return containsAwait(s.init);
+      return s.init ? containsAwait(s.init) : false;
     case "log":
       return containsAwait(s.arg);
     case "return":

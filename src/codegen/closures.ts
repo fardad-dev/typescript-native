@@ -112,7 +112,7 @@ class CaptureAnalysis {
         // Declare before walking the initializer so a self-referential closure
         // (`const f = () => f()`) captures its own (boxed) binding.
         this.declare(s.name, topLevel, () => (s.boxed = true));
-        this.walkExpr(s.init);
+        if (s.init) this.walkExpr(s.init);
         return;
       case "assign":
         this.walkExpr(s.target);

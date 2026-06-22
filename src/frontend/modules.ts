@@ -416,7 +416,7 @@ class Renamer {
     const locals = new Set<string>();
     return stmts.map((s) => {
       if (s.kind === "let") {
-        s.init = this.expr(s.init, locals);
+        if (s.init) s.init = this.expr(s.init, locals);
         if (s.type) this.type(s.type);
         if (this.isEntry) s.name = this.symName(s.name);
         return s;
@@ -432,7 +432,7 @@ class Renamer {
   private stmt(s: Stmt, locals: Set<string>): Stmt {
     switch (s.kind) {
       case "let":
-        s.init = this.expr(s.init, locals);
+        if (s.init) s.init = this.expr(s.init, locals);
         if (s.type) this.type(s.type);
         locals.add(s.name); // a true local from here on (shadows the table)
         return s;

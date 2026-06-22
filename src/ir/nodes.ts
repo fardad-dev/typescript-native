@@ -177,9 +177,12 @@ export type Expr =
 // enclosing scope and its closures share one mutable binding — JS closure
 // semantics. Codegen reads/writes such a variable through the cell (see codegen).
 export type Stmt =
-  // `type` is the annotation; absent means infer from the initializer. `boxed` ⇒
-  // captured by a nested closure (stored in a shared cell).
-  | { kind: "let"; name: string; type?: Type; init: Expr; boxed?: boolean }
+  // `type` is the annotation; absent means infer from the initializer. `init`
+  // absent ⇒ a declaration with no initializer (`let x: T;`) — then `type` is
+  // required (there's nothing to infer from, and the subset has no `any`); the
+  // slot is assigned before it's read (stage 0 enforces "used before assigned").
+  // `boxed` ⇒ captured by a nested closure (stored in a shared cell).
+  | { kind: "let"; name: string; type?: Type; init?: Expr; boxed?: boolean }
   | { kind: "log"; arg: Expr }
   | { kind: "return"; value?: Expr }
   // a bare expression evaluated for effect (e.g. a function call), result discarded

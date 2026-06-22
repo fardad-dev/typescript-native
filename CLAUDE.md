@@ -106,7 +106,8 @@ Implemented and tested end-to-end:
 - **`console.log`** — JS-style, matching Node's `util.inspect` byte-for-byte on the subset.
 - **`JSON.stringify` / `JSON.parse`** — match Node byte-for-byte; `parse` needs a target type
   (`JSON.parse(text) as T`).
-- **Variables:** `let`/`const` (type optional, inferred from initializer); `var` rejected.
+- **Variables:** `let`/`const` (type optional, inferred from initializer; or declared
+  uninitialized — `let x: T;`, where the annotation is required); `var` rejected.
 - **Arrays:** literals, and non-callback methods (`push`/`pop`/`slice`/`concat`/`join`/`indexOf`/…).
   Callback methods (`map`/`filter`/…) are not yet implemented.
 - **`Math.*`**, **`Map`/`Set`** (reference types).
@@ -158,7 +159,7 @@ ES cycle/TDZ semantics — and silent miscompiles are off the table). Also rejec
 re-export (`export * as ns from`) and the CommonJS `export =`. Every other import/export form is
 supported (see *Language support*).
 
-**Will never support:** the `any` type, and bare `this` as a value.
+**Will never support:** the `any` type, and bare `this` as a value. hosting , `var` will not support.
 
 ## Representation notes (read these — they bite)
 
